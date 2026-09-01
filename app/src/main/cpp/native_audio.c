@@ -29,7 +29,7 @@ typedef struct {
     AAudioStream *input, *output;
     pthread_t thread;
     atomic_int running, recording, flags;
-    _Atomic(float) levels[4];
+    _Atomic(float) levels[6];
     int rate, frames, in_channels, pair;
     float values[24];
     pthread_mutex_t param_lock, file_lock;
@@ -41,7 +41,10 @@ typedef struct {
     atomic_uint reverb_generation;
     float *lookahead;
     int look_size, look_pos;
-    float limiter_gain;
+    int *limiter_next_pos;
+    double *limiter_next_delta;
+    int limiter_delay_frames, limiter_next_iter, limiter_next_len;
+    double limiter_gain, limiter_delta, limiter_peak_activity;
     FILE *dry_file, *wet_file;
     uint32_t dry_bytes, wet_bytes;
     int net_sock, net_codec, net_port, net_min_ms, net_max_ms;
@@ -67,7 +70,7 @@ typedef struct __attribute__((packed)) { uint32_t magic; uint16_t version; uint8
 enum { DSP_ON=1, EQ_ON=2, REVERB_ON=4, LIMITER_ON=8 };
 enum {
     P_EQ1_F,P_EQ1_G,P_EQ1_Q,P_EQ2_F,P_EQ2_G,P_EQ2_Q,P_EQ3_F,P_EQ3_G,P_EQ3_Q,P_EQ4_F,P_EQ4_G,P_EQ4_Q,
-    P_ROOM,P_DECAY,P_DAMP,P_MIX,P_LIM_IN,P_LIMIT,P_RELEASE,P_CEILING,P_LOOKAHEAD
+    P_ROOM,P_DECAY,P_DAMP,P_MIX,P_LIM_IN,P_LIMIT,P_RELEASE,P_CEILING,P_LOOKAHEAD,P_ADAPTIVE_RELEASE
 };
 
 static float db_to_linear(float db) { return powf(10.f, db / 20.f); }
@@ -121,22 +124,150 @@ static void *reverb_worker(void *unused) {
     return NULL;
 }
 
-/* Linked-stereo lookahead limiter based on FFmpeg af_alimiter's ring-buffer approach. */
+static void limiter_reset(int delay_frames) {
+    memset(g.lookahead, 0, (size_t)g.look_size * sizeof(*g.lookahead));
+    memset(g.limiter_next_delta, 0, (size_t)g.look_size * sizeof(*g.limiter_next_delta));
+    for (int i = 0; i < g.look_size; i++) g.limiter_next_pos[i] = -1;
+    g.look_pos = 0;
+    g.limiter_delay_frames = delay_frames;
+    g.limiter_next_iter = 0;
+    g.limiter_next_len = 0;
+    g.limiter_gain = 1.0;
+    g.limiter_delta = 0.0;
+    g.limiter_peak_activity = 0.0;
+}
+
+/*
+ * Linked-stereo lookahead limiter adapted from FFmpeg af_alimiter's
+ * scheduled-peak attenuation algorithm. Each detected peak installs an
+ * attack ramp that reaches the required gain when that peak leaves the ring.
+ */
 static void limiter_process(float *l, float *r, const float *p) {
-    float in=db_to_linear(p[P_LIM_IN]), limit=db_to_linear(p[P_LIMIT]);
-    float ceiling=db_to_linear(p[P_CEILING]), release=fmaxf(p[P_RELEASE],10.f)/1000.f;
-    float x0=*l*in, x1=*r*in, peak=fmaxf(fabsf(x0),fabsf(x1));
-    int delay=(int)(clampf(p[P_LOOKAHEAD],0.f,5.f)*g.rate/1000.f)*2;
-    if(delay<2) delay=2; if(delay>=g.look_size)delay=g.look_size-2;
-    int read=g.look_pos-delay; if(read<0)read+=g.look_size;
-    float out0=g.lookahead[read], out1=g.lookahead[(read+1)%g.look_size];
-    g.lookahead[g.look_pos]=x0; g.lookahead[(g.look_pos+1)%g.look_size]=x1;
-    g.look_pos=(g.look_pos+2)%g.look_size;
-    float target=peak>limit?limit/peak:1.f;
-    if(target<g.limiter_gain)g.limiter_gain=target;
-    else g.limiter_gain += (1.f-g.limiter_gain)/(g.rate*release);
-    *l=clampf(out0*g.limiter_gain,-ceiling,ceiling);
-    *r=clampf(out1*g.limiter_gain,-ceiling,ceiling);
+    const int channels = 2;
+    float input_gain = db_to_linear(p[P_LIM_IN]);
+    double threshold = fmin(fmax(pow(10.0, (double)p[P_LIMIT] / 20.0), 0.000001), 1.0);
+    double ceiling = fmin(fmax(pow(10.0, (double)p[P_CEILING] / 20.0), 0.000001), 1.0);
+    double limit = fmin(threshold, ceiling);
+    double base_release = fmax((double)p[P_RELEASE], 10.0) / 1000.0;
+    int adaptive_release = p[P_ADAPTIVE_RELEASE] >= 0.5f;
+    int delay_frames = (int)(clampf(p[P_LOOKAHEAD], 0.f, 5.f) * g.rate / 1000.f);
+    int max_delay_frames = g.look_size / channels;
+    if (delay_frames < 1) delay_frames = 1;
+    if (delay_frames > max_delay_frames) delay_frames = max_delay_frames;
+    int buffer_size = delay_frames * channels;
+
+    if (delay_frames != g.limiter_delay_frames) limiter_reset(delay_frames);
+
+    float x0 = *l * input_gain;
+    float x1 = *r * input_gain;
+    float peak = fmaxf(fabsf(x0), fabsf(x1));
+    g.lookahead[g.look_pos] = x0;
+    g.lookahead[g.look_pos + 1] = x1;
+
+    /* A smoothed overload activity tracks peak duration without resetting at
+       waveform zero crossings. Transients use 0.5x release; sustained peaks
+       approach 2x release. The final time remains inside the UI's range. */
+    if (adaptive_release) {
+        if ((double)peak > limit)
+            g.limiter_peak_activity += (1.0 - g.limiter_peak_activity) /
+                                       ((double)g.rate * 0.150);
+        else
+            g.limiter_peak_activity -= g.limiter_peak_activity /
+                                       ((double)g.rate * 0.400);
+        g.limiter_peak_activity = fmin(fmax(g.limiter_peak_activity, 0.0), 1.0);
+    } else {
+        g.limiter_peak_activity = 0.0;
+    }
+    double release_scale = adaptive_release ?
+            0.5 + 1.5 * g.limiter_peak_activity : 1.0;
+    double release = fmin(fmax(base_release * release_scale, 0.010), 10.0);
+
+    if (peak > limit) {
+        double target_gain = limit / (double)peak;
+        double release_delta = (1.0 - target_gain) / ((double)g.rate * release);
+        double attack_delta = (target_gain - g.limiter_gain) / (double)delay_frames;
+
+        if (attack_delta < g.limiter_delta) {
+            g.limiter_delta = attack_delta;
+            g.limiter_next_pos[0] = g.look_pos;
+            if (buffer_size > 1) g.limiter_next_pos[1] = -1;
+            g.limiter_next_delta[0] = release_delta;
+            g.limiter_next_len = 1;
+            g.limiter_next_iter = 0;
+        } else {
+            int found = 0;
+            int i;
+            for (i = g.limiter_next_iter;
+                 i < g.limiter_next_iter + g.limiter_next_len; i++) {
+                int j = i % buffer_size;
+                int scheduled_pos = g.limiter_next_pos[j];
+                if (scheduled_pos < 0) continue;
+                float scheduled_peak = fmaxf(fabsf(g.lookahead[scheduled_pos]),
+                                              fabsf(g.lookahead[scheduled_pos + 1]));
+                int distance_frames = ((buffer_size - scheduled_pos + g.look_pos) %
+                                       buffer_size) / channels;
+                if (scheduled_peak <= 0.f || distance_frames <= 0) continue;
+                double scheduled_delta = (target_gain - limit / (double)scheduled_peak) /
+                                         (double)distance_frames;
+                if (scheduled_delta < g.limiter_next_delta[j]) {
+                    g.limiter_next_delta[j] = scheduled_delta;
+                    found = 1;
+                    break;
+                }
+            }
+            if (found) {
+                g.limiter_next_len = i - g.limiter_next_iter + 1;
+                int insert = (g.limiter_next_iter + g.limiter_next_len) % buffer_size;
+                int sentinel = (insert + 1) % buffer_size;
+                g.limiter_next_pos[insert] = g.look_pos;
+                g.limiter_next_delta[insert] = release_delta;
+                g.limiter_next_pos[sentinel] = -1;
+                g.limiter_next_len++;
+            }
+        }
+    }
+
+    int output_pos = (g.look_pos + channels) % buffer_size;
+    float out0 = g.lookahead[output_pos];
+    float out1 = g.lookahead[output_pos + 1];
+    float output_peak = fmaxf(fabsf(out0), fabsf(out1));
+
+    g.limiter_gain += g.limiter_delta;
+    *l = (float)((double)out0 * g.limiter_gain);
+    *r = (float)((double)out1 * g.limiter_gain);
+
+    if (g.limiter_next_len > 0 &&
+        output_pos == g.limiter_next_pos[g.limiter_next_iter]) {
+        g.limiter_delta = g.limiter_next_delta[g.limiter_next_iter];
+        g.limiter_gain = output_peak > 0.f ? fmin(limit / (double)output_peak, 1.0) : 1.0;
+        g.limiter_next_len--;
+        g.limiter_next_pos[g.limiter_next_iter] = -1;
+        g.limiter_next_iter = (g.limiter_next_iter + 1) % buffer_size;
+    }
+
+    /* Numerical guard rails copied from af_alimiter: keep the envelope
+       finite and avoid spending time accumulating sub-ULP deltas. */
+    if (g.limiter_gain > 1.0) {
+        g.limiter_gain = 1.0;
+        g.limiter_delta = 0.0;
+        g.limiter_next_iter = 0;
+        g.limiter_next_len = 0;
+        g.limiter_next_pos[0] = -1;
+    }
+    if (g.limiter_gain <= 0.0) {
+        g.limiter_gain = 0.0000000000001;
+        g.limiter_delta = (1.0 - g.limiter_gain) / ((double)g.rate * release);
+    }
+    if (g.limiter_gain != 1.0 && (1.0 - g.limiter_gain) < 0.0000000000001)
+        g.limiter_gain = 1.0;
+    if (g.limiter_delta != 0.0 && fabs(g.limiter_delta) < 0.00000000000001)
+        g.limiter_delta = 0.0;
+
+    *l = clampf(*l, -ceiling, ceiling);
+    *r = clampf(*r, -ceiling, ceiling);
+    atomic_store(&g.levels[4], (float)g.limiter_gain);
+    atomic_store(&g.levels[5], (float)(release * 1000.0));
+    g.look_pos = output_pos;
 }
 
 static void wav_header(FILE *f, uint32_t bytes, int rate) {
@@ -219,6 +350,11 @@ static void *audio_thread(void *unused) {
         if(got<=0)continue;
         pthread_mutex_lock(&g.param_lock); memcpy(p,g.values,sizeof(p)); pthread_mutex_unlock(&g.param_lock);
         int flags=atomic_load(&g.flags); float peaks[4]={0.f,0.f,0.f,0.f};
+        if (!(flags&DSP_ON) || !(flags&LIMITER_ON)) {
+            g.limiter_delay_frames=0;
+            atomic_store(&g.levels[4],1.f);
+            atomic_store(&g.levels[5],fmaxf(p[P_RELEASE],10.f));
+        }
         ConvolutionReverb *reverb=NULL;
         if((flags&REVERB_ON) && (flags&DSP_ON)) {
             pthread_mutex_lock(&g.reverb_lock);
@@ -272,14 +408,16 @@ static int open_stream(AAudioStream **stream, aaudio_direction_t direction, int 
 }
 
 JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEnv*e,jobject o,jint rate,jint frames,jint inDev,jint outDev,jint channels,jint pair,jboolean useNetworkInput){
-    (void)e;(void)o;if(atomic_load(&g.running))return JNI_TRUE;memset(g.eq,0,sizeof(g.eq));g.rate=rate;g.frames=frames;g.in_channels=channels;g.pair=pair;g.limiter_gain=1.f;atomic_store(&g.use_network_input,useNetworkInput?1:0);if(useNetworkInput)atomic_store(&g.net_last_packet_ns,now_ns());
+    (void)e;(void)o;if(atomic_load(&g.running))return JNI_TRUE;memset(g.eq,0,sizeof(g.eq));g.rate=rate;g.frames=frames;g.in_channels=channels;g.pair=pair;g.limiter_gain=1.0;g.limiter_delta=0.0;g.limiter_delay_frames=0;g.limiter_next_iter=g.limiter_next_len=0;atomic_store(&g.use_network_input,useNetworkInput?1:0);if(useNetworkInput)atomic_store(&g.net_last_packet_ns,now_ns());
     if(!atomic_load(&g.use_network_input) && !open_stream(&g.input,AAUDIO_DIRECTION_INPUT,channels,inDev,rate,frames)){LOGE("AAudio input open failed");return JNI_FALSE;}
     if(!open_stream(&g.output,AAUDIO_DIRECTION_OUTPUT,2,outDev,rate,frames)){LOGE("AAudio output open failed");if(g.input){AAudioStream_close(g.input);g.input=NULL;}return JNI_FALSE;}
     g.reverb=convolution_reverb_create(rate,g.values[P_ROOM],g.values[P_DECAY],g.values[P_DAMP]);
     g.net_capacity=(int)((int64_t)rate*NET_BUFFER_MAX_MS/1000)+MAX_FRAMES;
     g.net_buffer=calloc((size_t)g.net_capacity*2,sizeof(float)); g.net_read=g.net_write=g.net_count=0; g.net_started=0;
-    g.look_size=(int)(rate*.006f)*2+4;g.lookahead=calloc((size_t)g.look_size,sizeof(float));
-    if (!g.reverb || !g.lookahead || !g.net_buffer) { LOGE("DSP or network buffer allocation failed"); goto fail; }
+    g.look_pos=0;g.look_size=(int)(rate*.006f)*2+4;g.lookahead=calloc((size_t)g.look_size,sizeof(float));
+    g.limiter_next_pos=malloc((size_t)g.look_size*sizeof(*g.limiter_next_pos));
+    g.limiter_next_delta=calloc((size_t)g.look_size,sizeof(*g.limiter_next_delta));
+    if (!g.reverb || !g.lookahead || !g.limiter_next_pos || !g.limiter_next_delta || !g.net_buffer) { LOGE("DSP or network buffer allocation failed"); goto fail; }
     if(AAudioStream_requestStart(g.output)!=AAUDIO_OK || (g.input && AAudioStream_requestStart(g.input)!=AAUDIO_OK)) {
         LOGE("AAudioStream_requestStart failed");
         goto fail;
@@ -299,12 +437,14 @@ fail:
     if (g.output) { AAudioStream_requestStop(g.output); AAudioStream_close(g.output); g.output = NULL; }
     convolution_reverb_destroy(g.reverb); g.reverb=NULL;
     free(g.lookahead); g.lookahead=NULL;
+    free(g.limiter_next_pos); g.limiter_next_pos=NULL;
+    free(g.limiter_next_delta); g.limiter_next_delta=NULL;
     free(g.net_buffer); g.net_buffer=NULL;
     return JNI_FALSE;
 }
-JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stop(JNIEnv*e,jobject o){(void)e;(void)o;if(!atomic_exchange(&g.running,0))return;if(g.input)AAudioStream_requestStop(g.input);pthread_join(g.thread,NULL);atomic_store(&g.reverb_worker_running,0);if(atomic_exchange(&g.reverb_worker_started,0))pthread_join(g.reverb_thread,NULL);if(g.output)AAudioStream_requestStop(g.output);if(g.input)AAudioStream_close(g.input);if(g.output)AAudioStream_close(g.output);g.input=g.output=NULL;pthread_mutex_lock(&g.reverb_lock);ConvolutionReverb *reverb=g.reverb;g.reverb=NULL;pthread_mutex_unlock(&g.reverb_lock);convolution_reverb_destroy(reverb);free(g.lookahead);g.lookahead=NULL;free(g.net_buffer);g.net_buffer=NULL;g.net_capacity=g.net_count=0;}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stop(JNIEnv*e,jobject o){(void)e;(void)o;if(!atomic_exchange(&g.running,0))return;if(g.input)AAudioStream_requestStop(g.input);pthread_join(g.thread,NULL);atomic_store(&g.reverb_worker_running,0);if(atomic_exchange(&g.reverb_worker_started,0))pthread_join(g.reverb_thread,NULL);if(g.output)AAudioStream_requestStop(g.output);if(g.input)AAudioStream_close(g.input);if(g.output)AAudioStream_close(g.output);g.input=g.output=NULL;pthread_mutex_lock(&g.reverb_lock);ConvolutionReverb *reverb=g.reverb;g.reverb=NULL;pthread_mutex_unlock(&g.reverb_lock);convolution_reverb_destroy(reverb);free(g.lookahead);g.lookahead=NULL;free(g.limiter_next_pos);g.limiter_next_pos=NULL;free(g.limiter_next_delta);g.limiter_next_delta=NULL;free(g.net_buffer);g.net_buffer=NULL;g.net_capacity=g.net_count=0;}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_update(JNIEnv*e,jobject o,jint flags,jfloatArray values){(void)o;float incoming[24]={0};jsize n=(*e)->GetArrayLength(e,values);if(n>24)n=24;(*e)->GetFloatArrayRegion(e,values,0,n,incoming);pthread_mutex_lock(&g.param_lock);int reverb_changed=n>P_DAMP&&(g.values[P_ROOM]!=incoming[P_ROOM]||g.values[P_DECAY]!=incoming[P_DECAY]||g.values[P_DAMP]!=incoming[P_DAMP]);memcpy(g.values,incoming,(size_t)n*sizeof(float));pthread_mutex_unlock(&g.param_lock);if(reverb_changed)atomic_fetch_add(&g.reverb_generation,1);atomic_store(&g.flags,flags);}
-JNIEXPORT jfloatArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_levels(JNIEnv*e,jobject o){(void)o;jfloat v[4];for(int i=0;i<4;i++)v[i]=atomic_load(&g.levels[i]);jfloatArray a=(*e)->NewFloatArray(e,4);(*e)->SetFloatArrayRegion(e,a,0,4,v);return a;}
+JNIEXPORT jfloatArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_levels(JNIEnv*e,jobject o){(void)o;jfloat v[6];for(int i=0;i<6;i++)v[i]=atomic_load(&g.levels[i]);jfloatArray a=(*e)->NewFloatArray(e,6);(*e)->SetFloatArrayRegion(e,a,0,6,v);return a;}
 JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetwork(JNIEnv*e,jobject o,jint role,jint codec,jstring host,jint port,jint minMs,jint maxMs){(void)o;if(codec==1)return JNI_FALSE;const char*h=(*e)->GetStringUTFChars(e,host,NULL);if(g.net_sock>=0)close(g.net_sock);g.net_sock=socket(AF_INET,SOCK_DGRAM,0);if(g.net_sock<0){atomic_store(&g.net_role,0);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;}fcntl(g.net_sock,F_SETFL,O_NONBLOCK);memset(&g.net_addr,0,sizeof(g.net_addr));g.net_addr.sin_family=AF_INET;g.net_addr.sin_port=htons((uint16_t)port);inet_aton(h,&g.net_addr.sin_addr);atomic_store(&g.net_role,role);atomic_store(&g.net_last_packet_ns,now_ns());atomic_store(&g.net_packet_seen,0);g.net_codec=codec;g.net_port=port;g.net_min_ms=minMs<0?0:(minMs>200?200:minMs);g.net_max_ms=maxMs<50?50:(maxMs>1000?1000:maxMs);if(g.net_max_ms<g.net_min_ms)g.net_min_ms=g.net_max_ms;g.net_read=g.net_write=g.net_count=0;g.net_started=0;if(role==2&&bind(g.net_sock,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr))<0){close(g.net_sock);g.net_sock=-1;atomic_store(&g.net_role,0);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;}(*e)->ReleaseStringUTFChars(e,host,h);return JNI_TRUE;}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearNetwork(JNIEnv*e,jobject o){(void)e;(void)o;if(g.net_sock>=0)close(g.net_sock);g.net_sock=-1;atomic_store(&g.net_role,0);g.net_read=g.net_write=g.net_count=0;g.net_started=0;}
 JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkInputTimedOut(JNIEnv*e,jobject o,jint timeoutMs){(void)e;(void)o;if(atomic_load(&g.net_role)!=2||timeoutMs<=0)return JNI_FALSE;uint64_t last=atomic_load(&g.net_last_packet_ns),now=now_ns();return now>last&&(now-last)>=(uint64_t)timeoutMs*1000000ull?JNI_TRUE:JNI_FALSE;}

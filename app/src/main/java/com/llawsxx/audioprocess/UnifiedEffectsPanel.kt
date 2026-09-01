@@ -12,8 +12,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -46,10 +48,20 @@ fun UnifiedEffectsPanel(settings: EffectSettings, onChange: (EffectSettings) -> 
             ParameterSlider("Dry / Wet", settings.reverbMix, 0f..100f, { onChange(settings.copy(reverbMix = it)) }, "${settings.reverbMix.toInt()}%")
 
             GroupTitle("限制器 Limiter")
-            ParameterSlider("Input Gain", settings.limiterInputGain, -24f..24f, { onChange(settings.copy(limiterInputGain = it)) }, "${settings.limiterInputGain.toInt()} dB")
-            ParameterSlider("Threshold", settings.limiterThreshold, -24f..0f, { onChange(settings.copy(limiterThreshold = it)) }, "${settings.limiterThreshold.toInt()} dB")
+            ParameterSlider("Input Gain", settings.limiterInputGain, -24f..24f, { onChange(settings.copy(limiterInputGain = it)) }, limiterDbLabel(settings.limiterInputGain))
+            ParameterSlider("Threshold", settings.limiterThreshold, -24f..0f, { onChange(settings.copy(limiterThreshold = it)) }, limiterDbLabel(settings.limiterThreshold))
             ParameterSlider("Release", settings.limiterRelease, 10f..10000f, { onChange(settings.copy(limiterRelease = it)) }, releaseLabel(settings.limiterRelease))
-            ParameterSlider("Ceiling", settings.limiterCeiling, -6f..0f, { onChange(settings.copy(limiterCeiling = it)) }, "${settings.limiterCeiling.toInt()} dB")
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("自适应释放", color = Color.White, fontSize = 11.sp)
+                    Text("短峰值快速恢复，持续峰值平滑恢复", color = UnifiedMuted, fontSize = 10.sp)
+                }
+                Switch(
+                    checked = settings.limiterAdaptiveRelease,
+                    onCheckedChange = { onChange(settings.copy(limiterAdaptiveRelease = it)) }
+                )
+            }
+            ParameterSlider("Ceiling", settings.limiterCeiling, -6f..0f, { onChange(settings.copy(limiterCeiling = it)) }, limiterDbLabel(settings.limiterCeiling))
             ParameterSlider("Look-ahead", settings.limiterLookAhead, 0f..5f, { onChange(settings.copy(limiterLookAhead = it)) }, "${"%.1f".format(settings.limiterLookAhead)} ms")
 
         }
@@ -63,13 +75,15 @@ private fun GroupTitle(text: String) {
 
 @Composable
 private fun ParameterSlider(label: String, value: Float, range: ClosedFloatingPointRange<Float>, onChange: (Float) -> Unit, readout: String) {
-    Row(Modifier.fillMaxWidth()) {
-        Text(label, color = Color.White, fontSize = 11.sp, modifier = Modifier.weight(.25f))
-        Slider(value = value, onValueChange = onChange, valueRange = range, modifier = Modifier.weight(.64f).height(30.dp))
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = Color.White, fontSize = 11.sp, modifier = Modifier.width(72.dp), maxLines = 1)
+        Slider(value = value, onValueChange = onChange, valueRange = range, modifier = Modifier.weight(1f).height(30.dp))
         Spacer(Modifier.width(14.dp))
-        Text(readout, color = UnifiedMuted, fontSize = 10.sp, modifier = Modifier.weight(.11f))
+        Text(readout, color = UnifiedMuted, fontSize = 10.sp, modifier = Modifier.width(72.dp), maxLines = 1)
     }
 }
 
 private fun releaseLabel(value: Float): String =
     if (value >= 1000f) "${"%.2f".format(value / 1000f)} s" else "${value.toInt()} ms"
+
+private fun limiterDbLabel(value: Float): String = "%.2f dB".format(value)

@@ -45,7 +45,7 @@ class AudioEngine(private val context: Context) {
     @Volatile var eq3Frequency = 4000f; @Volatile var eq3Gain = 0f; @Volatile var eq3Q = 1f
     @Volatile var eq4Frequency = 10000f; @Volatile var eq4Gain = 0f; @Volatile var eq4Q = 1f
     @Volatile var reverbRoom = 42f; @Volatile var reverbDecay = 1.8f; @Volatile var reverbDamping = 35f; @Volatile var reverbMix = .18f
-    @Volatile var limiterInputGain = 0f; @Volatile var limiterThreshold = -.5f; @Volatile var limiterRelease = 80f; @Volatile var limiterCeiling = -.5f; @Volatile var limiterLookAhead = 1f
+    @Volatile var limiterInputGain = 0f; @Volatile var limiterThreshold = -.5f; @Volatile var limiterRelease = 80f; @Volatile var limiterCeiling = -.5f; @Volatile var limiterLookAhead = 1f; @Volatile var limiterAdaptiveRelease = false
     @Volatile var dspEnabled = true; @Volatile var eqEnabled = true; @Volatile var reverbEnabled = true; @Volatile var limiterEnabled = true
     @Volatile var isRunning = false; private set
     @Volatile var isRecording = false; private set
@@ -327,7 +327,7 @@ class AudioEngine(private val context: Context) {
     }
     fun stop() { if (isRecording) setRecording(false); routeHandler.removeCallbacks(routeRestart); routeHandler.removeCallbacks(routeRefresh); routeHandler.removeCallbacks(wifiHealthMonitor); routeHandler.removeCallbacks(bluetoothRouteMonitor); NativeAudio.stop(); clearBluetoothRoute(); activeInputDeviceId = -1; activeOutputDeviceId = -1; observedBluetoothDeviceId = Int.MIN_VALUE; bluetoothRetryCount = 0; nextBluetoothRetryAtMs = 0L; isRecording = false; isRunning = false }
     fun refreshNativeParameters() { pushNativeParameters() }
-    private fun pushNativeParameters() { if (NativeAudio.available) NativeAudio.update((if (dspEnabled) 1 else 0) or (if (eqEnabled) 2 else 0) or (if (reverbEnabled) 4 else 0) or (if (limiterEnabled) 8 else 0), floatArrayOf(eqFrequency, eqGain, eqQ, eq2Frequency, eq2Gain, eq2Q, eq3Frequency, eq3Gain, eq3Q, eq4Frequency, eq4Gain, eq4Q, reverbRoom, reverbDecay, reverbDamping, reverbMix * 100f, limiterInputGain, limiterThreshold, limiterRelease, limiterCeiling, limiterLookAhead)) }
+    private fun pushNativeParameters() { if (NativeAudio.available) NativeAudio.update((if (dspEnabled) 1 else 0) or (if (eqEnabled) 2 else 0) or (if (reverbEnabled) 4 else 0) or (if (limiterEnabled) 8 else 0), floatArrayOf(eqFrequency, eqGain, eqQ, eq2Frequency, eq2Gain, eq2Q, eq3Frequency, eq3Gain, eq3Q, eq4Frequency, eq4Gain, eq4Q, reverbRoom, reverbDecay, reverbDamping, reverbMix * 100f, limiterInputGain, limiterThreshold, limiterRelease, limiterCeiling, limiterLookAhead, if (limiterAdaptiveRelease) 1f else 0f)) }
 
     companion object {
         private const val BLUETOOTH_MONITOR_INTERVAL_MS = 1_000L

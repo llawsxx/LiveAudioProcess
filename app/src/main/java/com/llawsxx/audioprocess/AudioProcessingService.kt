@@ -74,7 +74,7 @@ class AudioProcessingService : Service() {
         engine.eq3Frequency = effects.eq3Frequency; engine.eq3Gain = effects.eq3Gain; engine.eq3Q = effects.eq3Q
         engine.eq4Frequency = effects.eq4Frequency; engine.eq4Gain = effects.eq4Gain; engine.eq4Q = effects.eq4Q
         engine.reverbRoom = effects.reverbRoom; engine.reverbDecay = effects.reverbDecay; engine.reverbDamping = effects.reverbDamping; engine.reverbMix = effects.reverbMix / 100f
-        engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead
+        engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease
         engine.sampleRate = p.getInt("rate", 48_000); engine.bufferFrames = p.getInt("buffer", 256)
         engine.wifiInputTimeoutMs = (((p.getString("wifiInputTimeout", "1.0")?.toFloatOrNull() ?: 1f) * 1000f).toInt()).coerceIn(100, 60_000)
         engine.inputPair = p.getInt("channelPair", 0)
@@ -83,8 +83,10 @@ class AudioProcessingService : Service() {
         val wifiOutputEnabled = p.getBoolean("wifiOutputEnabled", false)
         val wifiRole = if (engine.inputSource == InputSource.WIFI) 2 else if (wifiOutputEnabled) 1 else 0
         if (wifiRole != 0) {
-            val host = p.getString("wifiHost", "192.168.1.2") ?: "192.168.1.2"
-            val port = p.getString("wifiPort", "40100")?.toIntOrNull() ?: 40100
+            val legacyHost = p.getString("wifiHost", "192.168.1.2") ?: "192.168.1.2"
+            val legacyPort = p.getString("wifiPort", "40100") ?: "40100"
+            val host = if (wifiRole == 2) p.getString("wifiReceiveHost", legacyHost) ?: legacyHost else p.getString("wifiSendHost", legacyHost) ?: legacyHost
+            val port = if (wifiRole == 2) p.getString("wifiReceivePort", legacyPort)?.toIntOrNull() ?: 40100 else p.getString("wifiSendPort", legacyPort)?.toIntOrNull() ?: 40100
             val minBuffer = (p.getString("wifiMinBuffer", "50")?.toIntOrNull() ?: 50).coerceIn(0, 200)
             val maxBuffer = (p.getString("wifiMaxBuffer", "100")?.toIntOrNull() ?: 100).coerceIn(50, 1000)
             engine.configureNetwork(wifiRole, 0, host, port, minBuffer, maxBuffer)
