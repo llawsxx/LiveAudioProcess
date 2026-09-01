@@ -15,8 +15,10 @@ object NativeAudio {
     external fun stopRecording()
     external fun configureNetwork(role: Int, codec: Int, host: String, port: Int, minBufferMs: Int, maxBufferMs: Int): Boolean
     external fun configureUsbOutputBuffer(minBufferMs: Int, maxBufferMs: Int)
+    external fun configureOutputBufferBursts(bursts: Int)
     external fun clearNetwork()
     external fun networkInputTimedOut(timeoutMs: Int): Boolean
     external fun routeInfo(): IntArray
+    external fun outputInfo(): LongArray
     external fun usbStats(): LongArray
 }

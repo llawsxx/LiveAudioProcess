@@ -142,6 +142,10 @@ private fun LiveAudioProcessApp() {
         mutableIntStateOf(prefs.getInt("usbOutputBurstPackets", legacyUsbBurstPackets).takeIf { it == 1 || it == 2 || it == 4 || it == 8 || it == 16 } ?: 8)
     }
     var usbStats by remember { mutableStateOf(LongArray(12)) }
+    var outputInfo by remember { mutableStateOf(LongArray(13)) }
+    var systemOutputBufferBursts by remember {
+        mutableIntStateOf(prefs.getInt("systemOutputBufferBursts", 4).takeIf { it == 2 || it == 3 || it == 4 || it == 6 } ?: 4)
+    }
     var routeNotice by remember { mutableStateOf<String?>(null) }
     var elapsed by remember { mutableIntStateOf(0) }
     var hasPermission by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) }
@@ -168,8 +172,10 @@ private fun LiveAudioProcessApp() {
     }
     LaunchedEffect(recording) { while (recording) { delay(1000); elapsed++ } }
     LaunchedEffect(running) {
+        if (!running) outputInfo = LongArray(13)
         while (running && NativeAudio.available) {
             val levels = NativeAudio.levels(); if (levels.size >= 4) { inputLevelL = levels[0]; inputLevelR = levels[1]; outputLevelL = levels[2]; outputLevelR = levels[3] }; if (levels.size >= 6) { limiterGain = levels[4]; limiterReleaseMs = levels[5] }; delay(50)
+            outputInfo = NativeAudio.outputInfo()
         }
     }
     LaunchedEffect(running, input, output) {
@@ -187,7 +193,7 @@ private fun LiveAudioProcessApp() {
         wifiOutputEnabled -> engine.configureNetwork(1, 0, wifiSendHost, wifiSendPort.toIntOrNull() ?: 40100, 0, 50)
         else -> { engine.clearNetwork(); false }
     }
-    fun syncEngine() { engine.configureAudioFormat(rate, usbBitDepth); engine.bufferFrames = buffer; engine.eqGain = effects.eqGain; engine.eqFrequency = effects.eqFrequency; engine.eqQ = effects.eqQ; engine.eq2Frequency = effects.eq2Frequency; engine.eq2Gain = effects.eq2Gain; engine.eq2Q = effects.eq2Q; engine.eq3Frequency = effects.eq3Frequency; engine.eq3Gain = effects.eq3Gain; engine.eq3Q = effects.eq3Q; engine.eq4Frequency = effects.eq4Frequency; engine.eq4Gain = effects.eq4Gain; engine.eq4Q = effects.eq4Q; engine.reverbRoom = effects.reverbRoom; engine.reverbDecay = effects.reverbDecay; engine.reverbDamping = effects.reverbDamping; engine.reverbMix = effects.reverbMix / 100f; engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease; engine.wifiInputTimeoutMs = ((wifiInputTimeout.toFloatOrNull() ?: 1f) * 1000f).toInt().coerceIn(100, 60_000); engine.updateRouting(input, output, channelPair); effects.save(prefs); prefs.edit().putInt("rate", rate).putInt("usbBitDepth", usbBitDepth).putInt("buffer", buffer).putInt("channelPair", channelPair).putString("input", input.name).putString("output", output.name).putBoolean("wifiOutputEnabled", wifiOutputEnabled).putBoolean("wifiActive", wifiActive).apply() }
+    fun syncEngine() { engine.configureAudioFormat(rate, usbBitDepth); engine.bufferFrames = buffer; engine.configureSystemOutputBuffer(systemOutputBufferBursts); engine.eqGain = effects.eqGain; engine.eqFrequency = effects.eqFrequency; engine.eqQ = effects.eqQ; engine.eq2Frequency = effects.eq2Frequency; engine.eq2Gain = effects.eq2Gain; engine.eq2Q = effects.eq2Q; engine.eq3Frequency = effects.eq3Frequency; engine.eq3Gain = effects.eq3Gain; engine.eq3Q = effects.eq3Q; engine.eq4Frequency = effects.eq4Frequency; engine.eq4Gain = effects.eq4Gain; engine.eq4Q = effects.eq4Q; engine.reverbRoom = effects.reverbRoom; engine.reverbDecay = effects.reverbDecay; engine.reverbDamping = effects.reverbDamping; engine.reverbMix = effects.reverbMix / 100f; engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease; engine.wifiInputTimeoutMs = ((wifiInputTimeout.toFloatOrNull() ?: 1f) * 1000f).toInt().coerceIn(100, 60_000); engine.updateRouting(input, output, channelPair); effects.save(prefs); prefs.edit().putInt("rate", rate).putInt("usbBitDepth", usbBitDepth).putInt("buffer", buffer).putInt("systemOutputBufferBursts", systemOutputBufferBursts).putInt("channelPair", channelPair).putString("input", input.name).putString("output", output.name).putBoolean("wifiOutputEnabled", wifiOutputEnabled).putBoolean("wifiActive", wifiActive).apply() }
     LaunchedEffect(input, channelPair, output, wifiOutputEnabled, rate, usbBitDepth, buffer, effects) { syncEngine(); engine.dspEnabled = effects.dspEnabled; engine.eqEnabled = effects.eqEnabled; engine.reverbEnabled = effects.reverbEnabled; engine.limiterEnabled = effects.limiterEnabled; engine.limiterInputGain = effects.limiterInputGain; if (input == InputSource.WIFI || wifiOutputEnabled) wifiActive = configureWifiForCurrentRoute() else { engine.clearNetwork(); wifiActive = false }; engine.refreshNativeParameters() }
     LaunchedEffect(wifiSendHost, wifiSendPort) {
         prefs.edit().putString("wifiSendHost", wifiSendHost).putString("wifiSendPort", wifiSendPort).apply()
@@ -214,6 +220,10 @@ private fun LiveAudioProcessApp() {
             .apply()
         engine.configureUsbBursts(usbInputBurstPackets, usbOutputBurstPackets)
     }
+    LaunchedEffect(systemOutputBufferBursts) {
+        prefs.edit().putInt("systemOutputBufferBursts", systemOutputBufferBursts).apply()
+        engine.configureSystemOutputBuffer(systemOutputBufferBursts)
+    }
     fun startMonitoring() {
         syncEngine()
         ContextCompat.startForegroundService(
@@ -232,6 +242,7 @@ private fun LiveAudioProcessApp() {
             LevelPanel(inputLevelL, inputLevelR, outputLevelL, outputLevelR, limiterGain, limiterReleaseMs, running, running && effects.dspEnabled && effects.limiterEnabled)
             RoutingPanel2(input, { selected -> input = selected; channelPair = 0; if (selected == InputSource.WIFI) wifiOutputEnabled = false; wifiActive = configureWifiForCurrentRoute(); syncEngine() }, output, { selected -> if (selected == OutputSource.BLUETOOTH && Build.VERSION.SDK_INT >= 31 && ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) { pendingBluetoothOutput = selected; bluetoothPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT) } else { output = selected; syncEngine() } }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
             EnginePanel(rate, { rate = it; syncEngine() }, buffer, { buffer = it; syncEngine() }, running)
+            SystemOutputPanel(outputInfo, output != OutputSource.USB, systemOutputBufferBursts) { systemOutputBufferBursts = it }
             if (input == InputSource.USB || output == OutputSource.USB) {
                 UsbAudioPanel(usbMinBuffer, usbMaxBuffer, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets, input == InputSource.USB, output == OutputSource.USB, running, usbStats, { usbMinBuffer = it }, { usbMaxBuffer = it }, { usbBitDepth = it }, { usbInputBurstPackets = it }, { usbOutputBurstPackets = it })
             }
