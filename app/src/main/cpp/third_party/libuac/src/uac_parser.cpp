@@ -302,7 +302,8 @@ namespace uac {
 
     uac_format_type_1* parse_as_format_type_1_3(const uint8_t *data, int size) {
         uint8_t bSamFreqType = data[7];
-        uac_format_type_1 *desc = (uac_format_type_1*) malloc(sizeof(uac_format_type_1) + sizeof(uint32_t [bSamFreqType]));
+        uac_format_type_1 *desc = (uac_format_type_1*) malloc(
+                sizeof(uac_format_type_1) + sizeof(uint32_t) * bSamFreqType);
         desc->bFormatType = (uac_format_type) data[3];
         desc->bNrChannels = data[4];
         desc->bSubframeSize = data[5];

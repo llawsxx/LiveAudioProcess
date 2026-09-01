@@ -12,6 +12,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
@@ -31,6 +32,7 @@ fun UsbAudioPanel(
     outputBurstPackets: Int,
     inputEnabled: Boolean,
     outputEnabled: Boolean,
+    stats: LongArray,
     onMinBuffer: (String) -> Unit,
     onMaxBuffer: (String) -> Unit,
     onInputBurstPackets: (Int) -> Unit,
@@ -80,7 +82,39 @@ fun UsbAudioPanel(
             Text("范围：最小 8–200 ms，最大 8–500 ms", color = muted, fontSize = 10.sp)
             BurstChoice("输入 Burst（USB 包 / transfer）", inputBurstPackets, inputEnabled, muted, onInputBurstPackets)
             BurstChoice("输出 Burst（USB 包 / transfer）", outputBurstPackets, outputEnabled, muted, onOutputBurstPackets)
+            HorizontalDivider(color = Color(0xFF344248))
+            Text("本次 USB 状态", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            UsbStatPair("输入异常包", stats.getOrElse(0) { 0 }, "输入空包", stats.getOrElse(1) { 0 }, muted)
+            UsbStatPair("输入传输异常", stats.getOrElse(2) { 0 }, "输入 Ring 溢出", stats.getOrElse(3) { 0 }, muted)
+            UsbStatPair("输出传输异常", stats.getOrElse(4) { 0 }, "输出低水位", stats.getOrElse(5) { 0 }, muted)
         }
+    }
+}
+
+@Composable
+private fun UsbStatPair(
+    firstLabel: String,
+    firstValue: Long,
+    secondLabel: String,
+    secondValue: Long,
+    muted: Color
+) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        UsbStat(firstLabel, firstValue, muted, Modifier.weight(1f))
+        UsbStat(secondLabel, secondValue, muted, Modifier.weight(1f))
+    }
+}
+
+@Composable
+private fun UsbStat(label: String, value: Long, muted: Color, modifier: Modifier = Modifier) {
+    Row(modifier, horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(label, color = muted, fontSize = 11.sp)
+        Text(
+            value.toString(),
+            color = if (value == 0L) Color(0xFF43D5C1) else Color(0xFFFF6B6B),
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold
+        )
     }
 }
 

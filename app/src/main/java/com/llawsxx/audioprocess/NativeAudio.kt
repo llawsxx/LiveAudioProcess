@@ -18,4 +18,5 @@ object NativeAudio {
     external fun clearNetwork()
     external fun networkInputTimedOut(timeoutMs: Int): Boolean
     external fun routeInfo(): IntArray
+    external fun usbStats(): LongArray
 }

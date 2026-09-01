@@ -31,6 +31,7 @@ add_library(uac STATIC
 target_include_directories(uac PRIVATE ${LIBUAC_ROOT}/src ${LIBUAC_ROOT}/include ${LIBUSB_ROOT}/libusb ${LIBUSB_ROOT})
 target_link_libraries(uac PRIVATE libusb)
 target_compile_options(uac PRIVATE -fno-rtti -pthread)
+target_compile_definitions(uac PRIVATE UAC_ENABLE_LOGGING)
 
 add_library(pulseforge_audio SHARED native_audio.c convolution_reverb.c usb_host_bridge.cpp)
 target_include_directories(pulseforge_audio PRIVATE ${LIBUAC_ROOT}/include ${LIBUSB_ROOT}/libusb)

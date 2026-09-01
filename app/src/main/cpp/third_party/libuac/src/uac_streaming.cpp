@@ -40,7 +40,10 @@ namespace uac {
                     libusb_iso_packet_descriptor* packet = transfer->iso_packet_desc + packet_id;
                     //LOG_DEBUG("packet %d actual_len=%u", packet_id, packet->actual_length);
                     if (packet->actual_length > packet->length) {
+                        uint64_t count = strmh->packetErrors.fetch_add(1) + 1;
                         LOG_WARN("kernel misbehaviour with returned actual_length (%u>%u)", packet->actual_length, packet->length);
+                        if (count == 1 || count % 100 == 0)
+                            LOG_WARN("input packet error count=%llu", (unsigned long long)count);
                         strmh->usbTransferError = UAC_ERROR_KERNEL_MALFUNCTION;
                         dropTransfer = true;
                         break;
@@ -55,14 +58,30 @@ namespace uac {
                             LOG_DEBUG("SWAP CHANNELS packet %d actual_len=%d offset=%d", packet_id, packet->actual_length, offset);
                         }
                         strmh->cb_func(pktbuf, packet->actual_length);
+                    } else if (packet->status == LIBUSB_TRANSFER_COMPLETED) {
+                        uint64_t count = strmh->emptyPackets.fetch_add(1) + 1;
+                        if (count == 1 || count % 100 == 0)
+                            LOG_WARN("empty input packet count=%llu", (unsigned long long)count);
+                    } else {
+                        uint64_t count = strmh->packetErrors.fetch_add(1) + 1;
+                        if (count == 1 || count % 100 == 0)
+                            LOG_WARN("input packet status=%d count=%llu",
+                                     (int)packet->status,
+                                     (unsigned long long)count);
                     }
                 }
                 if (dropTransfer) break;
                 // else, fall through
             case LIBUSB_TRANSFER_TIMED_OUT:
                 // resubmit transfer
+                if (transfer->status == LIBUSB_TRANSFER_TIMED_OUT && strmh->active) {
+                    uint64_t count = strmh->transferErrors.fetch_add(1) + 1;
+                    if (count == 1 || count % 100 == 0)
+                        LOG_WARN("transfer timeout count=%llu", (unsigned long long)count);
+                }
                 errval = strmh->active ? libusb_submit_transfer(transfer) : LIBUSB_ERROR_INTERRUPTED;
                 if (errval != LIBUSB_SUCCESS) {
+                    if (strmh->active) strmh->transferErrors.fetch_add(1);
                     LOG_DEBUG("on time out: submit transfer... %s", libusb_error_name(errval));
                     dropTransfer = true;
                 }
@@ -72,7 +91,13 @@ namespace uac {
             case LIBUSB_TRANSFER_STALL:
 	        case LIBUSB_TRANSFER_NO_DEVICE:
 	        case LIBUSB_TRANSFER_OVERFLOW:
-                LOG_WARN("finish transfer due to %s", libusb_error_name(transfer->status));
+                if (strmh->active) {
+                    uint64_t count = strmh->transferErrors.fetch_add(1) + 1;
+                    if (count == 1 || count % 100 == 0)
+                        LOG_WARN("transfer status=%d count=%llu",
+                                 (int)transfer->status,
+                                 (unsigned long long)count);
+                }
                 dropTransfer = true;
                 break;
         }
@@ -349,6 +374,10 @@ namespace uac {
 
     error_code uac_stream_handle_impl::check_streaming_error() const {
         return usbTransferError;
+    }
+
+    uac_stream_stats uac_stream_handle_impl::get_streaming_stats() const {
+        return {packetErrors.load(), emptyPackets.load(), transferErrors.load()};
     }
 
     bool uac_stream_handle_impl::is_active() const {

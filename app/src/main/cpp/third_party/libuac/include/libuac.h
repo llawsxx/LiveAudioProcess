@@ -18,6 +18,7 @@
 #include <memory>
 #include <vector>
 #include <functional>
+#include <cstdint>
 
 namespace uac {
 
@@ -277,6 +278,12 @@ namespace uac {
     /**
      * A handle to the opened audio stream.
      */
+    struct uac_stream_stats {
+        uint64_t packet_errors;
+        uint64_t empty_packets;
+        uint64_t transfer_errors;
+    };
+
     class uac_stream_handle {
     public:
         virtual ~uac_stream_handle() = default;
@@ -284,6 +291,7 @@ namespace uac {
         virtual void set_sampling_rate(uint32_t samplingRate) = 0;
 
         virtual error_code check_streaming_error() const = 0;
+        virtual uac_stream_stats get_streaming_stats() const = 0;
     };
 
     /**

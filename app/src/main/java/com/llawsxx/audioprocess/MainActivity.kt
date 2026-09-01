@@ -138,6 +138,7 @@ private fun LiveAudioProcessApp() {
     var usbOutputBurstPackets by remember {
         mutableIntStateOf(prefs.getInt("usbOutputBurstPackets", legacyUsbBurstPackets).takeIf { it == 1 || it == 2 || it == 4 || it == 8 || it == 16 } ?: 8)
     }
+    var usbStats by remember { mutableStateOf(LongArray(6)) }
     var routeNotice by remember { mutableStateOf<String?>(null) }
     var elapsed by remember { mutableIntStateOf(0) }
     var hasPermission by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) }
@@ -166,6 +167,16 @@ private fun LiveAudioProcessApp() {
     LaunchedEffect(running) {
         while (running && NativeAudio.available) {
             val levels = NativeAudio.levels(); if (levels.size >= 4) { inputLevelL = levels[0]; inputLevelR = levels[1]; outputLevelL = levels[2]; outputLevelR = levels[3] }; if (levels.size >= 6) { limiterGain = levels[4]; limiterReleaseMs = levels[5] }; delay(50)
+        }
+    }
+    LaunchedEffect(running, input, output) {
+        if (!running || (input != InputSource.USB && output != OutputSource.USB)) {
+            usbStats = LongArray(6)
+            return@LaunchedEffect
+        }
+        while (running && NativeAudio.available) {
+            usbStats = NativeAudio.usbStats()
+            delay(500)
         }
     }
     fun configureWifiForCurrentRoute(): Boolean = when {
@@ -219,7 +230,7 @@ private fun LiveAudioProcessApp() {
             RoutingPanel2(input, { selected -> input = selected; channelPair = 0; if (selected == InputSource.WIFI) wifiOutputEnabled = false; wifiActive = configureWifiForCurrentRoute(); syncEngine() }, output, { selected -> if (selected == OutputSource.BLUETOOTH && Build.VERSION.SDK_INT >= 31 && ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) { pendingBluetoothOutput = selected; bluetoothPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT) } else { output = selected; syncEngine() } }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
             EnginePanel(rate, { rate = it; syncEngine() }, buffer, { buffer = it; syncEngine() }, running)
             if (input == InputSource.USB || output == OutputSource.USB) {
-                UsbAudioPanel(usbMinBuffer, usbMaxBuffer, usbInputBurstPackets, usbOutputBurstPackets, input == InputSource.USB, output == OutputSource.USB, { usbMinBuffer = it }, { usbMaxBuffer = it }, { usbInputBurstPackets = it }, { usbOutputBurstPackets = it })
+                UsbAudioPanel(usbMinBuffer, usbMaxBuffer, usbInputBurstPackets, usbOutputBurstPackets, input == InputSource.USB, output == OutputSource.USB, usbStats, { usbMinBuffer = it }, { usbMaxBuffer = it }, { usbInputBurstPackets = it }, { usbOutputBurstPackets = it })
             }
             Float32Badge()
             ProcessingControlPanel(effects) { effects = it }

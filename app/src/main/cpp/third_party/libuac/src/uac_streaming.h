@@ -33,6 +33,7 @@ namespace uac {
         void set_sampling_rate(const uint32_t samplingRate) override;
 
         error_code check_streaming_error() const override;
+        uac_stream_stats get_streaming_stats() const override;
 
         bool is_active() const;
 
@@ -64,5 +65,8 @@ namespace uac {
         std::vector<libusb_transfer*> transfers;
 
         error_code usbTransferError = UAC_NO_ERROR;
+        std::atomic<uint64_t> packetErrors{0};
+        std::atomic<uint64_t> emptyPackets{0};
+        std::atomic<uint64_t> transferErrors{0};
     };
 }

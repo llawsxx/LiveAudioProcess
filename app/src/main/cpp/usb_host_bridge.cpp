@@ -91,6 +91,28 @@ public:
         USB_HOST_LOGI("USB output buffer configured min=%d, target=%d, max=%d frames",
                       outputMinFrames_, outputPrerollFrames_, outputMaxPrerollFrames_);
     }
+    usb_host_audio_stats_t stats() {
+        usb_host_audio_stats_t result{};
+        if (inputStream_) {
+            const auto streamStats = inputStream_->get_streaming_stats();
+            result.input_packet_errors = streamStats.packet_errors;
+            result.input_empty_packets = streamStats.empty_packets;
+            result.input_transfer_errors = streamStats.transfer_errors;
+        }
+        if (outputStream_) {
+            const auto streamStats = outputStream_->get_streaming_stats();
+            result.output_transfer_errors = streamStats.transfer_errors;
+        }
+        {
+            std::lock_guard<std::mutex> lock(inputMutex_);
+            result.input_ring_overruns = inputRingOverruns_;
+        }
+        {
+            std::lock_guard<std::mutex> lock(outputMutex_);
+            result.output_low_water_events = outputUnderruns_;
+        }
+        return result;
+    }
 private:
     static constexpr int kRingFrames = 96000;
     static float decode(const uint8_t *s, int n) {
@@ -111,7 +133,7 @@ private:
         int stride = bytes * ch; if (stride <= 0) return; int count = (int)(len / (uint)stride);
         {
             std::lock_guard<std::mutex> lock(inputMutex_);
-            for (int i = 0; i < count; ++i) { const uint8_t *f = data + i * stride; float l = decode(f, bytes), r = ch > 1 ? decode(f + bytes, bytes) : l; if (inputCount_ == kRingFrames) { inputRead_ = (inputRead_ + 1) % kRingFrames; --inputCount_; } int p = inputWrite_; inputWrite_ = (inputWrite_ + 1) % kRingFrames; inputRing_[2*p] = l; inputRing_[2*p+1] = r; ++inputCount_; }
+            for (int i = 0; i < count; ++i) { const uint8_t *f = data + i * stride; float l = decode(f, bytes), r = ch > 1 ? decode(f + bytes, bytes) : l; if (inputCount_ == kRingFrames) { inputRead_ = (inputRead_ + 1) % kRingFrames; --inputCount_; ++inputRingOverruns_; } int p = inputWrite_; inputWrite_ = (inputWrite_ + 1) % kRingFrames; inputRing_[2*p] = l; inputRing_[2*p+1] = r; ++inputCount_; }
         }
         inputCv_.notify_one();
     }
@@ -176,11 +198,12 @@ private:
     int inputBurstPackets_=8, outputBurstPackets_=8;
     int outputTransferFrames_=0, outputMinFrames_=1, outputPrerollFrames_=1, outputMaxPrerollFrames_=1;
     bool outputPrimed_=false, outputHasData_=false;
-    uint64_t outputUnderruns_=0;
+    uint64_t inputRingOverruns_=0, outputUnderruns_=0;
 };
 }
 extern "C" usb_host_audio_t usb_host_audio_start(int fd, int rate, int in, int out, int minMs, int maxMs, int inputBurst, int outputBurst) { try { return new UsbHostAudio(fd, rate, in != 0, out != 0, minMs, maxMs, inputBurst, outputBurst); } catch (const std::exception &e) { USB_HOST_LOGE("USB Host audio start failed: %s", e.what()); return nullptr; } catch (...) { USB_HOST_LOGE("USB Host audio start failed"); return nullptr; } }
 extern "C" int usb_host_audio_read(usb_host_audio_t a, float *d, int n) { return a ? static_cast<UsbHostAudio *>(a)->read(d, n) : 0; }
 extern "C" int usb_host_audio_write(usb_host_audio_t a, const float *d, int n) { return a ? static_cast<UsbHostAudio *>(a)->write(d, n) : 0; }
 extern "C" void usb_host_audio_configure_output_buffer(usb_host_audio_t a, int minMs, int maxMs) { if (a) static_cast<UsbHostAudio *>(a)->configureOutputBuffer(minMs, maxMs); }
+extern "C" void usb_host_audio_get_stats(usb_host_audio_t a, usb_host_audio_stats_t *stats) { if (!stats) return; *stats = a ? static_cast<UsbHostAudio *>(a)->stats() : usb_host_audio_stats_t{}; }
 extern "C" void usb_host_audio_stop(usb_host_audio_t a) { delete static_cast<UsbHostAudio *>(a); }
