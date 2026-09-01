@@ -2,9 +2,15 @@ package com.llawsxx.audioprocess
 
 import android.Manifest
 import android.app.Activity
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.hardware.usb.UsbConstants
+import android.hardware.usb.UsbManager
 import android.os.Bundle
 import android.os.Build
 import android.view.WindowManager
@@ -36,9 +42,53 @@ import com.llawsxx.audioprocess.ui.theme.LiveAudioProcessTheme
 import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
+    private val usbPermissionAction = "com.llawsxx.audioprocess.USB_AUDIO_PERMISSION"
+    private var usbPermissionCallback: ((Boolean) -> Unit)? = null
+    private val usbPermissionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != usbPermissionAction) return
+            val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+            usbPermissionCallback?.invoke(granted)
+            usbPermissionCallback = null
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val filter = IntentFilter(usbPermissionAction)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(usbPermissionReceiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(usbPermissionReceiver, filter)
+        }
         setContent { LiveAudioProcessTheme { LiveAudioProcessApp() } }
+    }
+
+    override fun onDestroy() {
+        usbPermissionCallback = null
+        runCatching { unregisterReceiver(usbPermissionReceiver) }
+        super.onDestroy()
+    }
+
+    fun requestUsbAudioPermission(onResult: (Boolean) -> Unit) {
+        val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
+        val device = usbManager.deviceList.values.firstOrNull { usbDevice ->
+            (0 until usbDevice.interfaceCount).any {
+                usbDevice.getInterface(it).interfaceClass == UsbConstants.USB_CLASS_AUDIO
+            }
+        }
+        if (device == null || usbManager.hasPermission(device)) {
+            onResult(true)
+            return
+        }
+        usbPermissionCallback = onResult
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+            if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
+        val permissionIntent = PendingIntent.getBroadcast(
+            this, 0, Intent(usbPermissionAction).setPackage(packageName), flags
+        )
+        usbManager.requestPermission(device, permissionIntent)
     }
 }
 
@@ -79,6 +129,15 @@ private fun LiveAudioProcessApp() {
     var wifiReceivePort by remember { mutableStateOf(prefs.getString("wifiReceivePort", legacyWifiPort) ?: legacyWifiPort) }
     var wifiMinBuffer by remember { mutableStateOf(prefs.getString("wifiMinBuffer", "50") ?: "50") }; var wifiMaxBuffer by remember { mutableStateOf(prefs.getString("wifiMaxBuffer", "100") ?: "100") }; var wifiActive by remember { mutableStateOf(false) }
     var wifiInputTimeout by remember { mutableStateOf(prefs.getString("wifiInputTimeout", "1.0") ?: "1.0") }
+    var usbMinBuffer by remember { mutableStateOf(prefs.getInt("usbMinBuffer", 16).toString()) }
+    var usbMaxBuffer by remember { mutableStateOf(prefs.getInt("usbMaxBuffer", 50).toString()) }
+    val legacyUsbBurstPackets = prefs.getInt("usbBurstPackets", 8)
+    var usbInputBurstPackets by remember {
+        mutableIntStateOf(prefs.getInt("usbInputBurstPackets", legacyUsbBurstPackets).takeIf { it == 1 || it == 2 || it == 4 || it == 8 || it == 16 } ?: 8)
+    }
+    var usbOutputBurstPackets by remember {
+        mutableIntStateOf(prefs.getInt("usbOutputBurstPackets", legacyUsbBurstPackets).takeIf { it == 1 || it == 2 || it == 4 || it == 8 || it == 16 } ?: 8)
+    }
     var routeNotice by remember { mutableStateOf<String?>(null) }
     var elapsed by remember { mutableIntStateOf(0) }
     var hasPermission by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) }
@@ -125,6 +184,29 @@ private fun LiveAudioProcessApp() {
         prefs.edit().putString("wifiReceiveHost", wifiReceiveHost).putString("wifiReceivePort", wifiReceivePort).putString("wifiMinBuffer", wifiMinBuffer).putString("wifiMaxBuffer", wifiMaxBuffer).putString("wifiInputTimeout", wifiInputTimeout).apply()
         if (input == InputSource.WIFI) wifiActive = configureWifiForCurrentRoute()
     }
+    LaunchedEffect(usbMinBuffer, usbMaxBuffer) {
+        val minMs = usbMinBuffer.toIntOrNull() ?: return@LaunchedEffect
+        val maxMs = usbMaxBuffer.toIntOrNull() ?: return@LaunchedEffect
+        delay(400)
+        val appliedMinMs = minMs.coerceIn(8, 200)
+        val appliedMaxMs = maxMs.coerceIn(8, 500).coerceAtLeast(appliedMinMs)
+        prefs.edit().putInt("usbMinBuffer", appliedMinMs).putInt("usbMaxBuffer", appliedMaxMs).apply()
+        engine.configureUsbOutputBuffer(appliedMinMs, appliedMaxMs)
+    }
+    LaunchedEffect(usbInputBurstPackets, usbOutputBurstPackets) {
+        prefs.edit()
+            .putInt("usbInputBurstPackets", usbInputBurstPackets)
+            .putInt("usbOutputBurstPackets", usbOutputBurstPackets)
+            .apply()
+        engine.configureUsbBursts(usbInputBurstPackets, usbOutputBurstPackets)
+    }
+    fun startMonitoring() {
+        syncEngine()
+        ContextCompat.startForegroundService(
+            context,
+            Intent(context, AudioProcessingService::class.java).setAction(AudioProcessingService.ACTION_START)
+        )
+    }
     Scaffold(containerColor = Ink, topBar = { TopAppBar(title = { Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.GraphicEq, null, tint = Teal, modifier = Modifier.size(25.dp)); Spacer(Modifier.width(9.dp)); Text("LiveAudioProcess", fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp) } }, actions = { StatusDot(running) }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Ink, titleContentColor = Color.White)) }) { pad ->
         Column(Modifier.fillMaxSize().padding(pad).padding(horizontal = 16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Spacer(Modifier.height(2.dp))
@@ -136,13 +218,34 @@ private fun LiveAudioProcessApp() {
             LevelPanel(inputLevelL, inputLevelR, outputLevelL, outputLevelR, limiterGain, limiterReleaseMs, running, running && effects.dspEnabled && effects.limiterEnabled)
             RoutingPanel2(input, { selected -> input = selected; channelPair = 0; if (selected == InputSource.WIFI) wifiOutputEnabled = false; wifiActive = configureWifiForCurrentRoute(); syncEngine() }, output, { selected -> if (selected == OutputSource.BLUETOOTH && Build.VERSION.SDK_INT >= 31 && ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) { pendingBluetoothOutput = selected; bluetoothPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT) } else { output = selected; syncEngine() } }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
             EnginePanel(rate, { rate = it; syncEngine() }, buffer, { buffer = it; syncEngine() }, running)
+            if (input == InputSource.USB || output == OutputSource.USB) {
+                UsbAudioPanel(usbMinBuffer, usbMaxBuffer, usbInputBurstPackets, usbOutputBurstPackets, input == InputSource.USB, output == OutputSource.USB, { usbMinBuffer = it }, { usbMaxBuffer = it }, { usbInputBurstPackets = it }, { usbOutputBurstPackets = it })
+            }
             Float32Badge()
             ProcessingControlPanel(effects) { effects = it }
             UnifiedEffectsPanel(effects) { effects = it }
             EqBandsPanel(effects) { effects = it }
             WifiAudioPanel(wifiSendHost, wifiSendPort, wifiOutputEnabled && wifiActive, { wifiSendHost = it }, { wifiSendPort = it }, wifiReceiveHost, wifiReceivePort, wifiMinBuffer, wifiMaxBuffer, wifiInputTimeout, input == InputSource.WIFI && wifiActive, { wifiReceiveHost = it }, { wifiReceivePort = it }, { wifiMinBuffer = it }, { wifiMaxBuffer = it }, { wifiInputTimeout = it })
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                Button(onClick = { if (!hasPermission) permissionLauncher.launch(Manifest.permission.RECORD_AUDIO) else { syncEngine(); if (running) { context.startService(Intent(context, AudioProcessingService::class.java).setAction(AudioProcessingService.ACTION_STOP)) } else { ContextCompat.startForegroundService(context, Intent(context, AudioProcessingService::class.java).setAction(AudioProcessingService.ACTION_START)) } } }, modifier = Modifier.weight(1f).height(54.dp), colors = ButtonDefaults.buttonColors(containerColor = if (running) PanelRaised else Teal, contentColor = if (running) Color.White else Ink), shape = RoundedCornerShape(10.dp)) { Icon(if (running) Icons.Outlined.Stop else Icons.Outlined.PlayArrow, null); Spacer(Modifier.width(8.dp)); Text(if (!hasPermission) "授权麦克风" else if (running) "停止引擎" else "启动监听", fontWeight = FontWeight.Bold) }
+                Button(onClick = {
+                    if (!hasPermission) {
+                        permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    } else if (running) {
+                        context.startService(Intent(context, AudioProcessingService::class.java).setAction(AudioProcessingService.ACTION_STOP))
+                    } else if (input == InputSource.USB || output == OutputSource.USB) {
+                        val currentActivity = activity as? MainActivity
+                        if (currentActivity == null) {
+                            startMonitoring()
+                        } else {
+                            currentActivity.requestUsbAudioPermission { granted ->
+                                if (granted) startMonitoring()
+                                else routeNotice = "USB AUDIO CODEC 权限被拒绝，未启动监听"
+                            }
+                        }
+                    } else {
+                        startMonitoring()
+                    }
+                }, modifier = Modifier.weight(1f).height(54.dp), colors = ButtonDefaults.buttonColors(containerColor = if (running) PanelRaised else Teal, contentColor = if (running) Color.White else Ink), shape = RoundedCornerShape(10.dp)) { Icon(if (running) Icons.Outlined.Stop else Icons.Outlined.PlayArrow, null); Spacer(Modifier.width(8.dp)); Text(if (!hasPermission) "授权麦克风" else if (running) "停止引擎" else "启动监听", fontWeight = FontWeight.Bold) }
                 IconButton(onClick = { if (running) { recording = !recording; engine.setRecording(recording); if (!recording) elapsed = 0 } }, modifier = Modifier.size(54.dp).background(if (recording) Red.copy(.18f) else Panel, RoundedCornerShape(10.dp))) { Icon(Icons.Outlined.FiberManualRecord, "录音", tint = if (recording) Red else Muted) }
             }
             RecordingBar(recording, elapsed)

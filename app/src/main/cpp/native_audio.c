@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "convolution_reverb.h"
+#include "usb_host_bridge.h"
 
 #define TAG "PulseForgeNative"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
@@ -51,6 +52,9 @@ typedef struct {
     atomic_int net_role, use_network_input, net_packet_seen;
     atomic_ullong net_last_packet_ns;
     float *net_buffer;
+    usb_host_audio_t usb_audio;
+    int usb_input_host, usb_output_host;
+    int usb_buffer_min_ms, usb_buffer_max_ms;
     int net_capacity, net_read, net_write, net_count;
     int net_started;
     struct sockaddr_in net_addr;
@@ -59,6 +63,8 @@ typedef struct {
 
 static Engine g = {
     .net_sock = -1,
+    .usb_buffer_min_ms = 16,
+    .usb_buffer_max_ms = 50,
     .param_lock = PTHREAD_MUTEX_INITIALIZER,
     .file_lock = PTHREAD_MUTEX_INITIALIZER,
     .reverb_lock = PTHREAD_MUTEX_INITIALIZER
@@ -345,6 +351,7 @@ static void *audio_thread(void *unused) {
         aaudio_result_t got;
         int using_network=atomic_load(&g.use_network_input)&&atomic_load(&g.net_role)==2;
         if(using_network){ got=network_receive(output,want); if(got<=0){ memset(output,0,(size_t)want*2*sizeof(float)); got=want; } memcpy(dry,output,(size_t)got*2*sizeof(float)); }
+        else if(g.usb_input_host && g.usb_audio){got=usb_host_audio_read(g.usb_audio,input,want);}
         else if(g.input){if(atomic_load(&g.net_role)==2)network_fill();got=AAudioStream_read(g.input,input,want,100000000);}
         else { memset(input,0,(size_t)want*4*sizeof(float)); got=want; }
         if(got<=0)continue;
@@ -363,8 +370,8 @@ static void *audio_thread(void *unused) {
         for(int i=0;i<got;i++) {
             int first=g.pair*2; if(first>=g.in_channels)first=0;
             int second=first+1; if(second>=g.in_channels)second=first;
-            float l = using_network ? output[i*2] : input[i*g.in_channels+first];
-            float r = using_network ? output[i*2+1] : input[i*g.in_channels+second];
+            float l = using_network ? output[i*2] : (g.usb_input_host ? input[i*2] : input[i*g.in_channels+first]);
+            float r = using_network ? output[i*2+1] : (g.usb_input_host ? input[i*2+1] : input[i*g.in_channels+second]);
             dry[i*2]=l;dry[i*2+1]=r;
             peaks[0]=fmaxf(peaks[0],fabsf(l)); peaks[1]=fmaxf(peaks[1],fabsf(r));
             if(flags&DSP_ON) {
@@ -377,7 +384,9 @@ static void *audio_thread(void *unused) {
         if(reverb) pthread_mutex_unlock(&g.reverb_lock);
         for(int i=0;i<4;i++)atomic_store(&g.levels[i],atomic_load(&g.levels[i])*.84f+peaks[i]*.16f);
         if(g.net_role==1) network_send(output,got);
-        AAudioStream_write(g.output,output,got,100000000); record_samples(dry,output,got);
+        if (g.usb_output_host && g.usb_audio) usb_host_audio_write(g.usb_audio, output, got);
+        else if (g.output) AAudioStream_write(g.output,output,got,100000000);
+        record_samples(dry,output,got);
     }
     return NULL;
 }
@@ -407,10 +416,18 @@ static int open_stream(AAudioStream **stream, aaudio_direction_t direction, int 
     return 1;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEnv*e,jobject o,jint rate,jint frames,jint inDev,jint outDev,jint channels,jint pair,jboolean useNetworkInput){
-    (void)e;(void)o;if(atomic_load(&g.running))return JNI_TRUE;memset(g.eq,0,sizeof(g.eq));g.rate=rate;g.frames=frames;g.in_channels=channels;g.pair=pair;g.limiter_gain=1.0;g.limiter_delta=0.0;g.limiter_delay_frames=0;g.limiter_next_iter=g.limiter_next_len=0;atomic_store(&g.use_network_input,useNetworkInput?1:0);if(useNetworkInput)atomic_store(&g.net_last_packet_ns,now_ns());
-    if(!atomic_load(&g.use_network_input) && !open_stream(&g.input,AAUDIO_DIRECTION_INPUT,channels,inDev,rate,frames)){LOGE("AAudio input open failed");return JNI_FALSE;}
-    if(!open_stream(&g.output,AAUDIO_DIRECTION_OUTPUT,2,outDev,rate,frames)){LOGE("AAudio output open failed");if(g.input){AAudioStream_close(g.input);g.input=NULL;}return JNI_FALSE;}
+JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEnv*e,jobject o,jint rate,jint frames,jint inDev,jint outDev,jint channels,jint pair,jboolean useNetworkInput,jint usbFd,jboolean usbInputHost,jboolean usbOutputHost,jint usbInputBurstPackets,jint usbOutputBurstPackets){
+    (void)e;(void)o;if(atomic_load(&g.running))return JNI_TRUE;memset(g.eq,0,sizeof(g.eq));g.rate=rate;g.frames=frames;g.in_channels=channels;g.pair=pair;g.limiter_gain=1.0;g.limiter_delta=0.0;g.limiter_delay_frames=0;g.limiter_next_iter=g.limiter_next_len=0;g.usb_audio=NULL;g.usb_input_host=usbInputHost?1:0;g.usb_output_host=usbOutputHost?1:0;if(usbFd<0){g.usb_input_host=0;g.usb_output_host=0;}atomic_store(&g.use_network_input,useNetworkInput?1:0);if(useNetworkInput)atomic_store(&g.net_last_packet_ns,now_ns());
+    if(usbFd >= 0 && (g.usb_input_host || g.usb_output_host)) {
+        g.usb_audio = usb_host_audio_start(usbFd, rate, g.usb_input_host, g.usb_output_host,
+                                           g.usb_buffer_min_ms, g.usb_buffer_max_ms,
+                                           usbInputBurstPackets < 1 ? 1 : (usbInputBurstPackets > 16 ? 16 : usbInputBurstPackets),
+                                           usbOutputBurstPackets < 1 ? 1 : (usbOutputBurstPackets > 16 ? 16 : usbOutputBurstPackets));
+        if (!g.usb_audio) { LOGE("USB Host audio initialization failed"); return JNI_FALSE; }
+        if (g.usb_input_host) g.in_channels = 2;
+    }
+    if(!g.usb_input_host && !atomic_load(&g.use_network_input) && !open_stream(&g.input,AAUDIO_DIRECTION_INPUT,channels,inDev,rate,frames)){LOGE("AAudio input open failed");usb_host_audio_stop(g.usb_audio);g.usb_audio=NULL;return JNI_FALSE;}
+    if(!g.usb_output_host && !open_stream(&g.output,AAUDIO_DIRECTION_OUTPUT,2,outDev,rate,frames)){LOGE("AAudio output open failed");if(g.input){AAudioStream_close(g.input);g.input=NULL;}usb_host_audio_stop(g.usb_audio);g.usb_audio=NULL;return JNI_FALSE;}
     g.reverb=convolution_reverb_create(rate,g.values[P_ROOM],g.values[P_DECAY],g.values[P_DAMP]);
     g.net_capacity=(int)((int64_t)rate*NET_BUFFER_MAX_MS/1000)+MAX_FRAMES;
     g.net_buffer=calloc((size_t)g.net_capacity*2,sizeof(float)); g.net_read=g.net_write=g.net_count=0; g.net_started=0;
@@ -418,7 +435,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
     g.limiter_next_pos=malloc((size_t)g.look_size*sizeof(*g.limiter_next_pos));
     g.limiter_next_delta=calloc((size_t)g.look_size,sizeof(*g.limiter_next_delta));
     if (!g.reverb || !g.lookahead || !g.limiter_next_pos || !g.limiter_next_delta || !g.net_buffer) { LOGE("DSP or network buffer allocation failed"); goto fail; }
-    if(AAudioStream_requestStart(g.output)!=AAUDIO_OK || (g.input && AAudioStream_requestStart(g.input)!=AAUDIO_OK)) {
+    if((g.output && AAudioStream_requestStart(g.output)!=AAUDIO_OK) || (g.input && AAudioStream_requestStart(g.input)!=AAUDIO_OK)) {
         LOGE("AAudioStream_requestStart failed");
         goto fail;
     }
@@ -436,18 +453,20 @@ fail:
     if (g.input) { AAudioStream_requestStop(g.input); AAudioStream_close(g.input); g.input = NULL; }
     if (g.output) { AAudioStream_requestStop(g.output); AAudioStream_close(g.output); g.output = NULL; }
     convolution_reverb_destroy(g.reverb); g.reverb=NULL;
+    usb_host_audio_stop(g.usb_audio); g.usb_audio=NULL;
     free(g.lookahead); g.lookahead=NULL;
     free(g.limiter_next_pos); g.limiter_next_pos=NULL;
     free(g.limiter_next_delta); g.limiter_next_delta=NULL;
     free(g.net_buffer); g.net_buffer=NULL;
     return JNI_FALSE;
 }
-JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stop(JNIEnv*e,jobject o){(void)e;(void)o;if(!atomic_exchange(&g.running,0))return;if(g.input)AAudioStream_requestStop(g.input);pthread_join(g.thread,NULL);atomic_store(&g.reverb_worker_running,0);if(atomic_exchange(&g.reverb_worker_started,0))pthread_join(g.reverb_thread,NULL);if(g.output)AAudioStream_requestStop(g.output);if(g.input)AAudioStream_close(g.input);if(g.output)AAudioStream_close(g.output);g.input=g.output=NULL;pthread_mutex_lock(&g.reverb_lock);ConvolutionReverb *reverb=g.reverb;g.reverb=NULL;pthread_mutex_unlock(&g.reverb_lock);convolution_reverb_destroy(reverb);free(g.lookahead);g.lookahead=NULL;free(g.limiter_next_pos);g.limiter_next_pos=NULL;free(g.limiter_next_delta);g.limiter_next_delta=NULL;free(g.net_buffer);g.net_buffer=NULL;g.net_capacity=g.net_count=0;}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stop(JNIEnv*e,jobject o){(void)e;(void)o;if(!atomic_exchange(&g.running,0))return;if(g.input)AAudioStream_requestStop(g.input);pthread_join(g.thread,NULL);atomic_store(&g.reverb_worker_running,0);if(atomic_exchange(&g.reverb_worker_started,0))pthread_join(g.reverb_thread,NULL);if(g.output)AAudioStream_requestStop(g.output);if(g.input)AAudioStream_close(g.input);if(g.output)AAudioStream_close(g.output);g.input=g.output=NULL;usb_host_audio_stop(g.usb_audio);g.usb_audio=NULL;g.usb_input_host=g.usb_output_host=0;pthread_mutex_lock(&g.reverb_lock);ConvolutionReverb *reverb=g.reverb;g.reverb=NULL;pthread_mutex_unlock(&g.reverb_lock);convolution_reverb_destroy(reverb);free(g.lookahead);g.lookahead=NULL;free(g.limiter_next_pos);g.limiter_next_pos=NULL;free(g.limiter_next_delta);g.limiter_next_delta=NULL;free(g.net_buffer);g.net_buffer=NULL;g.net_capacity=g.net_count=0;}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_update(JNIEnv*e,jobject o,jint flags,jfloatArray values){(void)o;float incoming[24]={0};jsize n=(*e)->GetArrayLength(e,values);if(n>24)n=24;(*e)->GetFloatArrayRegion(e,values,0,n,incoming);pthread_mutex_lock(&g.param_lock);int reverb_changed=n>P_DAMP&&(g.values[P_ROOM]!=incoming[P_ROOM]||g.values[P_DECAY]!=incoming[P_DECAY]||g.values[P_DAMP]!=incoming[P_DAMP]);memcpy(g.values,incoming,(size_t)n*sizeof(float));pthread_mutex_unlock(&g.param_lock);if(reverb_changed)atomic_fetch_add(&g.reverb_generation,1);atomic_store(&g.flags,flags);}
 JNIEXPORT jfloatArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_levels(JNIEnv*e,jobject o){(void)o;jfloat v[6];for(int i=0;i<6;i++)v[i]=atomic_load(&g.levels[i]);jfloatArray a=(*e)->NewFloatArray(e,6);(*e)->SetFloatArrayRegion(e,a,0,6,v);return a;}
 JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetwork(JNIEnv*e,jobject o,jint role,jint codec,jstring host,jint port,jint minMs,jint maxMs){(void)o;if(codec==1)return JNI_FALSE;const char*h=(*e)->GetStringUTFChars(e,host,NULL);if(g.net_sock>=0)close(g.net_sock);g.net_sock=socket(AF_INET,SOCK_DGRAM,0);if(g.net_sock<0){atomic_store(&g.net_role,0);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;}fcntl(g.net_sock,F_SETFL,O_NONBLOCK);memset(&g.net_addr,0,sizeof(g.net_addr));g.net_addr.sin_family=AF_INET;g.net_addr.sin_port=htons((uint16_t)port);inet_aton(h,&g.net_addr.sin_addr);atomic_store(&g.net_role,role);atomic_store(&g.net_last_packet_ns,now_ns());atomic_store(&g.net_packet_seen,0);g.net_codec=codec;g.net_port=port;g.net_min_ms=minMs<0?0:(minMs>200?200:minMs);g.net_max_ms=maxMs<50?50:(maxMs>1000?1000:maxMs);if(g.net_max_ms<g.net_min_ms)g.net_min_ms=g.net_max_ms;g.net_read=g.net_write=g.net_count=0;g.net_started=0;if(role==2&&bind(g.net_sock,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr))<0){close(g.net_sock);g.net_sock=-1;atomic_store(&g.net_role,0);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;}(*e)->ReleaseStringUTFChars(e,host,h);return JNI_TRUE;}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearNetwork(JNIEnv*e,jobject o){(void)e;(void)o;if(g.net_sock>=0)close(g.net_sock);g.net_sock=-1;atomic_store(&g.net_role,0);g.net_read=g.net_write=g.net_count=0;g.net_started=0;}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureUsbOutputBuffer(JNIEnv*e,jobject o,jint minMs,jint maxMs){(void)e;(void)o;g.usb_buffer_min_ms=minMs<8?8:(minMs>200?200:minMs);g.usb_buffer_max_ms=maxMs<8?8:(maxMs>500?500:maxMs);if(g.usb_buffer_max_ms<g.usb_buffer_min_ms)g.usb_buffer_max_ms=g.usb_buffer_min_ms;usb_host_audio_configure_output_buffer(g.usb_audio,g.usb_buffer_min_ms,g.usb_buffer_max_ms);}
 JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkInputTimedOut(JNIEnv*e,jobject o,jint timeoutMs){(void)e;(void)o;if(atomic_load(&g.net_role)!=2||timeoutMs<=0)return JNI_FALSE;uint64_t last=atomic_load(&g.net_last_packet_ns),now=now_ns();return now>last&&(now-last)>=(uint64_t)timeoutMs*1000000ull?JNI_TRUE:JNI_FALSE;}
-JNIEXPORT jintArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_routeInfo(JNIEnv*e,jobject o){(void)o;jint route[2];route[0]=atomic_load(&g.use_network_input)&&atomic_load(&g.net_role)==2?-2:(g.input?AAudioStream_getDeviceId(g.input):-1);route[1]=g.output?AAudioStream_getDeviceId(g.output):-1;jintArray result=(*e)->NewIntArray(e,2);(*e)->SetIntArrayRegion(e,result,0,2,route);return result;}
+JNIEXPORT jintArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_routeInfo(JNIEnv*e,jobject o){(void)o;jint route[4];route[0]=g.usb_input_host?-3:(atomic_load(&g.use_network_input)&&atomic_load(&g.net_role)==2?-2:(g.input?AAudioStream_getDeviceId(g.input):-1));route[1]=g.usb_output_host?-4:(g.output?AAudioStream_getDeviceId(g.output):-1);route[2]=g.usb_input_host?2:(g.input?AAudioStream_getChannelCount(g.input):-1);route[3]=g.usb_output_host?2:(g.output?AAudioStream_getChannelCount(g.output):-1);jintArray result=(*e)->NewIntArray(e,4);(*e)->SetIntArrayRegion(e,result,0,4,route);return result;}
 JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_startRecordingFd(JNIEnv*e,jobject o,jint dryFd,jint wetFd){(void)e;(void)o;pthread_mutex_lock(&g.file_lock);if(g.dry_file){fclose(g.dry_file);g.dry_file=NULL;}if(g.wet_file){fclose(g.wet_file);g.wet_file=NULL;}g.dry_file=fdopen(dup(dryFd),"wb+");g.wet_file=fdopen(dup(wetFd),"wb+");g.dry_bytes=g.wet_bytes=0;if(g.dry_file){uint8_t z[44]={0};fwrite(z,1,44,g.dry_file);}if(g.wet_file){uint8_t z[44]={0};fwrite(z,1,44,g.wet_file);}int ok=g.dry_file&&g.wet_file;if(!ok){if(g.dry_file){fclose(g.dry_file);g.dry_file=NULL;}if(g.wet_file){fclose(g.wet_file);g.wet_file=NULL;}}pthread_mutex_unlock(&g.file_lock);atomic_store(&g.recording,ok);return ok?JNI_TRUE:JNI_FALSE;}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stopRecording(JNIEnv*e,jobject o){(void)e;(void)o;atomic_store(&g.recording,0);pthread_mutex_lock(&g.file_lock);if(g.dry_file){wav_header(g.dry_file,g.dry_bytes,g.rate);fclose(g.dry_file);g.dry_file=NULL;}if(g.wet_file){wav_header(g.wet_file,g.wet_bytes,g.rate);fclose(g.wet_file);g.wet_file=NULL;}pthread_mutex_unlock(&g.file_lock);}

@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 
 object AudioEngineStore {
@@ -18,6 +19,8 @@ object AudioEngineStore {
 }
 
 class AudioProcessingService : Service() {
+    private var wakeLock: PowerManager.WakeLock? = null
+
     override fun onCreate() {
         super.onCreate()
         createChannel()
@@ -28,26 +31,45 @@ class AudioProcessingService : Service() {
         val engine = AudioEngineStore.get(this)
         if (intent?.action == ACTION_STOP) {
             engine.stop()
+            releaseWakeLock()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         } else if (!engine.isRunning) {
             restoreSettings(engine)
             engine.start()
             if (!engine.isRunning) {
+                releaseWakeLock()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf(startId)
                 return START_NOT_STICKY
             }
         }
+        if (engine.isRunning) acquireWakeLock()
         return START_STICKY
     }
 
     override fun onDestroy() {
         AudioEngineStore.get(this).stop()
+        releaseWakeLock()
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun acquireWakeLock() {
+        val lock = wakeLock ?: (getSystemService(Context.POWER_SERVICE) as PowerManager)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:AudioProcessing")
+            .also {
+                it.setReferenceCounted(false)
+                wakeLock = it
+            }
+        if (!lock.isHeld) lock.acquire()
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
+    }
 
     private fun createChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
@@ -76,6 +98,15 @@ class AudioProcessingService : Service() {
         engine.reverbRoom = effects.reverbRoom; engine.reverbDecay = effects.reverbDecay; engine.reverbDamping = effects.reverbDamping; engine.reverbMix = effects.reverbMix / 100f
         engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease
         engine.sampleRate = p.getInt("rate", 48_000); engine.bufferFrames = p.getInt("buffer", 256)
+        engine.configureUsbOutputBuffer(
+            p.getInt("usbMinBuffer", 16),
+            p.getInt("usbMaxBuffer", 50)
+        )
+        val legacyUsbBurst = p.getInt("usbBurstPackets", 8)
+        engine.configureUsbBursts(
+            p.getInt("usbInputBurstPackets", legacyUsbBurst),
+            p.getInt("usbOutputBurstPackets", legacyUsbBurst)
+        )
         engine.wifiInputTimeoutMs = (((p.getString("wifiInputTimeout", "1.0")?.toFloatOrNull() ?: 1f) * 1000f).toInt()).coerceIn(100, 60_000)
         engine.inputPair = p.getInt("channelPair", 0)
         engine.inputSource = runCatching { InputSource.valueOf(p.getString("input", InputSource.BUILT_IN.name)!!) }.getOrDefault(InputSource.BUILT_IN)
