@@ -11,6 +11,7 @@ import android.os.Environment
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import java.io.File
 import android.os.ParcelFileDescriptor
 
@@ -20,6 +21,9 @@ class AudioEngine(private val context: Context) {
     @Volatile private var activeInputDeviceId = -1
     @Volatile private var activeOutputDeviceId = -1
     @Volatile private var bluetoothRouted = false
+    private var observedBluetoothDeviceId = Int.MIN_VALUE
+    private var bluetoothRetryCount = 0
+    private var nextBluetoothRetryAtMs = 0L
     @Volatile private var networkRole = 0
     @Volatile private var wifiFallbackActive = false
     @Volatile var wifiInputTimeoutMs = 1_000
@@ -66,27 +70,50 @@ class AudioEngine(private val context: Context) {
         return audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { it.type == AudioDeviceInfo.TYPE_USB_DEVICE || it.type == AudioDeviceInfo.TYPE_USB_HEADSET }
     }
     private fun bluetoothOutputDevice(): AudioDeviceInfo? {
-        return audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || (Build.VERSION.SDK_INT >= 31 && it.type == AudioDeviceInfo.TYPE_BLE_HEADSET) }
+        return runCatching {
+            audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                .filter { isBluetoothOutput(it) }
+                .minByOrNull { bluetoothOutputPriority(it) }
+        }.getOrNull()
+    }
+    private fun isBluetoothOutput(device: AudioDeviceInfo): Boolean {
+        return device.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+            device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            (Build.VERSION.SDK_INT >= 28 && device.type == AudioDeviceInfo.TYPE_HEARING_AID) ||
+            (Build.VERSION.SDK_INT >= 31 && (device.type == AudioDeviceInfo.TYPE_BLE_HEADSET || device.type == AudioDeviceInfo.TYPE_BLE_SPEAKER))
+    }
+    private fun bluetoothOutputPriority(device: AudioDeviceInfo): Int = when (device.type) {
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> 0
+        AudioDeviceInfo.TYPE_BLE_HEADSET, AudioDeviceInfo.TYPE_BLE_SPEAKER -> 1
+        AudioDeviceInfo.TYPE_HEARING_AID -> 2
+        else -> 3
     }
     private fun prepareBluetoothRoute(): Int {
         val device = bluetoothOutputDevice() ?: return -1
         if (Build.VERSION.SDK_INT >= 31) {
-            audioManager.availableCommunicationDevices.firstOrNull { it.id == device.id }?.let { audioManager.setCommunicationDevice(it) }
+            runCatching {
+                audioManager.availableCommunicationDevices.firstOrNull { it.id == device.id }
+                    ?.let { audioManager.setCommunicationDevice(it) }
+            }
         } else if (device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
-            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            audioManager.startBluetoothSco()
-            audioManager.isBluetoothScoOn = true
+            runCatching {
+                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                audioManager.startBluetoothSco()
+                audioManager.isBluetoothScoOn = true
+            }
         }
         bluetoothRouted = true
         return device.id
     }
     private fun clearBluetoothRoute() {
         if (!bluetoothRouted) return
-        if (Build.VERSION.SDK_INT >= 31) audioManager.clearCommunicationDevice()
+        if (Build.VERSION.SDK_INT >= 31) runCatching { audioManager.clearCommunicationDevice() }
         else {
-            audioManager.isBluetoothScoOn = false
-            audioManager.stopBluetoothSco()
-            audioManager.mode = AudioManager.MODE_NORMAL
+            runCatching {
+                audioManager.isBluetoothScoOn = false
+                audioManager.stopBluetoothSco()
+                audioManager.mode = AudioManager.MODE_NORMAL
+            }
         }
         bluetoothRouted = false
     }
@@ -101,6 +128,46 @@ class AudioEngine(private val context: Context) {
         if (inputId != activeInputDeviceId || outputId != activeOutputDeviceId) restartStreamsForRouteChange()
     }
     private val routeRestart = Runnable { if (isRunning) restartStreamsForRouteChange() }
+    private val bluetoothRouteMonitor = object : Runnable {
+        override fun run() {
+            if (!isRunning || outputSource != OutputSource.BLUETOOTH) return
+            val desiredDeviceId = bluetoothOutputDevice()?.id ?: -1
+            if (desiredDeviceId != observedBluetoothDeviceId) {
+                observedBluetoothDeviceId = desiredDeviceId
+                bluetoothRetryCount = 0
+                nextBluetoothRetryAtMs = 0L
+            }
+
+            val actualOutputDeviceId = NativeAudio.routeInfo().getOrElse(1) { -1 }
+            if (desiredDeviceId != activeOutputDeviceId) {
+                routeNotice = if (desiredDeviceId < 0) {
+                    "蓝牙输出已断开，当前使用系统默认输出；设备恢复后将自动重连"
+                } else {
+                    "检测到蓝牙设备，正在自动重连"
+                }
+                restartStreamsForRouteChange()
+                return
+            }
+
+            if (desiredDeviceId >= 0 && actualOutputDeviceId != desiredDeviceId) {
+                val now = SystemClock.elapsedRealtime()
+                if (bluetoothRetryCount < BLUETOOTH_ROUTE_RETRY_LIMIT && now >= nextBluetoothRetryAtMs) {
+                    val retryDelayMs = (BLUETOOTH_ROUTE_RETRY_BASE_MS shl bluetoothRetryCount).coerceAtMost(BLUETOOTH_ROUTE_RETRY_MAX_MS)
+                    bluetoothRetryCount++
+                    nextBluetoothRetryAtMs = now + retryDelayMs
+                    routeNotice = "蓝牙路由尚未生效，正在自动重连（$bluetoothRetryCount/$BLUETOOTH_ROUTE_RETRY_LIMIT）"
+                    restartStreamsForRouteChange()
+                    return
+                }
+            } else if (desiredDeviceId >= 0) {
+                bluetoothRetryCount = 0
+                nextBluetoothRetryAtMs = 0L
+            }
+
+            refreshRouteNotice()
+            routeHandler.postDelayed(this, BLUETOOTH_MONITOR_INTERVAL_MS)
+        }
+    }
     private val wifiHealthMonitor = object : Runnable {
         override fun run() {
             if (!isRunning) return
@@ -141,6 +208,7 @@ class AudioEngine(private val context: Context) {
     /** Restart only AAudio/DSP streams; keep the native recording files open. */
     private fun restartStreamsForRouteChange() {
         if (!isRunning) return
+        routeHandler.removeCallbacks(bluetoothRouteMonitor)
         NativeAudio.stop()
         clearBluetoothRoute()
         activeInputDeviceId = -1
@@ -178,19 +246,29 @@ class AudioEngine(private val context: Context) {
         if (isRunning) {
             activeInputDeviceId = inputDeviceId
             activeOutputDeviceId = outputDeviceId
-            val actual = NativeAudio.routeInfo()
-            val actualInput = actual.getOrElse(0) { -1 }
-            val actualOutput = actual.getOrElse(1) { -1 }
-            val warnings = mutableListOf<String>()
-            if (inputSource == InputSource.WIFI && !wifiFallbackActive && (!useNetworkInput || actualInput != -2)) warnings += "Wi-Fi 输入未生效，当前使用默认麦克风"
-            if (inputSource == InputSource.WIFI && wifiFallbackActive) warnings += "Wi-Fi 输入暂无数据，当前使用默认麦克风并等待恢复"
-            if (inputSource == InputSource.USB && (inputDeviceId < 0 || actualInput != inputDeviceId)) warnings += "USB 输入未生效，当前使用系统默认输入"
-            if (outputSource == OutputSource.USB && (outputDeviceId < 0 || actualOutput != outputDeviceId)) warnings += "USB 输出未生效，当前使用系统默认输出"
-            if (outputSource == OutputSource.BLUETOOTH && (outputDeviceId < 0 || actualOutput != outputDeviceId)) warnings += "蓝牙输出未生效，当前使用系统默认输出"
-            routeNotice = warnings.takeIf { it.isNotEmpty() }?.joinToString("；")
+            refreshRouteNotice()
             routeHandler.removeCallbacks(wifiHealthMonitor)
             routeHandler.postDelayed(wifiHealthMonitor, 100)
+            routeHandler.removeCallbacks(bluetoothRouteMonitor)
+            if (outputSource == OutputSource.BLUETOOTH) routeHandler.postDelayed(bluetoothRouteMonitor, BLUETOOTH_MONITOR_INTERVAL_MS)
         }
+    }
+    private fun refreshRouteNotice() {
+        if (!isRunning) return
+        val actual = NativeAudio.routeInfo()
+        val actualInput = actual.getOrElse(0) { -1 }
+        val actualOutput = actual.getOrElse(1) { -1 }
+        val usbInputId = if (inputSource == InputSource.USB) usbInputDevice()?.id ?: -1 else -1
+        val usbOutputId = if (outputSource == OutputSource.USB) usbOutputDevice()?.id ?: -1 else -1
+        val bluetoothOutputId = if (outputSource == OutputSource.BLUETOOTH) bluetoothOutputDevice()?.id ?: -1 else -1
+        val warnings = mutableListOf<String>()
+        if (inputSource == InputSource.WIFI && !wifiFallbackActive && (networkRole != 2 || actualInput != -2)) warnings += "Wi-Fi 输入未生效，当前使用默认麦克风"
+        if (inputSource == InputSource.WIFI && wifiFallbackActive) warnings += "Wi-Fi 输入暂无数据，当前使用默认麦克风并等待恢复"
+        if (inputSource == InputSource.USB && (usbInputId < 0 || actualInput != usbInputId)) warnings += "USB 输入未生效，当前使用系统默认输入"
+        if (outputSource == OutputSource.USB && (usbOutputId < 0 || actualOutput != usbOutputId)) warnings += "USB 输出未生效，当前使用系统默认输出"
+        if (outputSource == OutputSource.BLUETOOTH && bluetoothOutputId < 0) warnings += "蓝牙输出已断开，当前使用系统默认输出；设备恢复后将自动重连"
+        else if (outputSource == OutputSource.BLUETOOTH && actualOutput != bluetoothOutputId) warnings += "蓝牙输出未生效，正在自动重连"
+        routeNotice = warnings.takeIf { it.isNotEmpty() }?.joinToString("；")
     }
     fun setRecording(enabled: Boolean): Pair<File, File>? {
         if (!enabled) {
@@ -217,7 +295,7 @@ class AudioEngine(private val context: Context) {
                 lastError = "录音无法保存到系统录音目录"
             }
         } else {
-            val folder = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC), "Recordings/PulseForge").apply { mkdirs() }
+            val folder = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC), "Recordings/LiveAudioProcess").apply { mkdirs() }
             runCatching {
                 val dry = File(folder, "${stamp}_dry.wav"); val wet = File(folder, "${stamp}_wet.wav")
                 val dryPfd = ParcelFileDescriptor.open(dry, ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_TRUNCATE or ParcelFileDescriptor.MODE_WRITE_ONLY)
@@ -232,7 +310,7 @@ class AudioEngine(private val context: Context) {
     private fun mediaValues(name: String) = ContentValues().apply {
         put(MediaStore.Audio.Media.DISPLAY_NAME, name)
         put(MediaStore.Audio.Media.MIME_TYPE, "audio/wav")
-        put(MediaStore.Audio.Media.RELATIVE_PATH, Environment.DIRECTORY_RECORDINGS + "/PulseForge")
+        put(MediaStore.Audio.Media.RELATIVE_PATH, Environment.DIRECTORY_RECORDINGS + "/LiveAudioProcess")
         put(MediaStore.Audio.Media.IS_PENDING, 1)
     }
     private fun finishRecording(deletePending: Boolean = false) {
@@ -247,9 +325,16 @@ class AudioEngine(private val context: Context) {
         }
         recordingTarget = null
     }
-    fun stop() { if (isRecording) setRecording(false); routeHandler.removeCallbacks(routeRestart); routeHandler.removeCallbacks(routeRefresh); routeHandler.removeCallbacks(wifiHealthMonitor); NativeAudio.stop(); clearBluetoothRoute(); activeInputDeviceId = -1; activeOutputDeviceId = -1; isRecording = false; isRunning = false }
+    fun stop() { if (isRecording) setRecording(false); routeHandler.removeCallbacks(routeRestart); routeHandler.removeCallbacks(routeRefresh); routeHandler.removeCallbacks(wifiHealthMonitor); routeHandler.removeCallbacks(bluetoothRouteMonitor); NativeAudio.stop(); clearBluetoothRoute(); activeInputDeviceId = -1; activeOutputDeviceId = -1; observedBluetoothDeviceId = Int.MIN_VALUE; bluetoothRetryCount = 0; nextBluetoothRetryAtMs = 0L; isRecording = false; isRunning = false }
     fun refreshNativeParameters() { pushNativeParameters() }
     private fun pushNativeParameters() { if (NativeAudio.available) NativeAudio.update((if (dspEnabled) 1 else 0) or (if (eqEnabled) 2 else 0) or (if (reverbEnabled) 4 else 0) or (if (limiterEnabled) 8 else 0), floatArrayOf(eqFrequency, eqGain, eqQ, eq2Frequency, eq2Gain, eq2Q, eq3Frequency, eq3Gain, eq3Q, eq4Frequency, eq4Gain, eq4Q, reverbRoom, reverbDecay, reverbDamping, reverbMix * 100f, limiterInputGain, limiterThreshold, limiterRelease, limiterCeiling, limiterLookAhead)) }
+
+    companion object {
+        private const val BLUETOOTH_MONITOR_INTERVAL_MS = 1_000L
+        private const val BLUETOOTH_ROUTE_RETRY_BASE_MS = 500L
+        private const val BLUETOOTH_ROUTE_RETRY_MAX_MS = 8_000L
+        private const val BLUETOOTH_ROUTE_RETRY_LIMIT = 6
+    }
 }
 
 enum class InputSource(val label: String) { BUILT_IN("内置麦克风"), USB("USB 声卡 / AD2R"), WIFI("Wi-Fi 音频") }

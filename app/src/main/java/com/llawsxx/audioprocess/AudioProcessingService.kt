@@ -52,14 +52,14 @@ class AudioProcessingService : Service() {
     private fun createChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "PulseForge 音频引擎", NotificationManager.IMPORTANCE_LOW)
+                NotificationChannel(CHANNEL_ID, "LiveAudioProcess 音频引擎", NotificationManager.IMPORTANCE_LOW)
             )
         }
     }
 
     private fun notification(): Notification = NotificationCompat.Builder(this, CHANNEL_ID)
         .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-        .setContentTitle("PulseForge 正在监听")
+        .setContentTitle("LiveAudioProcess 正在监听")
         .setContentText("实时 DSP 音频处理运行中")
         .setOngoing(true)
         .setCategory(NotificationCompat.CATEGORY_SERVICE)

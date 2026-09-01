@@ -36,7 +36,7 @@ import kotlinx.coroutines.delay
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { LiveAudioProcessTheme { PulseForgeApp() } }
+        setContent { LiveAudioProcessTheme { LiveAudioProcessApp() } }
     }
 }
 
@@ -50,7 +50,7 @@ private val Red = Color(0xFFFF6B6B)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun PulseForgeApp() {
+private fun LiveAudioProcessApp() {
     val context = LocalContext.current
     val engine = remember { AudioEngineStore.get(context.applicationContext) }
     val prefs = remember { context.getSharedPreferences("pulseforge_settings", android.content.Context.MODE_PRIVATE) }
@@ -99,7 +99,7 @@ private fun PulseForgeApp() {
             engine.configureNetwork(role, 0, wifiHost, wifiPort.toIntOrNull() ?: 40100, wifiMinBuffer.toIntOrNull()?.coerceIn(0, 200) ?: 50, wifiMaxBuffer.toIntOrNull()?.coerceIn(50, 1000) ?: 100)
         }
     }
-    Scaffold(containerColor = Ink, topBar = { TopAppBar(title = { Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.GraphicEq, null, tint = Teal, modifier = Modifier.size(25.dp)); Spacer(Modifier.width(9.dp)); Text("PULSEFORGE", fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp) } }, actions = { StatusDot(running) }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Ink, titleContentColor = Color.White)) }) { pad ->
+    Scaffold(containerColor = Ink, topBar = { TopAppBar(title = { Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.GraphicEq, null, tint = Teal, modifier = Modifier.size(25.dp)); Spacer(Modifier.width(9.dp)); Text("LiveAudioProcess", fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp) } }, actions = { StatusDot(running) }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Ink, titleContentColor = Color.White)) }) { pad ->
         Column(Modifier.fillMaxSize().padding(pad).padding(horizontal = 16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Spacer(Modifier.height(2.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) { Column { Text("实时监听", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold); Text("LOW-LATENCY DSP CONSOLE", color = Muted, fontSize = 11.sp, letterSpacing = 1.2.sp) }; Text(if (running) "RUNNING" else "STANDBY", color = if (running) Teal else Muted, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
