@@ -60,7 +60,7 @@ fun WifiAudioPanel(
             Text("Wi-Fi 实时音频", color = Color.White, fontWeight = FontWeight.Bold)
 
             EndpointHeader("发送端", "音频输出", sendActive)
-            Text("PCM Float32 · 双声道 · 当前引擎采样率", color = WifiTeal, fontSize = 11.sp)
+            Text("PCM Float32 · 双声道 · 128 frames / UDP 包 · 协议 v2", color = WifiTeal, fontSize = 11.sp)
             OutlinedTextField(
                 sendHost,
                 onSendHost,
