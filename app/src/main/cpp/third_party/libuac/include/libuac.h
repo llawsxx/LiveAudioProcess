@@ -249,7 +249,8 @@ namespace uac {
 
         virtual std::unique_ptr<const uac_audio_config_uncompressed> query_config_uncompressed(uac_audio_data_format_type audioDataFormatType,
                                                                          uint8_t numChannels,
-                                                                         uint32_t sampleRate) const = 0;
+                                                                         uint32_t sampleRate,
+                                                                         uint8_t bitResolution = 0) const = 0;
     };
 
     class uac_stream_handle;

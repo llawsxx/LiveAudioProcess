@@ -42,6 +42,8 @@ class AudioEngine(private val context: Context) {
     @Volatile var outputSource = OutputSource.SPEAKER
         internal set
     @Volatile var sampleRate = 48_000; @Volatile var bufferFrames = 256; @Volatile var inputPair = 0
+    @Volatile var usbBitDepth = 16
+        private set
     @Volatile var usbInputBurstPackets = 8
         private set
     @Volatile var usbOutputBurstPackets = 8
@@ -75,6 +77,19 @@ class AudioEngine(private val context: Context) {
         val minMs = minBufferMs.coerceIn(8, 200)
         val maxMs = maxBufferMs.coerceIn(8, 500).coerceAtLeast(minMs)
         NativeAudio.configureUsbOutputBuffer(minMs, maxMs)
+    }
+    fun configureAudioFormat(requestedSampleRate: Int, requestedUsbBitDepth: Int) {
+        val normalizedRate = requestedSampleRate.takeIf { it == 44_100 || it == 48_000 || it == 96_000 } ?: 48_000
+        val normalizedBitDepth = requestedUsbBitDepth.takeIf { it == 16 || it == 24 || it == 32 } ?: 16
+        val rateChanged = sampleRate != normalizedRate
+        val bitDepthChanged = usbBitDepth != normalizedBitDepth
+        sampleRate = normalizedRate
+        usbBitDepth = normalizedBitDepth
+        if (isRunning && (rateChanged || (bitDepthChanged && (inputSource == InputSource.USB || outputSource == OutputSource.USB)))) {
+            routeNotice = "正在应用新的音频格式"
+            routeHandler.removeCallbacks(routeRestart)
+            routeHandler.post(routeRestart)
+        }
     }
     fun configureUsbBursts(inputPackets: Int, outputPackets: Int) {
         fun normalize(value: Int) = value.takeIf { it == 1 || it == 2 || it == 4 || it == 8 || it == 16 } ?: 8
@@ -284,16 +299,16 @@ class AudioEngine(private val context: Context) {
         val usbFd = if (requestedUsbInputHost || requestedUsbOutputHost) openUsbHostConnection() else -1
         val usbInputHost = requestedUsbInputHost && usbFd >= 0
         val usbOutputHost = requestedUsbOutputHost && usbFd >= 0
-        var started = NativeAudio.start(sampleRate, bufferFrames, inputDeviceId, outputDeviceId, nativeInputChannels, inputPair, useNetworkInput, usbFd, usbInputHost, usbOutputHost, usbInputBurstPackets, usbOutputBurstPackets)
+        var started = NativeAudio.start(sampleRate, bufferFrames, inputDeviceId, outputDeviceId, nativeInputChannels, inputPair, useNetworkInput, usbFd, usbInputHost, usbOutputHost, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
         if (!started && usbFd >= 0) {
             usbConnection?.close()
             usbConnection = null
-            lastError = "USB Host 立体声采集不可用，正在回退到系统 USB 音频"
-            started = NativeAudio.start(sampleRate, bufferFrames, inputDeviceId, outputDeviceId, nativeInputChannels, inputPair, useNetworkInput, -1, false, false, usbInputBurstPackets, usbOutputBurstPackets)
+            lastError = "USB Host 不支持 ${formatSampleRate(sampleRate)} / ${usbBitDepth}-bit，正在回退到系统 USB 音频"
+            started = NativeAudio.start(sampleRate, bufferFrames, inputDeviceId, outputDeviceId, nativeInputChannels, inputPair, useNetworkInput, -1, false, false, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
         }
         if (!started && inputSource == InputSource.USB && nativeInputChannels == 2) {
             // Keep USB usable on devices whose driver rejects a stereo AAudio request.
-            started = NativeAudio.start(sampleRate, bufferFrames, inputDeviceId, outputDeviceId, 1, inputPair, useNetworkInput, -1, false, false, usbInputBurstPackets, usbOutputBurstPackets)
+            started = NativeAudio.start(sampleRate, bufferFrames, inputDeviceId, outputDeviceId, 1, inputPair, useNetworkInput, -1, false, false, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
             if (started) lastError = "USB 输入驱动拒绝立体声，已回退为单声道"
         }
         if (started) isRunning = true
@@ -387,6 +402,7 @@ class AudioEngine(private val context: Context) {
     private fun pushNativeParameters() { if (NativeAudio.available) NativeAudio.update((if (dspEnabled) 1 else 0) or (if (eqEnabled) 2 else 0) or (if (reverbEnabled) 4 else 0) or (if (limiterEnabled) 8 else 0), floatArrayOf(eqFrequency, eqGain, eqQ, eq2Frequency, eq2Gain, eq2Q, eq3Frequency, eq3Gain, eq3Q, eq4Frequency, eq4Gain, eq4Q, reverbRoom, reverbDecay, reverbDamping, reverbMix * 100f, limiterInputGain, limiterThreshold, limiterRelease, limiterCeiling, limiterLookAhead, if (limiterAdaptiveRelease) 1f else 0f)) }
 
     companion object {
+        private fun formatSampleRate(rate: Int) = if (rate % 1_000 == 0) "${rate / 1_000} kHz" else "${rate / 1000f} kHz"
         private const val BLUETOOTH_MONITOR_INTERVAL_MS = 1_000L
         private const val BLUETOOTH_ROUTE_RETRY_BASE_MS = 500L
         private const val BLUETOOTH_ROUTE_RETRY_MAX_MS = 8_000L

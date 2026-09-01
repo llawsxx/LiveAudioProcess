@@ -28,13 +28,16 @@ import androidx.compose.ui.unit.sp
 fun UsbAudioPanel(
     minBuffer: String,
     maxBuffer: String,
+    bitDepth: Int,
     inputBurstPackets: Int,
     outputBurstPackets: Int,
     inputEnabled: Boolean,
     outputEnabled: Boolean,
+    active: Boolean,
     stats: LongArray,
     onMinBuffer: (String) -> Unit,
     onMaxBuffer: (String) -> Unit,
+    onBitDepth: (Int) -> Unit,
     onInputBurstPackets: (Int) -> Unit,
     onOutputBurstPackets: (Int) -> Unit
 ) {
@@ -56,6 +59,16 @@ fun UsbAudioPanel(
     ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("USB Host", color = Color.White, fontWeight = FontWeight.Bold)
+            Text("USB PCM 位深", color = muted, fontSize = 12.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(16, 24, 32).forEach { bits ->
+                    FilterChip(
+                        selected = bitDepth == bits,
+                        onClick = { onBitDepth(bits) },
+                        label = { Text("$bits-bit", fontSize = 12.sp) }
+                    )
+                }
+            }
             Text("输出缓冲", color = muted, fontSize = 12.sp)
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedTextField(
@@ -83,11 +96,48 @@ fun UsbAudioPanel(
             BurstChoice("输入 Burst（USB 包 / transfer）", inputBurstPackets, inputEnabled, muted, onInputBurstPackets)
             BurstChoice("输出 Burst（USB 包 / transfer）", outputBurstPackets, outputEnabled, muted, onOutputBurstPackets)
             HorizontalDivider(color = Color(0xFF344248))
-            Text("本次 USB 状态", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Text("实际采用格式", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            if (inputEnabled) {
+                UsbFormatRow("输入", active, stats.getOrElse(6) { 0 }, stats.getOrElse(7) { 0 }, stats.getOrElse(8) { 0 }, muted, accent)
+            }
+            if (outputEnabled) {
+                UsbFormatRow("输出", active, stats.getOrElse(9) { 0 }, stats.getOrElse(10) { 0 }, stats.getOrElse(11) { 0 }, muted, accent)
+            }
+            HorizontalDivider(color = Color(0xFF344248))
+            Text("本次 USB 异常", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
             UsbStatPair("输入异常包", stats.getOrElse(0) { 0 }, "输入空包", stats.getOrElse(1) { 0 }, muted)
             UsbStatPair("输入传输异常", stats.getOrElse(2) { 0 }, "输入 Ring 溢出", stats.getOrElse(3) { 0 }, muted)
             UsbStatPair("输出传输异常", stats.getOrElse(4) { 0 }, "输出低水位", stats.getOrElse(5) { 0 }, muted)
         }
+    }
+}
+
+@Composable
+private fun UsbFormatRow(
+    label: String,
+    active: Boolean,
+    sampleRate: Long,
+    bitDepth: Long,
+    channels: Long,
+    muted: Color,
+    accent: Color
+) {
+    val actualFormat = when {
+        !active -> "未启动"
+        sampleRate <= 0 || bitDepth <= 0 || channels <= 0 -> "未采用 USB Host"
+        else -> {
+            val rate = if (sampleRate % 1_000L == 0L) "${sampleRate / 1_000L} kHz" else "${sampleRate / 1_000f} kHz"
+            "$rate · $bitDepth-bit · $channels ch"
+        }
+    }
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text("${label}实际格式", color = muted, fontSize = 11.sp)
+        Text(
+            actualFormat,
+            color = if (sampleRate > 0) accent else muted,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold
+        )
     }
 }
 

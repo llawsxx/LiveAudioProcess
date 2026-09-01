@@ -19,9 +19,10 @@
 namespace {
 class UsbHostAudio {
 public:
-    UsbHostAudio(int fd, int rate, bool in, bool out, int outputMinBufferMs,
+    UsbHostAudio(int fd, int rate, int bitDepth, bool in, bool out, int outputMinBufferMs,
                  int outputMaxBufferMs, int inputBurstPackets, int outputBurstPackets)
         : inputRing_(kRingFrames * 2), outputRing_(kRingFrames * 2), rate_(rate),
+          bitDepth_(bitDepth),
           outputMinBufferMs_(outputMinBufferMs), outputMaxBufferMs_(outputMaxBufferMs),
           inputBurstPackets_(std::clamp(inputBurstPackets, 1, 16)),
           outputBurstPackets_(std::clamp(outputBurstPackets, 1, 16)) {
@@ -31,8 +32,9 @@ public:
         if (out) startOutput(rate);
         if ((in && !inputStream_) || (out && !outputStream_))
             throw std::runtime_error("requested USB audio route/format not found");
-        USB_HOST_LOGI("USB Host audio started input=%d output=%d, buffer=%d/%d/%d ms, burst=%d/%d",
+        USB_HOST_LOGI("USB Host audio started input=%d output=%d, requested=%d Hz/%d-bit, buffer=%d/%d/%d ms, burst=%d/%d",
                       inputStream_ != nullptr, outputStream_ != nullptr,
+                      rate_, bitDepth_,
                       outputMinBufferMs_,
                       outputMinBufferMs_ + (outputMaxBufferMs_ - outputMinBufferMs_) / 2,
                       outputMaxBufferMs_, inputBurstPackets_,
@@ -111,6 +113,12 @@ public:
             std::lock_guard<std::mutex> lock(outputMutex_);
             result.output_low_water_events = outputUnderruns_;
         }
+        result.input_sample_rate = inputSampleRate_;
+        result.input_bit_resolution = inputBitResolution_;
+        result.input_channels = inputChannels_;
+        result.output_sample_rate = outputSampleRate_;
+        result.output_bit_resolution = outputBitResolution_;
+        result.output_channels = outputChannels_;
         return result;
     }
 private:
@@ -166,16 +174,22 @@ private:
     }
     void startInput(int rate) {
         auto routes = device_->get_device()->query_audio_routes(uac::UAC_TERMINAL_ANY, uac::UAC_TERMINAL_USB_STREAMING); if (routes.empty()) return;
-        const auto &si = device_->get_device()->get_stream_interface(routes.front().get()); auto cfg = si.query_config_uncompressed(uac::UAC_FORMAT_DATA_PCM, 2, (uint32_t)rate); if (!cfg) return;
+        const auto &si = device_->get_device()->get_stream_interface(routes.front().get()); auto cfg = si.query_config_uncompressed(uac::UAC_FORMAT_DATA_PCM, 2, (uint32_t)rate, (uint8_t)bitDepth_); if (!cfg) return;
         int bytes = cfg->bSubframeSize, ch = cfg->bChannelCount; inputStream_ = device_->start_streaming(si, *cfg, [this, bytes, ch](uint8_t *d, uint n) { onInput(d, n, bytes, ch); }, inputBurstPackets_);
+        inputSampleRate_ = cfg->tSampleRate; inputBitResolution_ = cfg->bBitResolution; inputChannels_ = cfg->bChannelCount;
+        USB_HOST_LOGI("USB input actual format=%u Hz/%u-bit/%u ch, subframe=%u B",
+                      inputSampleRate_, inputBitResolution_, inputChannels_, cfg->bSubframeSize);
     }
     void startOutput(int rate) {
         auto routes = device_->get_device()->query_audio_routes(uac::UAC_TERMINAL_USB_STREAMING, uac::UAC_TERMINAL_ANY); if (routes.empty()) return;
-        const auto &si = device_->get_device()->get_stream_interface(routes.front().get()); auto cfg = si.query_config_uncompressed(uac::UAC_FORMAT_DATA_PCM, 2, (uint32_t)rate); if (!cfg) return;
+        const auto &si = device_->get_device()->get_stream_interface(routes.front().get()); auto cfg = si.query_config_uncompressed(uac::UAC_FORMAT_DATA_PCM, 2, (uint32_t)rate, (uint8_t)bitDepth_); if (!cfg) return;
         int bytes = cfg->bSubframeSize, ch = cfg->bChannelCount;
         outputTransferFrames_ = (outputBurstPackets_ * cfg->wMaxPacketSize) / std::max(1, bytes * ch);
         updateOutputBufferFrames();
         outputStream_ = device_->start_streaming(si, *cfg, [this, bytes, ch](uint8_t *d, uint n) { onOutput(d, n, bytes, ch); }, outputBurstPackets_);
+        outputSampleRate_ = cfg->tSampleRate; outputBitResolution_ = cfg->bBitResolution; outputChannels_ = cfg->bChannelCount;
+        USB_HOST_LOGI("USB output actual format=%u Hz/%u-bit/%u ch, subframe=%u B",
+                      outputSampleRate_, outputBitResolution_, outputChannels_, cfg->bSubframeSize);
     }
     void updateOutputBufferFrames() {
         if (outputTransferFrames_ <= 0) return;
@@ -194,14 +208,16 @@ private:
     std::shared_ptr<uac::uac_context> context_; std::shared_ptr<uac::uac_device_handle> device_; std::shared_ptr<uac::uac_stream_handle> inputStream_, outputStream_;
     std::atomic<bool> stopping_{false};
     std::mutex inputMutex_, outputMutex_; std::condition_variable inputCv_; std::vector<float> inputRing_, outputRing_; int inputRead_=0,inputWrite_=0,inputCount_=0,outputRead_=0,outputWrite_=0,outputCount_=0;
-    int rate_=48000, outputMinBufferMs_=16, outputMaxBufferMs_=50;
+    int rate_=48000, bitDepth_=16, outputMinBufferMs_=16, outputMaxBufferMs_=50;
+    uint32_t inputSampleRate_=0, outputSampleRate_=0;
+    uint8_t inputBitResolution_=0, inputChannels_=0, outputBitResolution_=0, outputChannels_=0;
     int inputBurstPackets_=8, outputBurstPackets_=8;
     int outputTransferFrames_=0, outputMinFrames_=1, outputPrerollFrames_=1, outputMaxPrerollFrames_=1;
     bool outputPrimed_=false, outputHasData_=false;
     uint64_t inputRingOverruns_=0, outputUnderruns_=0;
 };
 }
-extern "C" usb_host_audio_t usb_host_audio_start(int fd, int rate, int in, int out, int minMs, int maxMs, int inputBurst, int outputBurst) { try { return new UsbHostAudio(fd, rate, in != 0, out != 0, minMs, maxMs, inputBurst, outputBurst); } catch (const std::exception &e) { USB_HOST_LOGE("USB Host audio start failed: %s", e.what()); return nullptr; } catch (...) { USB_HOST_LOGE("USB Host audio start failed"); return nullptr; } }
+extern "C" usb_host_audio_t usb_host_audio_start(int fd, int rate, int bitDepth, int in, int out, int minMs, int maxMs, int inputBurst, int outputBurst) { try { return new UsbHostAudio(fd, rate, bitDepth, in != 0, out != 0, minMs, maxMs, inputBurst, outputBurst); } catch (const std::exception &e) { USB_HOST_LOGE("USB Host audio start failed: %s", e.what()); return nullptr; } catch (...) { USB_HOST_LOGE("USB Host audio start failed"); return nullptr; } }
 extern "C" int usb_host_audio_read(usb_host_audio_t a, float *d, int n) { return a ? static_cast<UsbHostAudio *>(a)->read(d, n) : 0; }
 extern "C" int usb_host_audio_write(usb_host_audio_t a, const float *d, int n) { return a ? static_cast<UsbHostAudio *>(a)->write(d, n) : 0; }
 extern "C" void usb_host_audio_configure_output_buffer(usb_host_audio_t a, int minMs, int maxMs) { if (a) static_cast<UsbHostAudio *>(a)->configureOutputBuffer(minMs, maxMs); }

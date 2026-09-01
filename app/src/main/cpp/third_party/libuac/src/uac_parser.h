@@ -117,7 +117,8 @@ namespace uac {
 
         std::unique_ptr<const uac_audio_config_uncompressed> query_config_uncompressed(uac_audio_data_format_type audioDataFormatType,
                                                                          uint8_t numChannels,
-                                                                         uint32_t sampleRate) const override;
+                                                                         uint32_t sampleRate,
+                                                                         uint8_t bitResolution = 0) const override;
 
         uint8_t bInterfaceNr;
         std::vector<uac_altsetting> altsettings;

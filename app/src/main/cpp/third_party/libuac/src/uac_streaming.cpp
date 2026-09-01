@@ -185,13 +185,15 @@ namespace uac {
     std::unique_ptr<const uac_audio_config_uncompressed> uac_stream_if_impl::query_config_uncompressed(
             uac_audio_data_format_type audioDataFormatType,
             uint8_t numChannels,
-            uint32_t sampleRate) const {
+            uint32_t sampleRate,
+            uint8_t bitResolution) const {
         for (auto&& setting : altsettings) {
             auto format1 = setting.getFormatType1();
             if (format1 == nullptr) continue;
             if ((audioDataFormatType == UAC_FORMAT_DATA_ANY || setting.general.wFormatTag == audioDataFormatType)
                 && setting.supportsChannelsCount(numChannels)
-                && setting.supportsSampleRate(sampleRate)) {
+                && setting.supportsSampleRate(sampleRate)
+                && (bitResolution == 0 || format1->bBitResolution == bitResolution)) {
                 return std::make_unique<uac_audio_config_uncompressed>(
                         uac_audio_config_uncompressed{
                             audioDataFormatType,

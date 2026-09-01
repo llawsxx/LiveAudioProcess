@@ -7,7 +7,7 @@ object NativeAudio {
         System.loadLibrary("pulseforge_audio")
     }.isSuccess
 
-    external fun start(sampleRate: Int, frames: Int, inputDeviceId: Int, outputDeviceId: Int, inputChannels: Int, pair: Int, useNetworkInput: Boolean, usbFd: Int, usbInputHost: Boolean, usbOutputHost: Boolean, usbInputBurstPackets: Int, usbOutputBurstPackets: Int): Boolean
+    external fun start(sampleRate: Int, frames: Int, inputDeviceId: Int, outputDeviceId: Int, inputChannels: Int, pair: Int, useNetworkInput: Boolean, usbFd: Int, usbInputHost: Boolean, usbOutputHost: Boolean, usbBitDepth: Int, usbInputBurstPackets: Int, usbOutputBurstPackets: Int): Boolean
     external fun stop()
     external fun update(flags: Int, values: FloatArray)
     external fun levels(): FloatArray
