@@ -60,7 +60,8 @@ class AudioEngine(private val context: Context) {
     @Volatile var eq4Frequency = 10000f; @Volatile var eq4Gain = 0f; @Volatile var eq4Q = 1f
     @Volatile var reverbRoom = 42f; @Volatile var reverbDecay = 1.8f; @Volatile var reverbDamping = 35f; @Volatile var reverbMix = .18f
     @Volatile var limiterInputGain = 0f; @Volatile var limiterThreshold = -.5f; @Volatile var limiterRelease = 80f; @Volatile var limiterCeiling = -.5f; @Volatile var limiterLookAhead = 1f; @Volatile var limiterAdaptiveRelease = false
-    @Volatile var dspEnabled = false; @Volatile var eqEnabled = true; @Volatile var reverbEnabled = true; @Volatile var limiterEnabled = true
+    @Volatile var loudnessTarget = -16f; @Volatile var loudnessLra = 7f; @Volatile var loudnessTruePeak = -1f
+    @Volatile var dspEnabled = false; @Volatile var eqEnabled = true; @Volatile var reverbEnabled = true; @Volatile var limiterEnabled = true; @Volatile var loudnessEnabled = true
     @Volatile var isRunning = false; private set
     @Volatile var isRecording = false; private set
     @Volatile var lastError: String? = null; private set
@@ -420,7 +421,22 @@ class AudioEngine(private val context: Context) {
     }
     fun stop() { if (isRecording) setRecording(false); routeHandler.removeCallbacks(routeRestart); routeHandler.removeCallbacks(routeRefresh); routeHandler.removeCallbacks(wifiHealthMonitor); routeHandler.removeCallbacks(bluetoothRouteMonitor); NativeAudio.stop(); usbConnection?.close(); usbConnection = null; clearBluetoothRoute(); activeInputDeviceId = -1; activeOutputDeviceId = -1; observedBluetoothDeviceId = Int.MIN_VALUE; bluetoothRetryCount = 0; nextBluetoothRetryAtMs = 0L; isRecording = false; isRunning = false }
     fun refreshNativeParameters() { pushNativeParameters() }
-    private fun pushNativeParameters() { if (NativeAudio.available) NativeAudio.update((if (dspEnabled) 1 else 0) or (if (eqEnabled) 2 else 0) or (if (reverbEnabled) 4 else 0) or (if (limiterEnabled) 8 else 0), floatArrayOf(eqFrequency, eqGain, eqQ, eq2Frequency, eq2Gain, eq2Q, eq3Frequency, eq3Gain, eq3Q, eq4Frequency, eq4Gain, eq4Q, reverbRoom, reverbDecay, reverbDamping, reverbMix * 100f, limiterInputGain, limiterThreshold, limiterRelease, limiterCeiling, limiterLookAhead, if (limiterAdaptiveRelease) 1f else 0f)) }
+    private fun pushNativeParameters() {
+        if (!NativeAudio.available) return
+        val flags = (if (dspEnabled) 1 else 0) or
+            (if (eqEnabled) 2 else 0) or
+            (if (reverbEnabled) 4 else 0) or
+            (if (limiterEnabled) 8 else 0) or
+            (if (loudnessEnabled) 16 else 0)
+        NativeAudio.update(flags, floatArrayOf(
+            eqFrequency, eqGain, eqQ, eq2Frequency, eq2Gain, eq2Q,
+            eq3Frequency, eq3Gain, eq3Q, eq4Frequency, eq4Gain, eq4Q,
+            reverbRoom, reverbDecay, reverbDamping, reverbMix * 100f,
+            limiterInputGain, limiterThreshold, limiterRelease, limiterCeiling,
+            limiterLookAhead, if (limiterAdaptiveRelease) 1f else 0f,
+            loudnessTarget, loudnessLra, loudnessTruePeak
+        ))
+    }
 
     companion object {
         private fun formatSampleRate(rate: Int) = if (rate % 1_000 == 0) "${rate / 1_000} kHz" else "${rate / 1000f} kHz"

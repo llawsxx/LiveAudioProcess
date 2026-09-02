@@ -47,6 +47,11 @@ fun UnifiedEffectsPanel(settings: EffectSettings, onChange: (EffectSettings) -> 
             ParameterSlider("Damping", settings.reverbDamping, 0f..100f, { onChange(settings.copy(reverbDamping = it)) }, "${settings.reverbDamping.toInt()}%")
             ParameterSlider("Dry / Wet", settings.reverbMix, 0f..100f, { onChange(settings.copy(reverbMix = it)) }, "${settings.reverbMix.toInt()}%")
 
+            GroupTitle("响度标准化 Loudness · Limiter 前级")
+            ParameterSlider("目标响度", settings.loudnessTarget, -30f..-5f, { onChange(settings.copy(loudnessTarget = it)) }, "${"%.1f".format(settings.loudnessTarget)} LUFS")
+            ParameterSlider("响度范围 LRA", settings.loudnessLra, 1f..20f, { onChange(settings.copy(loudnessLra = it)) }, "${"%.1f".format(settings.loudnessLra)} LU")
+            ParameterSlider("真峰值上限", settings.loudnessTruePeak, -9f..0f, { onChange(settings.copy(loudnessTruePeak = it)) }, "${"%.1f".format(settings.loudnessTruePeak)} dBTP")
+
             GroupTitle("限制器 Limiter")
             ParameterSlider("Input Gain", settings.limiterInputGain, -24f..24f, { onChange(settings.copy(limiterInputGain = it)) }, limiterDbLabel(settings.limiterInputGain))
             ParameterSlider("Threshold", settings.limiterThreshold, -24f..0f, { onChange(settings.copy(limiterThreshold = it)) }, limiterDbLabel(settings.limiterThreshold))

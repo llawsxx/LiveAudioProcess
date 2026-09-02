@@ -25,6 +25,7 @@ fun ProcessingControlPanel(settings: EffectSettings, onChange: (EffectSettings) 
             ToggleRow("整体 DSP", "关闭后为立体声直通", settings.dspEnabled) { onChange(settings.copy(dspEnabled = it)) }
             ToggleRow("参数均衡 EQ", "4-band", settings.eqEnabled) { onChange(settings.copy(eqEnabled = it)) }
             ToggleRow("卷积混响", "Partitioned convolution", settings.reverbEnabled) { onChange(settings.copy(reverbEnabled = it)) }
+            ToggleRow("响度标准化 Loudness", "低延迟 · 目标响度 / 真峰值", settings.loudnessEnabled) { onChange(settings.copy(loudnessEnabled = it)) }
             ToggleRow("限制器 Limiter", "Input Gain / Threshold / Release", settings.limiterEnabled) { onChange(settings.copy(limiterEnabled = it)) }
         }
     }

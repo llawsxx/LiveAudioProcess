@@ -51,6 +51,9 @@ typedef struct {
     uint8_t data[NET_AAC_STORED_PACKET_BYTES];
 } NetAacJitterSlot;
 #define RECORD_QUEUE_BLOCKS 32
+#define LOUDNESS_SUBBLOCKS 30
+#define LOUDNESS_GATE_BLOCKS 300
+#define LOUDNESS_LRA_BLOCKS 30
 typedef struct {
     int frames;
     int16_t dry[MAX_FRAMES * 2];
@@ -62,7 +65,7 @@ typedef struct {
     atomic_int running, recording, flags;
     _Atomic(float) levels[6];
     int rate, frames, in_channels, pair;
-    float values[24];
+    float values[28];
     pthread_mutex_t param_lock, file_lock, stream_lock;
     Biquad eq[2][EQ_BANDS];
     ConvolutionReverb *reverb;
@@ -76,6 +79,20 @@ typedef struct {
     double *limiter_next_delta;
     int limiter_delay_frames, limiter_next_iter, limiter_next_len;
     double limiter_gain, limiter_delta, limiter_peak_activity;
+    /* BS.1770 measurement runs on a side-chain and never buffers output. */
+    double loudness_b[5], loudness_a[5], loudness_v[2][5];
+    double loudness_subblocks[LOUDNESS_SUBBLOCKS];
+    double loudness_gate_blocks[LOUDNESS_GATE_BLOCKS];
+    double loudness_lra_blocks[LOUDNESS_LRA_BLOCKS];
+    double loudness_subblock_sum;
+    int loudness_subblock_frames, loudness_subblock_count;
+    int loudness_subblock_pos, loudness_subblock_valid;
+    int loudness_gate_pos, loudness_gate_valid;
+    int loudness_lra_pos, loudness_lra_valid, loudness_lra_hop;
+    double loudness_measured_lra;
+    double loudness_gain, loudness_desired_gain, loudness_gain_coeff;
+    double loudness_peak_gain, loudness_peak_release_coeff, loudness_tp_limit;
+    double loudness_tp_db;
     FILE *dry_file, *wet_file;
     uint32_t dry_bytes, wet_bytes;
     pthread_t record_thread;
@@ -141,10 +158,11 @@ static Engine g = {
 
 #define NET_MAGIC 0x50464C58u
 
-enum { DSP_ON=1, EQ_ON=2, REVERB_ON=4, LIMITER_ON=8 };
+enum { DSP_ON=1, EQ_ON=2, REVERB_ON=4, LIMITER_ON=8, LOUDNESS_ON=16 };
 enum {
     P_EQ1_F,P_EQ1_G,P_EQ1_Q,P_EQ2_F,P_EQ2_G,P_EQ2_Q,P_EQ3_F,P_EQ3_G,P_EQ3_Q,P_EQ4_F,P_EQ4_G,P_EQ4_Q,
-    P_ROOM,P_DECAY,P_DAMP,P_MIX,P_LIM_IN,P_LIMIT,P_RELEASE,P_CEILING,P_LOOKAHEAD,P_ADAPTIVE_RELEASE
+    P_ROOM,P_DECAY,P_DAMP,P_MIX,P_LIM_IN,P_LIMIT,P_RELEASE,P_CEILING,P_LOOKAHEAD,P_ADAPTIVE_RELEASE,
+    P_LOUDNESS_TARGET,P_LOUDNESS_LRA,P_LOUDNESS_TP
 };
 
 static float db_to_linear(float db) { return powf(10.f, db / 20.f); }
@@ -443,6 +461,241 @@ static void limiter_reset(int delay_frames) {
     g.limiter_gain = 1.0;
     g.limiter_delta = 0.0;
     g.limiter_peak_activity = 0.0;
+}
+
+static double loudness_to_energy(double loudness) {
+    return pow(10.0, (loudness + 0.691) / 10.0);
+}
+
+static double loudness_from_energy(double energy) {
+    return 10.0 * log10(fmax(energy, 1.0e-12)) - 0.691;
+}
+
+static double loudness_recent_average(const double *values, int size,
+                                      int next_pos, int count) {
+    double sum = 0.0;
+    if (count > size) count = size;
+    for (int i = 1; i <= count; ++i) {
+        int index = next_pos - i;
+        if (index < 0) index += size;
+        sum += values[index];
+    }
+    return count > 0 ? sum / (double)count : 0.0;
+}
+
+/* Coefficients match FFmpeg's ebur128 K-weighting filter. The filtered signal
+ * is used only for measurement, so its phase response adds no output delay. */
+static void loudness_init_filter(int rate) {
+    double f0 = 1681.974450955533;
+    double gain = 3.999843853973347;
+    double q = 0.7071752369554196;
+    double k = tan(M_PI * f0 / (double)rate);
+    double vh = pow(10.0, gain / 20.0);
+    double vb = pow(vh, 0.4996667741545416);
+    double pb[3], pa[3] = {1.0, 0.0, 0.0};
+    double rb[3] = {1.0, -2.0, 1.0}, ra[3] = {1.0, 0.0, 0.0};
+    double a0 = 1.0 + k / q + k * k;
+    pb[0] = (vh + vb * k / q + k * k) / a0;
+    pb[1] = 2.0 * (k * k - vh) / a0;
+    pb[2] = (vh - vb * k / q + k * k) / a0;
+    pa[1] = 2.0 * (k * k - 1.0) / a0;
+    pa[2] = (1.0 - k / q + k * k) / a0;
+
+    f0 = 38.13547087602444;
+    q = 0.5003270373238773;
+    k = tan(M_PI * f0 / (double)rate);
+    a0 = 1.0 + k / q + k * k;
+    ra[1] = 2.0 * (k * k - 1.0) / a0;
+    ra[2] = (1.0 - k / q + k * k) / a0;
+
+    g.loudness_b[0] = pb[0] * rb[0];
+    g.loudness_b[1] = pb[0] * rb[1] + pb[1] * rb[0];
+    g.loudness_b[2] = pb[0] * rb[2] + pb[1] * rb[1] + pb[2] * rb[0];
+    g.loudness_b[3] = pb[1] * rb[2] + pb[2] * rb[1];
+    g.loudness_b[4] = pb[2] * rb[2];
+    g.loudness_a[0] = 1.0;
+    g.loudness_a[1] = ra[1] + pa[1];
+    g.loudness_a[2] = ra[2] + pa[1] * ra[1] + pa[2];
+    g.loudness_a[3] = pa[1] * ra[2] + pa[2] * ra[1];
+    g.loudness_a[4] = pa[2] * ra[2];
+}
+
+static void loudness_reset(void) {
+    memset(g.loudness_v, 0, sizeof(g.loudness_v));
+    memset(g.loudness_subblocks, 0, sizeof(g.loudness_subblocks));
+    memset(g.loudness_gate_blocks, 0, sizeof(g.loudness_gate_blocks));
+    memset(g.loudness_lra_blocks, 0, sizeof(g.loudness_lra_blocks));
+    g.loudness_subblock_sum = 0.0;
+    g.loudness_subblock_count = 0;
+    g.loudness_subblock_pos = g.loudness_subblock_valid = 0;
+    g.loudness_gate_pos = g.loudness_gate_valid = 0;
+    g.loudness_lra_pos = g.loudness_lra_valid = g.loudness_lra_hop = 0;
+    g.loudness_measured_lra = 0.0;
+    g.loudness_gain = g.loudness_desired_gain = 1.0;
+    g.loudness_gain_coeff = 0.0;
+    g.loudness_peak_gain = 1.0;
+    g.loudness_tp_limit = 1.0;
+    g.loudness_tp_db = 1000.0;
+}
+
+static void loudness_init(int rate) {
+    int safe_rate = rate > 0 ? rate : 48000;
+    loudness_init_filter(safe_rate);
+    g.loudness_subblock_frames = (safe_rate + 5) / 10;
+    if (g.loudness_subblock_frames < 1) g.loudness_subblock_frames = 1;
+    g.loudness_peak_release_coeff = 1.0 -
+            exp(-1.0 / ((double)safe_rate * 0.100));
+    loudness_reset();
+}
+
+static double loudness_filter_sample(int channel, double sample) {
+    double *v = g.loudness_v[channel];
+    v[0] = sample - g.loudness_a[1] * v[1] - g.loudness_a[2] * v[2]
+                  - g.loudness_a[3] * v[3] - g.loudness_a[4] * v[4];
+    double output = g.loudness_b[0] * v[0] + g.loudness_b[1] * v[1]
+                  + g.loudness_b[2] * v[2] + g.loudness_b[3] * v[3]
+                  + g.loudness_b[4] * v[4];
+    v[4] = v[3]; v[3] = v[2]; v[2] = v[1]; v[1] = v[0];
+    return output;
+}
+
+static void loudness_update_lra(double short_term_energy) {
+    if (++g.loudness_lra_hop < 10) return;
+    g.loudness_lra_hop = 0;
+    g.loudness_lra_blocks[g.loudness_lra_pos] = short_term_energy;
+    g.loudness_lra_pos = (g.loudness_lra_pos + 1) % LOUDNESS_LRA_BLOCKS;
+    if (g.loudness_lra_valid < LOUDNESS_LRA_BLOCKS) g.loudness_lra_valid++;
+
+    const double absolute_gate = loudness_to_energy(-70.0);
+    double sum = 0.0;
+    int count = 0;
+    for (int i = 0; i < g.loudness_lra_valid; ++i) {
+        if (g.loudness_lra_blocks[i] >= absolute_gate) {
+            sum += g.loudness_lra_blocks[i];
+            count++;
+        }
+    }
+    if (count < 4) return;
+    double gate = fmax(absolute_gate, (sum / (double)count) * 0.01);
+    double sorted[LOUDNESS_LRA_BLOCKS];
+    int sorted_count = 0;
+    for (int i = 0; i < g.loudness_lra_valid; ++i) {
+        double energy = g.loudness_lra_blocks[i];
+        if (energy < gate) continue;
+        double loudness = loudness_from_energy(energy);
+        int insert = sorted_count;
+        while (insert > 0 && sorted[insert - 1] > loudness) {
+            sorted[insert] = sorted[insert - 1];
+            insert--;
+        }
+        sorted[insert] = loudness;
+        sorted_count++;
+    }
+    if (sorted_count < 4) return;
+    int low = (int)floor(0.10 * (double)(sorted_count - 1));
+    int high = (int)ceil(0.95 * (double)(sorted_count - 1));
+    g.loudness_measured_lra = sorted[high] - sorted[low];
+}
+
+static void loudness_update_target(const float *p) {
+    if (g.loudness_subblock_valid < 4) return;
+
+    double momentary_energy = loudness_recent_average(
+            g.loudness_subblocks, LOUDNESS_SUBBLOCKS,
+            g.loudness_subblock_pos, 4);
+    g.loudness_gate_blocks[g.loudness_gate_pos] = momentary_energy;
+    g.loudness_gate_pos = (g.loudness_gate_pos + 1) % LOUDNESS_GATE_BLOCKS;
+    if (g.loudness_gate_valid < LOUDNESS_GATE_BLOCKS) g.loudness_gate_valid++;
+
+    /* BS.1770 integrated gate: first reject blocks below -70 LUFS, then reject
+     * blocks more than 10 LU below the absolute-gated mean. */
+    const double absolute_gate = loudness_to_energy(-70.0);
+    double absolute_sum = 0.0;
+    int absolute_count = 0;
+    for (int i = 0; i < g.loudness_gate_valid; ++i) {
+        double energy = g.loudness_gate_blocks[i];
+        if (energy >= absolute_gate) { absolute_sum += energy; absolute_count++; }
+    }
+    if (absolute_count == 0) return;
+    double relative_gate = (absolute_sum / (double)absolute_count) * 0.1;
+    double gate = fmax(absolute_gate, relative_gate);
+    double gated_sum = 0.0;
+    int gated_count = 0;
+    for (int i = 0; i < g.loudness_gate_valid; ++i) {
+        double energy = g.loudness_gate_blocks[i];
+        if (energy >= gate) { gated_sum += energy; gated_count++; }
+    }
+    if (gated_count == 0) return;
+
+    double integrated = loudness_from_energy(gated_sum / (double)gated_count);
+    int short_count = g.loudness_subblock_valid < LOUDNESS_SUBBLOCKS ?
+                      g.loudness_subblock_valid : LOUDNESS_SUBBLOCKS;
+    double short_term_energy = loudness_recent_average(
+            g.loudness_subblocks, LOUDNESS_SUBBLOCKS,
+            g.loudness_subblock_pos, short_count);
+    double short_term = loudness_from_energy(short_term_energy);
+    if (short_term < -60.0) return;
+    if (short_count == LOUDNESS_SUBBLOCKS)
+        loudness_update_lra(short_term_energy);
+
+    double target = clampf(p[P_LOUDNESS_TARGET], -70.f, -5.f);
+    double target_lra = clampf(p[P_LOUDNESS_LRA], 1.f, 50.f);
+    double deviation = short_term - integrated;
+    double dynamic_correction = 0.0;
+    if (g.loudness_measured_lra > target_lra) {
+        double range_ratio = target_lra / g.loudness_measured_lra;
+        dynamic_correction = deviation * (range_ratio - 1.0);
+    }
+    dynamic_correction = fmin(fmax(dynamic_correction, -6.0), 6.0);
+    double gain_db = fmin(fmax(target - integrated + dynamic_correction,
+                              -12.0), 18.0);
+    g.loudness_desired_gain = pow(10.0, gain_db / 20.0);
+    double gain_tau = g.loudness_desired_gain < g.loudness_gain ? 0.080 :
+                      fmin(1.500, 0.250 + 0.035 * target_lra);
+    g.loudness_gain_coeff = 1.0 - exp(-1.0 / ((double)g.rate * gain_tau));
+}
+
+/* K-weighted, gated loudness measurement and linked-stereo gain control. All
+ * windows live in the measurement side-chain; the current sample is emitted
+ * immediately, so this stage adds zero samples of audio latency. */
+static void loudness_process(float *l, float *r, const float *p) {
+    double target_tp = clampf(p[P_LOUDNESS_TP], -9.f, 0.f);
+    if (target_tp != g.loudness_tp_db) {
+        g.loudness_tp_db = target_tp;
+        g.loudness_tp_limit = pow(10.0, target_tp / 20.0);
+    }
+    double weighted_l = loudness_filter_sample(0, *l);
+    double weighted_r = loudness_filter_sample(1, *r);
+    g.loudness_subblock_sum += weighted_l * weighted_l + weighted_r * weighted_r;
+    if (++g.loudness_subblock_count >= g.loudness_subblock_frames) {
+        double energy = g.loudness_subblock_sum /
+                        (double)g.loudness_subblock_count;
+        g.loudness_subblocks[g.loudness_subblock_pos] = energy;
+        g.loudness_subblock_pos = (g.loudness_subblock_pos + 1) % LOUDNESS_SUBBLOCKS;
+        if (g.loudness_subblock_valid < LOUDNESS_SUBBLOCKS)
+            g.loudness_subblock_valid++;
+        g.loudness_subblock_sum = 0.0;
+        g.loudness_subblock_count = 0;
+        loudness_update_target(p);
+    }
+
+    g.loudness_gain += (g.loudness_desired_gain - g.loudness_gain) *
+                       g.loudness_gain_coeff;
+    g.loudness_gain = fmin(fmax(g.loudness_gain, 0.0630957), 7.94328);
+
+    double peak = fmax(fabs((double)*l), fabs((double)*r));
+    double applied_gain = g.loudness_gain * g.loudness_peak_gain;
+    if (peak > 1.0e-9 && peak * applied_gain > g.loudness_tp_limit)
+        g.loudness_peak_gain = fmin(g.loudness_peak_gain,
+                                    g.loudness_tp_limit /
+                                    (peak * g.loudness_gain));
+    else
+        g.loudness_peak_gain += (1.0 - g.loudness_peak_gain) *
+                                g.loudness_peak_release_coeff;
+    g.loudness_peak_gain = fmin(fmax(g.loudness_peak_gain, 0.0), 1.0);
+    applied_gain = g.loudness_gain * g.loudness_peak_gain;
+    *l = (float)((double)*l * applied_gain);
+    *r = (float)((double)*r * applied_gain);
 }
 
 /*
@@ -967,7 +1220,7 @@ static void *audio_thread(void *unused) {
     (void)unused;
     if (setpriority(PRIO_PROCESS, 0, -16) != 0)
         LOGI("Audio DSP thread priority request failed: errno=%d", errno);
-    float input[MAX_FRAMES*MAX_INPUT_CHANNELS], dry[MAX_FRAMES*2], output[MAX_FRAMES*2], p[24];
+    float input[MAX_FRAMES*MAX_INPUT_CHANNELS], dry[MAX_FRAMES*2], output[MAX_FRAMES*2], p[28];
     while(atomic_load(&g.running)) {
         uint64_t block_begin_us = now_ns() / 1000ull;
         int want=g.frames<MAX_FRAMES?g.frames:MAX_FRAMES;
@@ -985,6 +1238,7 @@ static void *audio_thread(void *unused) {
             atomic_store(&g.levels[4],1.f);
             atomic_store(&g.levels[5],fmaxf(p[P_RELEASE],10.f));
         }
+        if (!(flags & DSP_ON) || !(flags & LOUDNESS_ON)) loudness_reset();
         ConvolutionReverb *reverb=NULL;
         if((flags&REVERB_ON) && (flags&DSP_ON)) {
             pthread_mutex_lock(&g.reverb_lock);
@@ -1000,6 +1254,7 @@ static void *audio_thread(void *unused) {
             if(flags&DSP_ON) {
                 if(flags&EQ_ON)for(int b=0;b<EQ_BANDS;b++){biquad_config(&g.eq[0][b],g.rate,p[b*3],p[b*3+1],p[b*3+2]);biquad_config(&g.eq[1][b],g.rate,p[b*3],p[b*3+1],p[b*3+2]);l=biquad_process(&g.eq[0][b],l);r=biquad_process(&g.eq[1][b],r);}
                 if((flags&REVERB_ON) && reverb){float wet_l=0.f,wet_r=0.f,mix=clampf(p[P_MIX]/100.f,0.f,1.f);convolution_reverb_process(reverb,l,r,&wet_l,&wet_r);l=l*(1.f-mix)+wet_l*mix;r=r*(1.f-mix)+wet_r*mix;}
+                if(flags&LOUDNESS_ON) loudness_process(&l,&r,p);
                 if(flags&LIMITER_ON)limiter_process(&l,&r,p);
             }
             output[i*2]=l;output[i*2+1]=r;peaks[2]=fmaxf(peaks[2],fabsf(l));peaks[3]=fmaxf(peaks[3],fabsf(r));
@@ -1113,7 +1368,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
     output_ring_destroy();
     atomic_store(&g.dsp_last_us, 0);
     atomic_store(&g.dsp_max_us, 0);
-    memset(g.eq,0,sizeof(g.eq));g.rate=rate;g.frames=frames;g.in_channels=channels;g.pair=pair;g.limiter_gain=1.0;g.limiter_delta=0.0;g.limiter_delay_frames=0;g.limiter_next_iter=g.limiter_next_len=0;g.usb_audio=NULL;g.usb_input_host=usbInputHost?1:0;g.usb_output_host=usbOutputHost?1:0;if(usbFd<0){g.usb_input_host=0;g.usb_output_host=0;}atomic_store(&g.use_network_input,useNetworkInput?1:0);if(useNetworkInput)atomic_store(&g.net_last_packet_ns,now_ns());
+    memset(g.eq,0,sizeof(g.eq));g.rate=rate;g.frames=frames;g.in_channels=channels;g.pair=pair;g.limiter_gain=1.0;g.limiter_delta=0.0;g.limiter_delay_frames=0;g.limiter_next_iter=g.limiter_next_len=0;loudness_init(rate);g.usb_audio=NULL;g.usb_input_host=usbInputHost?1:0;g.usb_output_host=usbOutputHost?1:0;if(usbFd<0){g.usb_input_host=0;g.usb_output_host=0;}atomic_store(&g.use_network_input,useNetworkInput?1:0);if(useNetworkInput)atomic_store(&g.net_last_packet_ns,now_ns());
     atomic_store(&g.reverb_worker_started,0);
     if(usbFd >= 0 && (g.usb_input_host || g.usb_output_host)) {
         g.usb_audio = usb_host_audio_start(usbFd, rate, usbBitDepth, g.usb_input_host, g.usb_output_host,
@@ -1196,7 +1451,7 @@ static void native_stop_internal(int finalize_recording) {
 }
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stop(JNIEnv*e,jobject o){(void)e;(void)o;native_stop_internal(1);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stopForRouteChange(JNIEnv*e,jobject o){(void)e;(void)o;native_stop_internal(0);}
-JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_update(JNIEnv*e,jobject o,jint flags,jfloatArray values){(void)o;float incoming[24]={0};jsize n=(*e)->GetArrayLength(e,values);if(n>24)n=24;(*e)->GetFloatArrayRegion(e,values,0,n,incoming);pthread_mutex_lock(&g.param_lock);int reverb_changed=n>P_DAMP&&(g.values[P_ROOM]!=incoming[P_ROOM]||g.values[P_DECAY]!=incoming[P_DECAY]||g.values[P_DAMP]!=incoming[P_DAMP]);memcpy(g.values,incoming,(size_t)n*sizeof(float));pthread_mutex_unlock(&g.param_lock);if(reverb_changed)atomic_fetch_add(&g.reverb_generation,1);atomic_store(&g.flags,flags);}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_update(JNIEnv*e,jobject o,jint flags,jfloatArray values){(void)o;float incoming[28]={0};jsize n=(*e)->GetArrayLength(e,values);if(n>28)n=28;(*e)->GetFloatArrayRegion(e,values,0,n,incoming);pthread_mutex_lock(&g.param_lock);int reverb_changed=n>P_DAMP&&(g.values[P_ROOM]!=incoming[P_ROOM]||g.values[P_DECAY]!=incoming[P_DECAY]||g.values[P_DAMP]!=incoming[P_DAMP]);memcpy(g.values,incoming,(size_t)n*sizeof(float));pthread_mutex_unlock(&g.param_lock);if(reverb_changed)atomic_fetch_add(&g.reverb_generation,1);atomic_store(&g.flags,flags);}
 JNIEXPORT jfloatArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_levels(JNIEnv*e,jobject o){(void)o;jfloat v[6];for(int i=0;i<6;i++)v[i]=atomic_load(&g.levels[i]);jfloatArray a=(*e)->NewFloatArray(e,6);(*e)->SetFloatArrayRegion(e,a,0,6,v);return a;}
 JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetwork(JNIEnv*e,jobject o,jint role,jint codec,jint sampleRate,jint bitrate,jstring host,jint port,jint minMs,jint maxMs){
     (void)o;
