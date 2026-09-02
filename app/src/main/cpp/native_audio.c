@@ -1090,6 +1090,18 @@ static void network_store_aac_packet(const NetHeader *h, const uint8_t *data, ui
         if(delta<0&&!g.net_aac_started&&delta>=-(NET_AAC_FRAMES/NET_PACKET_FRAMES)) {
             g.net_aac_play_seq=h->sequence;
             delta=0;
+        } else if(delta < -(int32_t)(NET_AAC_JITTER_SLOTS *
+                                     (NET_AAC_FRAMES / NET_PACKET_FRAMES))) {
+            /* A sender may restart its sequence at zero while changing
+             * bitrate. Treat a large backwards jump as a new stream rather
+             * than dropping every packet as late. */
+            LOGI("Wi-Fi AAC sequence restart: sequence=%u expected=%u",
+                 h->sequence, g.net_aac_play_seq);
+            network_clear_jitter_state();
+            g.net_aac_seq_initialized=1;
+            g.net_aac_play_seq=h->sequence;
+            g.net_aac_high_seq=h->sequence;
+            delta=0;
         } else if(delta<0) {
             g.net_late_packets++;
             return;
@@ -1474,15 +1486,45 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
     wifi_aac_t next_aac=codec==1?wifi_aac_create(normalized_rate,normalized_bitrate):NULL;
     int codec_ready=codec==0||(next_aac&&wifi_aac_frame_length(next_aac)==NET_AAC_FRAMES);
     if(!codec_ready){wifi_aac_destroy(next_aac);LOGE("Wi-Fi AAC initialization failed rate=%d bitrate=%d",normalized_rate,normalized_bitrate);return JNI_FALSE;}
+    const char*h=(*e)->GetStringUTFChars(e,host,NULL);
+    struct in_addr requested_addr={0};
+    inet_aton(h,&requested_addr);
+    int current_role=atomic_load(&g.net_role);
+    int same_transport=current_role==role && g.net_sock>=0 &&
+            g.net_codec==codec && g.rate==normalized_rate && g.net_port==port &&
+            g.net_addr.sin_addr.s_addr==requested_addr.s_addr;
+    int normalized_min=minMs<0?0:(minMs>200?200:minMs);
+    int normalized_max=maxMs<50?50:(maxMs>1000?1000:maxMs);
+    if (normalized_max<normalized_min) normalized_min=normalized_max;
+    if (same_transport) {
+        /* Parameter/UI updates must not tear down a live transport. In
+         * receive mode, bitrate is carried by each ADTS frame and the
+         * decoder must stay alive; only a sender needs a new encoder. */
+        g.net_min_ms=normalized_min;
+        g.net_max_ms=normalized_max;
+        if (codec==1 && role==1 && normalized_bitrate != g.net_bitrate) {
+            pthread_mutex_lock(&g.net_codec_lock);
+            wifi_aac_t previous=g.net_aac;
+            g.net_aac=next_aac;
+            g.net_bitrate=normalized_bitrate;
+            pthread_mutex_unlock(&g.net_codec_lock);
+            wifi_aac_destroy(previous);
+            (*e)->ReleaseStringUTFChars(e,host,h);
+            LOGI("Wi-Fi AAC bitrate updated in place: bitrate=%d", normalized_bitrate);
+            return JNI_TRUE;
+        }
+        wifi_aac_destroy(next_aac);
+        (*e)->ReleaseStringUTFChars(e,host,h);
+        return JNI_TRUE;
+    }
     pthread_mutex_lock(&g.net_codec_lock);
     wifi_aac_destroy(g.net_aac);g.net_aac=next_aac;
     pthread_mutex_unlock(&g.net_codec_lock);
-    const char*h=(*e)->GetStringUTFChars(e,host,NULL);
     atomic_store(&g.net_role,0);
     if(g.net_sock>=0)close(g.net_sock);
     g.net_sock=socket(AF_INET,SOCK_DGRAM,0);
     if(g.net_sock<0){atomic_store(&g.net_role,0);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;}
-    fcntl(g.net_sock,F_SETFL,O_NONBLOCK);memset(&g.net_addr,0,sizeof(g.net_addr));g.net_addr.sin_family=AF_INET;g.net_addr.sin_port=htons((uint16_t)port);inet_aton(h,&g.net_addr.sin_addr);
+    fcntl(g.net_sock,F_SETFL,O_NONBLOCK);memset(&g.net_addr,0,sizeof(g.net_addr));g.net_addr.sin_family=AF_INET;g.net_addr.sin_port=htons((uint16_t)port);g.net_addr.sin_addr=requested_addr;
     atomic_store(&g.net_last_packet_ns,now_ns());atomic_store(&g.net_packet_seen,0);
     g.net_codec=codec;g.net_bitrate=normalized_bitrate;g.net_port=port;g.net_min_ms=minMs<0?0:(minMs>200?200:minMs);g.net_max_ms=maxMs<50?50:(maxMs>1000?1000:maxMs);if(g.net_max_ms<g.net_min_ms)g.net_min_ms=g.net_max_ms;
     g.net_send_count=0;g.net_seq=0;g.net_missing_packets=g.net_late_packets=g.net_duplicate_packets=0;network_clear_jitter_state();
