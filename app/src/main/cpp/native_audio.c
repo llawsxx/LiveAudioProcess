@@ -333,7 +333,15 @@ static int output_ring_write(const float *data, uint32_t frames) {
         write = atomic_load_explicit(&g.output_write_frame, memory_order_relaxed);
         uint32_t read = atomic_load_explicit(&g.output_read_frame, memory_order_acquire);
         uint32_t queued = write - read;
-        if (queued <= g.output_ring_capacity && frames <= g.output_ring_capacity - queued) break;
+        /* Network input is packet-buffered and can be consumed faster than
+         * wall clock. Apply backpressure at the same logical limit used by
+         * output_data_callback; allowing the physical ring capacity here
+         * creates a fill-to-16384/clear-to-zero loop. */
+        uint32_t limit = atomic_load_explicit(&g.output_queue_limit,
+                                              memory_order_acquire);
+        if (limit == 0 || limit > g.output_ring_capacity)
+            limit = g.output_ring_capacity;
+        if (queued <= limit && frames <= limit - queued) break;
         usleep(250);
     }
     if (!atomic_load(&g.running)) return 0;
@@ -359,8 +367,13 @@ static aaudio_data_callback_result_t output_data_callback(
     uint32_t write = atomic_load_explicit(&g.output_write_frame, memory_order_acquire);
     uint32_t read = atomic_load_explicit(&g.output_read_frame, memory_order_relaxed);
     uint32_t available = write - read;
-    uint32_t limit = atomic_load_explicit(&g.output_queue_limit, memory_order_acquire);
-    if (available > g.output_ring_capacity || available > limit) {
+    /* The writer applies the logical queue limit as backpressure. A live
+     * limit reduction can leave a valid queue temporarily above that limit;
+     * drain it instead of clearing audio. Only a physical ring overrun is
+     * unrecoverable and warrants a reset. */
+    if (available > g.output_ring_capacity) {
+        uint32_t limit = atomic_load_explicit(&g.output_queue_limit,
+                                              memory_order_acquire);
         atomic_store_explicit(&g.output_read_frame, write, memory_order_release);
         atomic_store_explicit(&g.output_callback_started, 0, memory_order_relaxed);
         unsigned int count = atomic_fetch_add(&g.output_buffer_clears, 1) + 1;
