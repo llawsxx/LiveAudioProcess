@@ -28,6 +28,7 @@ import androidx.compose.ui.unit.sp
 fun UsbAudioPanel(
     minBuffer: String,
     maxBuffer: String,
+    inputMaxBuffer: String,
     bitDepth: Int,
     inputBurstPackets: Int,
     outputBurstPackets: Int,
@@ -37,6 +38,7 @@ fun UsbAudioPanel(
     stats: LongArray,
     onMinBuffer: (String) -> Unit,
     onMaxBuffer: (String) -> Unit,
+    onInputMaxBuffer: (String) -> Unit,
     onBitDepth: (Int) -> Unit,
     onInputBurstPackets: (Int) -> Unit,
     onOutputBurstPackets: (Int) -> Unit
@@ -93,6 +95,17 @@ fun UsbAudioPanel(
                 )
             }
             Text("范围：最小 8–200 ms，最大 8–500 ms", color = muted, fontSize = 10.sp)
+            OutlinedTextField(
+                value = inputMaxBuffer,
+                onValueChange = { if (it.length <= 3 && it.all(Char::isDigit)) onInputMaxBuffer(it) },
+                label = { Text("输入缓冲上限 ms") },
+                singleLine = true,
+                enabled = inputEnabled,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                colors = fieldColors,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Text("输入范围：5–200 ms，超过上限自动清空旧数据", color = muted, fontSize = 10.sp)
             BurstChoice("输入 Burst（USB 包 / transfer）", inputBurstPackets, inputEnabled, muted, onInputBurstPackets)
             BurstChoice("输出 Burst（USB 包 / transfer）", outputBurstPackets, outputEnabled, muted, onOutputBurstPackets)
             HorizontalDivider(color = Color(0xFF344248))
@@ -108,6 +121,9 @@ fun UsbAudioPanel(
             UsbStatPair("输入异常包", stats.getOrElse(0) { 0 }, "输入空包", stats.getOrElse(1) { 0 }, muted)
             UsbStatPair("输入传输异常", stats.getOrElse(2) { 0 }, "输入 Ring 溢出", stats.getOrElse(3) { 0 }, muted)
             UsbStatPair("输出传输异常", stats.getOrElse(4) { 0 }, "输出低水位", stats.getOrElse(5) { 0 }, muted)
+            UsbStatPair("输入回调峰值", stats.getOrElse(12) { 0 }, "输出回调峰值", stats.getOrElse(13) { 0 }, muted, " μs", false)
+            UsbStatPair("输出 Ring 溢出", stats.getOrElse(14) { 0 }, "输入缓冲清空", stats.getOrElse(15) { 0 }, muted)
+            UsbStatPair("DSP 本块 (μs)", stats.getOrElse(16) { 0 }, "DSP 峰值 (μs)", stats.getOrElse(17) { 0 }, muted, "", false)
         }
     }
 }
@@ -147,21 +163,23 @@ private fun UsbStatPair(
     firstValue: Long,
     secondLabel: String,
     secondValue: Long,
-    muted: Color
+    muted: Color,
+    suffix: String = "",
+    alertNonzero: Boolean = true
 ) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        UsbStat(firstLabel, firstValue, muted, Modifier.weight(1f))
-        UsbStat(secondLabel, secondValue, muted, Modifier.weight(1f))
+        UsbStat(firstLabel, firstValue, muted, Modifier.weight(1f), suffix, alertNonzero)
+        UsbStat(secondLabel, secondValue, muted, Modifier.weight(1f), suffix, alertNonzero)
     }
 }
 
 @Composable
-private fun UsbStat(label: String, value: Long, muted: Color, modifier: Modifier = Modifier) {
+private fun UsbStat(label: String, value: Long, muted: Color, modifier: Modifier = Modifier, suffix: String = "", alertNonzero: Boolean = true) {
     Row(modifier, horizontalArrangement = Arrangement.SpaceBetween) {
         Text(label, color = muted, fontSize = 11.sp)
         Text(
-            value.toString(),
-            color = if (value == 0L) Color(0xFF43D5C1) else Color(0xFFFF6B6B),
+            value.toString() + suffix,
+            color = if (!alertNonzero) muted else if (value == 0L) Color(0xFF43D5C1) else Color(0xFFFF6B6B),
             fontSize = 11.sp,
             fontWeight = FontWeight.Bold
         )

@@ -41,6 +41,8 @@ fun SystemOutputPanel(info: LongArray, visible: Boolean, maxBufferMs: String, on
     val latencyMs = info.getOrElse(11) { 0L } / 1000f
     val error = info.getOrElse(12) { 0L }
     val clears = info.getOrElse(13) { 0L }
+    val dspLastUs = info.getOrElse(14) { 0L }
+    val dspMaxUs = info.getOrElse(15) { 0L }
     val healthy = lowLatency && error == 0L
 
     Card(
@@ -87,6 +89,11 @@ fun SystemOutputPanel(info: LongArray, visible: Boolean, maxBufferMs: String, on
                 "应用队列 $appQueued 帧 + 系统队列 $systemQueued 帧 · 估算 ${"%.1f".format(latencyMs)} ms",
                 color = if (latencyMs <= 40f) OutputTeal else OutputAmber,
                 fontSize = 11.sp
+            )
+            Text(
+                "DSP 本块 ${dspLastUs} μs · 峰值 ${dspMaxUs} μs",
+                color = if (dspMaxUs <= 5000L || dspMaxUs == 0L) OutputMuted else OutputAmber,
+                fontSize = 10.sp
             )
             Text(
                 "XRUN $xruns · 回调欠载 $underflows · 缓冲清空 $clears${if (error != 0L) " · 错误 $error" else ""}",

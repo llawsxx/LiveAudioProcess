@@ -11,6 +11,12 @@ typedef struct {
     uint64_t input_ring_overruns;
     uint64_t output_transfer_errors;
     uint64_t output_low_water_events;
+    uint64_t input_callback_max_us;
+    uint64_t output_callback_max_us;
+    uint64_t output_ring_overruns;
+    uint64_t input_buffer_clears;
+    uint64_t dsp_last_us;
+    uint64_t dsp_max_us;
     uint32_t input_sample_rate;
     uint32_t output_sample_rate;
     uint8_t input_bit_resolution;
@@ -26,6 +32,7 @@ int usb_host_audio_read(usb_host_audio_t audio, float *stereo, int frames);
 int usb_host_audio_write(usb_host_audio_t audio, const float *stereo, int frames);
 void usb_host_audio_configure_output_buffer(usb_host_audio_t audio, int min_buffer_ms,
                                             int max_buffer_ms);
+void usb_host_audio_configure_input_buffer(usb_host_audio_t audio, int max_buffer_ms);
 void usb_host_audio_get_stats(usb_host_audio_t audio, usb_host_audio_stats_t *stats);
 void usb_host_audio_stop(usb_host_audio_t audio);
 #ifdef __cplusplus

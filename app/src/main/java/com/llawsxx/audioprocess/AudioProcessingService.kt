@@ -109,6 +109,7 @@ class AudioProcessingService : Service() {
             p.getInt("usbMinBuffer", 16),
             p.getInt("usbMaxBuffer", 50)
         )
+        engine.configureUsbInputBuffer(p.getInt("usbInputBufferMaxMs", 20))
         val legacyUsbBurst = p.getInt("usbBurstPackets", 8)
         engine.configureUsbBursts(
             p.getInt("usbInputBurstPackets", legacyUsbBurst),

@@ -48,6 +48,8 @@ class AudioEngine(private val context: Context) {
         private set
     @Volatile var usbOutputBurstPackets = 8
         private set
+    @Volatile var usbInputBufferMaxMs = 20
+        private set
     @Volatile var systemOutputBufferMaxMs = 20
         private set
     @Volatile var systemInputBufferMaxMs = 20
@@ -81,6 +83,11 @@ class AudioEngine(private val context: Context) {
         val minMs = minBufferMs.coerceIn(8, 200)
         val maxMs = maxBufferMs.coerceIn(8, 500).coerceAtLeast(minMs)
         NativeAudio.configureUsbOutputBuffer(minMs, maxMs)
+    }
+    fun configureUsbInputBuffer(maxBufferMs: Int) {
+        val normalized = maxBufferMs.coerceIn(5, 200)
+        usbInputBufferMaxMs = normalized
+        if (NativeAudio.available) NativeAudio.configureUsbInputBuffer(normalized)
     }
     fun configureAudioFormat(requestedSampleRate: Int, requestedUsbBitDepth: Int) {
         val normalizedRate = requestedSampleRate.takeIf { it == 44_100 || it == 48_000 || it == 96_000 } ?: 48_000
@@ -274,7 +281,7 @@ class AudioEngine(private val context: Context) {
     private fun restartStreamsForRouteChange() {
         if (!isRunning) return
         routeHandler.removeCallbacks(bluetoothRouteMonitor)
-        NativeAudio.stop()
+        NativeAudio.stopForRouteChange()
         clearBluetoothRoute()
         activeInputDeviceId = -1
         activeOutputDeviceId = -1

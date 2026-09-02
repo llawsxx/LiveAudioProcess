@@ -131,6 +131,7 @@ private fun LiveAudioProcessApp() {
     var wifiInputTimeout by remember { mutableStateOf(prefs.getString("wifiInputTimeout", "1.0") ?: "1.0") }
     var usbMinBuffer by remember { mutableStateOf(prefs.getInt("usbMinBuffer", 16).toString()) }
     var usbMaxBuffer by remember { mutableStateOf(prefs.getInt("usbMaxBuffer", 50).toString()) }
+    var usbInputBufferMaxMs by remember { mutableStateOf(prefs.getInt("usbInputBufferMaxMs", 20).coerceIn(5, 200).toString()) }
     var usbBitDepth by remember {
         mutableIntStateOf(prefs.getInt("usbBitDepth", 16).takeIf { it == 16 || it == 24 || it == 32 } ?: 16)
     }
@@ -141,9 +142,9 @@ private fun LiveAudioProcessApp() {
     var usbOutputBurstPackets by remember {
         mutableIntStateOf(prefs.getInt("usbOutputBurstPackets", legacyUsbBurstPackets).takeIf { it == 1 || it == 2 || it == 4 || it == 8 || it == 16 } ?: 8)
     }
-    var usbStats by remember { mutableStateOf(LongArray(12)) }
+    var usbStats by remember { mutableStateOf(LongArray(18)) }
     var inputInfo by remember { mutableStateOf(LongArray(14)) }
-    var outputInfo by remember { mutableStateOf(LongArray(14)) }
+    var outputInfo by remember { mutableStateOf(LongArray(16)) }
     var systemInputBufferMaxMs by remember { mutableStateOf(prefs.getInt("systemInputBufferMaxMs", 20).coerceIn(5, 200).toString()) }
     val legacySystemOutputBufferMs = (prefs.getInt("systemOutputBufferBursts", 4) * 2).coerceIn(5, 200)
     var systemOutputBufferMaxMs by remember {
@@ -169,6 +170,7 @@ private fun LiveAudioProcessApp() {
     LaunchedEffect(Unit) {
         while (true) {
             running = engine.isRunning
+            recording = engine.isRecording
             routeNotice = engine.routeNotice ?: engine.lastError
             delay(100)
         }
@@ -177,7 +179,7 @@ private fun LiveAudioProcessApp() {
     LaunchedEffect(running) {
         if (!running) {
             inputInfo = LongArray(14)
-            outputInfo = LongArray(14)
+            outputInfo = LongArray(16)
         }
         while (running && NativeAudio.available) {
             val levels = NativeAudio.levels(); if (levels.size >= 4) { inputLevelL = levels[0]; inputLevelR = levels[1]; outputLevelL = levels[2]; outputLevelR = levels[3] }; if (levels.size >= 6) { limiterGain = levels[4]; limiterReleaseMs = levels[5] }
@@ -188,7 +190,7 @@ private fun LiveAudioProcessApp() {
     }
     LaunchedEffect(running, input, output) {
         if (!running || (input != InputSource.USB && output != OutputSource.USB)) {
-            usbStats = LongArray(12)
+            usbStats = LongArray(18)
             return@LaunchedEffect
         }
         while (running && NativeAudio.available) {
@@ -201,7 +203,7 @@ private fun LiveAudioProcessApp() {
         wifiOutputEnabled -> engine.configureNetwork(1, 0, wifiSendHost, wifiSendPort.toIntOrNull() ?: 40100, 0, 50)
         else -> { engine.clearNetwork(); false }
     }
-    fun syncEngine() { val inputBufferMaxMs = (systemInputBufferMaxMs.toIntOrNull() ?: 20).coerceIn(5, 200); val outputBufferMaxMs = (systemOutputBufferMaxMs.toIntOrNull() ?: 20).coerceIn(5, 200); engine.configureAudioFormat(rate, usbBitDepth); engine.bufferFrames = buffer; engine.configureSystemOutputBuffer(outputBufferMaxMs); engine.configureSystemInputBuffer(inputBufferMaxMs); engine.eqGain = effects.eqGain; engine.eqFrequency = effects.eqFrequency; engine.eqQ = effects.eqQ; engine.eq2Frequency = effects.eq2Frequency; engine.eq2Gain = effects.eq2Gain; engine.eq2Q = effects.eq2Q; engine.eq3Frequency = effects.eq3Frequency; engine.eq3Gain = effects.eq3Gain; engine.eq3Q = effects.eq3Q; engine.eq4Frequency = effects.eq4Frequency; engine.eq4Gain = effects.eq4Gain; engine.eq4Q = effects.eq4Q; engine.reverbRoom = effects.reverbRoom; engine.reverbDecay = effects.reverbDecay; engine.reverbDamping = effects.reverbDamping; engine.reverbMix = effects.reverbMix / 100f; engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease; engine.wifiInputTimeoutMs = ((wifiInputTimeout.toFloatOrNull() ?: 1f) * 1000f).toInt().coerceIn(100, 60_000); engine.updateRouting(input, output, channelPair); effects.save(prefs); prefs.edit().putInt("rate", rate).putInt("usbBitDepth", usbBitDepth).putInt("buffer", buffer).putInt("systemOutputBufferMaxMs", outputBufferMaxMs).putInt("systemInputBufferMaxMs", inputBufferMaxMs).putInt("channelPair", channelPair).putString("input", input.name).putString("output", output.name).putBoolean("wifiOutputEnabled", wifiOutputEnabled).putBoolean("wifiActive", wifiActive).apply() }
+    fun syncEngine() { val inputBufferMaxMs = (systemInputBufferMaxMs.toIntOrNull() ?: 20).coerceIn(5, 200); val outputBufferMaxMs = (systemOutputBufferMaxMs.toIntOrNull() ?: 20).coerceIn(5, 200); val usbInputMaxMs = (usbInputBufferMaxMs.toIntOrNull() ?: 20).coerceIn(5, 200); engine.configureAudioFormat(rate, usbBitDepth); engine.bufferFrames = buffer; engine.configureSystemOutputBuffer(outputBufferMaxMs); engine.configureSystemInputBuffer(inputBufferMaxMs); engine.configureUsbInputBuffer(usbInputMaxMs); engine.eqGain = effects.eqGain; engine.eqFrequency = effects.eqFrequency; engine.eqQ = effects.eqQ; engine.eq2Frequency = effects.eq2Frequency; engine.eq2Gain = effects.eq2Gain; engine.eq2Q = effects.eq2Q; engine.eq3Frequency = effects.eq3Frequency; engine.eq3Gain = effects.eq3Gain; engine.eq3Q = effects.eq3Q; engine.eq4Frequency = effects.eq4Frequency; engine.eq4Gain = effects.eq4Gain; engine.eq4Q = effects.eq4Q; engine.reverbRoom = effects.reverbRoom; engine.reverbDecay = effects.reverbDecay; engine.reverbDamping = effects.reverbDamping; engine.reverbMix = effects.reverbMix / 100f; engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease; engine.wifiInputTimeoutMs = ((wifiInputTimeout.toFloatOrNull() ?: 1f) * 1000f).toInt().coerceIn(100, 60_000); engine.updateRouting(input, output, channelPair); effects.save(prefs); prefs.edit().putInt("rate", rate).putInt("usbBitDepth", usbBitDepth).putInt("buffer", buffer).putInt("systemOutputBufferMaxMs", outputBufferMaxMs).putInt("systemInputBufferMaxMs", inputBufferMaxMs).putInt("usbInputBufferMaxMs", usbInputMaxMs).putInt("channelPair", channelPair).putString("input", input.name).putString("output", output.name).putBoolean("wifiOutputEnabled", wifiOutputEnabled).putBoolean("wifiActive", wifiActive).apply() }
     LaunchedEffect(input, channelPair, output, wifiOutputEnabled, rate, usbBitDepth, buffer, effects) { syncEngine(); engine.dspEnabled = effects.dspEnabled; engine.eqEnabled = effects.eqEnabled; engine.reverbEnabled = effects.reverbEnabled; engine.limiterEnabled = effects.limiterEnabled; engine.limiterInputGain = effects.limiterInputGain; if (input == InputSource.WIFI || wifiOutputEnabled) wifiActive = configureWifiForCurrentRoute() else { engine.clearNetwork(); wifiActive = false }; engine.refreshNativeParameters() }
     LaunchedEffect(wifiSendHost, wifiSendPort) {
         prefs.edit().putString("wifiSendHost", wifiSendHost).putString("wifiSendPort", wifiSendPort).apply()
@@ -220,6 +222,13 @@ private fun LiveAudioProcessApp() {
         val appliedMaxMs = maxMs.coerceIn(8, 500).coerceAtLeast(appliedMinMs)
         prefs.edit().putInt("usbMinBuffer", appliedMinMs).putInt("usbMaxBuffer", appliedMaxMs).apply()
         engine.configureUsbOutputBuffer(appliedMinMs, appliedMaxMs)
+    }
+    LaunchedEffect(usbInputBufferMaxMs) {
+        val entered = usbInputBufferMaxMs.toIntOrNull() ?: return@LaunchedEffect
+        delay(400)
+        val applied = entered.coerceIn(5, 200)
+        prefs.edit().putInt("usbInputBufferMaxMs", applied).apply()
+        engine.configureUsbInputBuffer(applied)
     }
     LaunchedEffect(usbInputBurstPackets, usbOutputBurstPackets) {
         prefs.edit()
@@ -263,7 +272,7 @@ private fun LiveAudioProcessApp() {
             SystemInputPanel(inputInfo, input != InputSource.USB && input != InputSource.WIFI, systemInputBufferMaxMs) { systemInputBufferMaxMs = it }
             SystemOutputPanel(outputInfo, output != OutputSource.USB, systemOutputBufferMaxMs) { systemOutputBufferMaxMs = it }
             if (input == InputSource.USB || output == OutputSource.USB) {
-                UsbAudioPanel(usbMinBuffer, usbMaxBuffer, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets, input == InputSource.USB, output == OutputSource.USB, running, usbStats, { usbMinBuffer = it }, { usbMaxBuffer = it }, { usbBitDepth = it }, { usbInputBurstPackets = it }, { usbOutputBurstPackets = it })
+                UsbAudioPanel(usbMinBuffer, usbMaxBuffer, usbInputBufferMaxMs, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets, input == InputSource.USB, output == OutputSource.USB, running, usbStats, { usbMinBuffer = it }, { usbMaxBuffer = it }, { usbInputBufferMaxMs = it }, { usbBitDepth = it }, { usbInputBurstPackets = it }, { usbOutputBurstPackets = it })
             }
             Float32Badge()
             ProcessingControlPanel(effects) { effects = it }
