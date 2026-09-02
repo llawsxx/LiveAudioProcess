@@ -6,6 +6,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(LIBUSB_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libusb)
 set(LIBUAC_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libuac)
+set(FDK_AAC_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fdk-aac)
+
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static third-party libraries" FORCE)
+set(BUILD_PROGRAMS OFF CACHE BOOL "Do not build FDK-AAC tools" FORCE)
+set(FDK_AAC_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "Do not install FDK-AAC config" FORCE)
+set(FDK_AAC_INSTALL_PKGCONFIG_MODULE OFF CACHE BOOL "Do not install FDK-AAC pkg-config" FORCE)
+add_subdirectory(${FDK_AAC_ROOT} fdk-aac EXCLUDE_FROM_ALL)
 
 add_library(libusb STATIC
         ${LIBUSB_ROOT}/libusb/core.c
@@ -33,7 +40,7 @@ target_link_libraries(uac PRIVATE libusb)
 target_compile_options(uac PRIVATE -fno-rtti -pthread)
 target_compile_definitions(uac PRIVATE UAC_ENABLE_LOGGING)
 
-add_library(pulseforge_audio SHARED native_audio.c convolution_reverb.c usb_host_bridge.cpp)
+add_library(pulseforge_audio SHARED native_audio.c convolution_reverb.c usb_host_bridge.cpp wifi_aac_bridge.cpp)
 target_include_directories(pulseforge_audio PRIVATE ${LIBUAC_ROOT}/include ${LIBUSB_ROOT}/libusb)
 target_compile_options(pulseforge_audio PRIVATE -O3 -ffast-math -Wall -Wextra)
-target_link_libraries(pulseforge_audio log m dl aaudio uac libusb)
+target_link_libraries(pulseforge_audio log m dl aaudio uac libusb fdk-aac)

@@ -67,8 +67,8 @@ class AudioEngine(private val context: Context) {
     private data class RecordingTarget(val dryUri: android.net.Uri?, val wetUri: android.net.Uri?, val dryPfd: ParcelFileDescriptor, val wetPfd: ParcelFileDescriptor)
     private var recordingTarget: RecordingTarget? = null
     private var usbConnection: UsbDeviceConnection? = null
-    fun configureNetwork(role: Int, codec: Int, host: String, port: Int, minBufferMs: Int, maxBufferMs: Int): Boolean {
-        val configured = NativeAudio.configureNetwork(role, codec, host, port, minBufferMs, maxBufferMs)
+    fun configureNetwork(role: Int, codec: Int, bitrate: Int, host: String, port: Int, minBufferMs: Int, maxBufferMs: Int): Boolean {
+        val configured = NativeAudio.configureNetwork(role, codec, sampleRate, bitrate, host, port, minBufferMs, maxBufferMs)
         networkRole = if (configured) role else 0
         if (!configured) routeNotice = "Wi-Fi 音频配置失败，所选 Wi-Fi 路由未生效"
         return configured

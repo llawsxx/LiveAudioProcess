@@ -4,11 +4,14 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
@@ -27,9 +30,13 @@ private val WifiMuted = Color(0xFF8EA0A8)
 fun WifiAudioPanel(
     sendHost: String,
     sendPort: String,
+    codec: Int,
+    aacBitrate: Int,
     sendActive: Boolean,
     onSendHost: (String) -> Unit,
     onSendPort: (String) -> Unit,
+    onCodec: (Int) -> Unit,
+    onAacBitrate: (Int) -> Unit,
     receiveHost: String,
     receivePort: String,
     minBuffer: String,
@@ -59,8 +66,34 @@ fun WifiAudioPanel(
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("Wi-Fi 实时音频", color = Color.White, fontWeight = FontWeight.Bold)
 
+            Text("传输格式", color = WifiMuted, fontSize = 12.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = codec == 0, onClick = { onCodec(0) }, label = { Text("PCM Float32") })
+                FilterChip(selected = codec == 1, onClick = { onCodec(1) }, label = { Text("AAC-LC") })
+            }
+            if (codec == 1) {
+                Text("AAC 码率", color = WifiMuted, fontSize = 12.sp)
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf(64_000, 96_000, 128_000, 192_000, 256_000, 320_000).forEach { bitrate ->
+                        FilterChip(
+                            selected = aacBitrate == bitrate,
+                            onClick = { onAacBitrate(bitrate) },
+                            label = { Text("${bitrate / 1000} kbps") }
+                        )
+                    }
+                }
+            }
+
             EndpointHeader("发送端", "音频输出", sendActive)
-            Text("PCM Float32 · 双声道 · 128 frames / UDP 包 · 协议 v2", color = WifiTeal, fontSize = 11.sp)
+            Text(
+                if (codec == 1) "AAC-LC · 双声道 · 1024 frames / UDP 包 · 协议 v2"
+                else "PCM Float32 · 双声道 · 128 frames / UDP 包 · 协议 v2",
+                color = WifiTeal,
+                fontSize = 11.sp
+            )
             OutlinedTextField(
                 sendHost,
                 onSendHost,
