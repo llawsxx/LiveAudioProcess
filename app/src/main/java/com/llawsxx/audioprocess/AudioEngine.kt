@@ -50,7 +50,7 @@ class AudioEngine(private val context: Context) {
         private set
     @Volatile var usbInputBufferMaxMs = 20
         private set
-    @Volatile var systemOutputBufferMaxMs = 20
+    @Volatile var systemOutputBufferMaxMs = 40
         private set
     @Volatile var systemInputBufferMaxMs = 20
         private set
@@ -60,7 +60,7 @@ class AudioEngine(private val context: Context) {
     @Volatile var eq4Frequency = 10000f; @Volatile var eq4Gain = 0f; @Volatile var eq4Q = 1f
     @Volatile var reverbRoom = 42f; @Volatile var reverbDecay = 1.8f; @Volatile var reverbDamping = 35f; @Volatile var reverbMix = .18f
     @Volatile var limiterInputGain = 0f; @Volatile var limiterThreshold = -.5f; @Volatile var limiterRelease = 80f; @Volatile var limiterCeiling = -.5f; @Volatile var limiterLookAhead = 1f; @Volatile var limiterAdaptiveRelease = false
-    @Volatile var dspEnabled = true; @Volatile var eqEnabled = true; @Volatile var reverbEnabled = true; @Volatile var limiterEnabled = true
+    @Volatile var dspEnabled = false; @Volatile var eqEnabled = true; @Volatile var reverbEnabled = true; @Volatile var limiterEnabled = true
     @Volatile var isRunning = false; private set
     @Volatile var isRecording = false; private set
     @Volatile var lastError: String? = null; private set

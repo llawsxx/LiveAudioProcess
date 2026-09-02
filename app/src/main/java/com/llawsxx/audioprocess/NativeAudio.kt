@@ -4,7 +4,7 @@ import android.os.Build
 
 object NativeAudio {
     val available: Boolean = Build.VERSION.SDK_INT >= 26 && runCatching {
-        System.loadLibrary("pulseforge_audio")
+        System.loadLibrary("audioprocess")
     }.isSuccess
 
     external fun start(sampleRate: Int, frames: Int, inputDeviceId: Int, outputDeviceId: Int, inputChannels: Int, pair: Int, useNetworkInput: Boolean, usbFd: Int, usbInputHost: Boolean, usbOutputHost: Boolean, usbBitDepth: Int, usbInputBurstPackets: Int, usbOutputBurstPackets: Int): Boolean

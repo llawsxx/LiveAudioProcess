@@ -10,7 +10,7 @@
 #include <vector>
 #include "libuac.h"
 
-#define USB_HOST_TAG "PulseForgeUsbHost"
+#define USB_HOST_TAG "AudioProcessUsbHost"
 #define USB_HOST_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, USB_HOST_TAG, __VA_ARGS__)
 #define USB_HOST_LOGI(...) __android_log_print(ANDROID_LOG_INFO, USB_HOST_TAG, __VA_ARGS__)
 

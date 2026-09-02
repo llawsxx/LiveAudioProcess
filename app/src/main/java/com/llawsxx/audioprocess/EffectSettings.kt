@@ -3,7 +3,7 @@ package com.llawsxx.audioprocess
 import android.content.SharedPreferences
 
 data class EffectSettings(
-    val dspEnabled: Boolean = true, val eqEnabled: Boolean = true, val reverbEnabled: Boolean = true, val limiterEnabled: Boolean = true, val loudnessEnabled: Boolean = true,
+    val dspEnabled: Boolean = false, val eqEnabled: Boolean = true, val reverbEnabled: Boolean = true, val limiterEnabled: Boolean = true, val loudnessEnabled: Boolean = true,
     val eqFrequency: Float = 1200f, val eqGain: Float = 2f, val eqQ: Float = .85f,
     val eq2Frequency: Float = 250f, val eq2Gain: Float = 0f, val eq2Q: Float = 1f,
     val eq3Frequency: Float = 4000f, val eq3Gain: Float = 0f, val eq3Q: Float = 1f,
@@ -24,7 +24,7 @@ data class EffectSettings(
 
     companion object {
         fun load(p: SharedPreferences) = EffectSettings(
-            p.getBoolean("dspEnabled", true), p.getBoolean("eqEnabled", true), p.getBoolean("reverbEnabled", true), p.getBoolean("limiterEnabled", true), p.getBoolean("loudnessEnabled", true),
+            p.getBoolean("dspEnabled", false), p.getBoolean("eqEnabled", true), p.getBoolean("reverbEnabled", true), p.getBoolean("limiterEnabled", true), p.getBoolean("loudnessEnabled", true),
             p.getFloat("eqFrequency", 1200f), p.getFloat("eqGain", 2f), p.getFloat("eqQ", .85f),
             p.getFloat("eq2Frequency", 250f), p.getFloat("eq2Gain", 0f), p.getFloat("eq2Q", 1f),
             p.getFloat("eq3Frequency", 4000f), p.getFloat("eq3Gain", 0f), p.getFloat("eq3Q", 1f),

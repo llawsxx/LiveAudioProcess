@@ -22,7 +22,7 @@
 #include "usb_host_bridge.h"
 #include "wifi_aac_bridge.h"
 
-#define TAG "PulseForgeNative"
+#define TAG "AudioProcessNative"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define MAX_FRAMES 2048
@@ -127,7 +127,7 @@ static Engine g = {
     .net_sock = -1,
     .usb_buffer_min_ms = 16,
     .usb_buffer_max_ms = 50,
-    .output_buffer_max_ms = ATOMIC_VAR_INIT(20),
+    .output_buffer_max_ms = ATOMIC_VAR_INIT(40),
     .usb_input_buffer_max_ms = ATOMIC_VAR_INIT(20),
     .input_buffer_max_ms = ATOMIC_VAR_INIT(20),
     .param_lock = PTHREAD_MUTEX_INITIALIZER,

@@ -88,7 +88,7 @@ class AudioProcessingService : Service() {
         .build()
 
     private fun restoreSettings(engine: AudioEngine) {
-        val p = getSharedPreferences("pulseforge_settings", MODE_PRIVATE)
+        val p = getSharedPreferences("audioprocess_settings", MODE_PRIVATE)
         val effects = EffectSettings.load(p)
         engine.dspEnabled = effects.dspEnabled; engine.eqEnabled = effects.eqEnabled; engine.reverbEnabled = effects.reverbEnabled; engine.limiterEnabled = effects.limiterEnabled
         engine.eqFrequency = effects.eqFrequency; engine.eqGain = effects.eqGain; engine.eqQ = effects.eqQ
@@ -99,9 +99,11 @@ class AudioProcessingService : Service() {
         engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease
         engine.configureAudioFormat(p.getInt("rate", 48_000), p.getInt("usbBitDepth", 16)); engine.bufferFrames = p.getInt("buffer", 256)
         val outputBufferMaxMs = if (p.contains("systemOutputBufferMaxMs")) {
-            p.getInt("systemOutputBufferMaxMs", 20)
+            p.getInt("systemOutputBufferMaxMs", 40)
         } else {
-            (p.getInt("systemOutputBufferBursts", 4) * 2).coerceIn(5, 200)
+            if (p.contains("systemOutputBufferBursts")) {
+                (p.getInt("systemOutputBufferBursts", 4) * 2).coerceIn(5, 200)
+            } else 40
         }
         engine.configureSystemOutputBuffer(outputBufferMaxMs)
         engine.configureSystemInputBuffer(p.getInt("systemInputBufferMaxMs", 20))
@@ -135,7 +137,7 @@ class AudioProcessingService : Service() {
     companion object {
         const val ACTION_START = "com.llawsxx.audioprocess.START"
         const val ACTION_STOP = "com.llawsxx.audioprocess.STOP"
-        private const val CHANNEL_ID = "pulseforge_audio"
+        private const val CHANNEL_ID = "audioprocess_audio"
         private const val NOTIFICATION_ID = 42
     }
 }
