@@ -98,7 +98,13 @@ class AudioProcessingService : Service() {
         engine.reverbRoom = effects.reverbRoom; engine.reverbDecay = effects.reverbDecay; engine.reverbDamping = effects.reverbDamping; engine.reverbMix = effects.reverbMix / 100f
         engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease
         engine.configureAudioFormat(p.getInt("rate", 48_000), p.getInt("usbBitDepth", 16)); engine.bufferFrames = p.getInt("buffer", 256)
-        engine.configureSystemOutputBuffer(p.getInt("systemOutputBufferBursts", 4))
+        val outputBufferMaxMs = if (p.contains("systemOutputBufferMaxMs")) {
+            p.getInt("systemOutputBufferMaxMs", 20)
+        } else {
+            (p.getInt("systemOutputBufferBursts", 4) * 2).coerceIn(5, 200)
+        }
+        engine.configureSystemOutputBuffer(outputBufferMaxMs)
+        engine.configureSystemInputBuffer(p.getInt("systemInputBufferMaxMs", 20))
         engine.configureUsbOutputBuffer(
             p.getInt("usbMinBuffer", 16),
             p.getInt("usbMaxBuffer", 50)

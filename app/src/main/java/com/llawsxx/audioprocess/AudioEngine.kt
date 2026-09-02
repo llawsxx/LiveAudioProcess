@@ -48,7 +48,9 @@ class AudioEngine(private val context: Context) {
         private set
     @Volatile var usbOutputBurstPackets = 8
         private set
-    @Volatile var systemOutputBufferBursts = 4
+    @Volatile var systemOutputBufferMaxMs = 20
+        private set
+    @Volatile var systemInputBufferMaxMs = 20
         private set
     @Volatile var eqGain = 2f; @Volatile var eqFrequency = 1200f; @Volatile var eqQ = .85f
     @Volatile var eq2Frequency = 250f; @Volatile var eq2Gain = 0f; @Volatile var eq2Q = 1f
@@ -104,16 +106,15 @@ class AudioEngine(private val context: Context) {
             restartStreamsForRouteChange()
         }
     }
-    fun configureSystemOutputBuffer(bursts: Int) {
-        val normalized = bursts.takeIf { it == 2 || it == 3 || it == 4 || it == 6 } ?: 4
-        if (systemOutputBufferBursts == normalized) return
-        systemOutputBufferBursts = normalized
-        if (NativeAudio.available) NativeAudio.configureOutputBufferBursts(normalized)
-        if (isRunning && outputSource != OutputSource.USB) {
-            routeNotice = "正在应用系统输出缓冲"
-            routeHandler.removeCallbacks(routeRestart)
-            routeHandler.post(routeRestart)
-        }
+    fun configureSystemOutputBuffer(maxMs: Int) {
+        val normalized = maxMs.coerceIn(5, 200)
+        systemOutputBufferMaxMs = normalized
+        if (NativeAudio.available) NativeAudio.configureOutputBufferMaxMs(normalized)
+    }
+    fun configureSystemInputBuffer(maxMs: Int) {
+        val normalized = maxMs.coerceIn(5, 200)
+        systemInputBufferMaxMs = normalized
+        if (NativeAudio.available) NativeAudio.configureInputBufferMaxMs(normalized)
     }
     private fun usbInputDevice(): AudioDeviceInfo? {
         return audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.type == AudioDeviceInfo.TYPE_USB_DEVICE || it.type == AudioDeviceInfo.TYPE_USB_HEADSET }
