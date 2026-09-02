@@ -147,8 +147,38 @@ private:
         if(take<count){std::memset(data+(size_t)take*stride,0,(size_t)(count-take)*stride);outputUnderruns_.fetch_add(1);outputPrimed_.store(false);}
         outputRead_.store(read+take,std::memory_order_release);update_max(outputCallbackMaxUs_,now_us()-begin);
     }
-    void startInput(int rate){auto routes=device_->get_device()->query_audio_routes(uac::UAC_TERMINAL_ANY,uac::UAC_TERMINAL_USB_STREAMING);if(routes.empty())return;const auto&si=device_->get_device()->get_stream_interface(routes.front().get());auto cfg=si.query_config_uncompressed(uac::UAC_FORMAT_DATA_PCM,2,(uint32_t)rate,(uint8_t)bitDepth_);if(!cfg)return;int bytes=cfg->bSubframeSize,ch=cfg->bChannelCount;inputStream_=device_->start_streaming(si,*cfg,[this,bytes,ch](uint8_t*d,uint n){onInput(d,n,bytes,ch);},inputBurstPackets_);inputSampleRate_=cfg->tSampleRate;inputBitResolution_=cfg->bBitResolution;inputChannels_=cfg->bChannelCount;USB_HOST_LOGI("USB input actual format=%u Hz/%u-bit/%u ch, subframe=%u B",inputSampleRate_,inputBitResolution_,inputChannels_,cfg->bSubframeSize);}
-    void startOutput(int rate){auto routes=device_->get_device()->query_audio_routes(uac::UAC_TERMINAL_USB_STREAMING,uac::UAC_TERMINAL_ANY);if(routes.empty())return;const auto&si=device_->get_device()->get_stream_interface(routes.front().get());auto cfg=si.query_config_uncompressed(uac::UAC_FORMAT_DATA_PCM,2,(uint32_t)rate,(uint8_t)bitDepth_);if(!cfg)return;int bytes=cfg->bSubframeSize,ch=cfg->bChannelCount;outputTransferFrames_=(outputBurstPackets_*cfg->wMaxPacketSize)/std::max(1,bytes*ch);updateOutputBufferFrames();outputStream_=device_->start_streaming(si,*cfg,[this,bytes,ch](uint8_t*d,uint n){onOutput(d,n,bytes,ch);},outputBurstPackets_);outputSampleRate_=cfg->tSampleRate;outputBitResolution_=cfg->bBitResolution;outputChannels_=cfg->bChannelCount;USB_HOST_LOGI("USB output actual format=%u Hz/%u-bit/%u ch, subframe=%u B",outputSampleRate_,outputBitResolution_,outputChannels_,cfg->bSubframeSize);}
+    void startInput(int rate){
+        auto routes=device_->get_device()->query_audio_routes(uac::UAC_TERMINAL_ANY,uac::UAC_TERMINAL_USB_STREAMING);
+        if(routes.empty())return;
+        const auto&si=device_->get_device()->get_stream_interface(routes.front().get());
+        auto cfg=si.query_config_uncompressed(uac::UAC_FORMAT_DATA_PCM,2,(uint32_t)rate,(uint8_t)bitDepth_);
+        if(!cfg){
+            cfg=si.query_config_uncompressed(uac::UAC_FORMAT_DATA_PCM,1,(uint32_t)rate,(uint8_t)bitDepth_);
+            if(cfg)USB_HOST_LOGI("USB input stereo format unavailable; falling back to mono");
+        }
+        if(!cfg)return;
+        int bytes=cfg->bSubframeSize,ch=cfg->bChannelCount;
+        inputStream_=device_->start_streaming(si,*cfg,[this,bytes,ch](uint8_t*d,uint n){onInput(d,n,bytes,ch);},inputBurstPackets_);
+        inputSampleRate_=cfg->tSampleRate;inputBitResolution_=cfg->bBitResolution;inputChannels_=cfg->bChannelCount;
+        USB_HOST_LOGI("USB input actual format=%u Hz/%u-bit/%u ch, subframe=%u B",inputSampleRate_,inputBitResolution_,inputChannels_,cfg->bSubframeSize);
+    }
+    void startOutput(int rate){
+        auto routes=device_->get_device()->query_audio_routes(uac::UAC_TERMINAL_USB_STREAMING,uac::UAC_TERMINAL_ANY);
+        if(routes.empty())return;
+        const auto&si=device_->get_device()->get_stream_interface(routes.front().get());
+        auto cfg=si.query_config_uncompressed(uac::UAC_FORMAT_DATA_PCM,2,(uint32_t)rate,(uint8_t)bitDepth_);
+        if(!cfg){
+            cfg=si.query_config_uncompressed(uac::UAC_FORMAT_DATA_PCM,1,(uint32_t)rate,(uint8_t)bitDepth_);
+            if(cfg)USB_HOST_LOGI("USB output stereo format unavailable; falling back to mono");
+        }
+        if(!cfg)return;
+        int bytes=cfg->bSubframeSize,ch=cfg->bChannelCount;
+        outputTransferFrames_=(outputBurstPackets_*cfg->wMaxPacketSize)/std::max(1,bytes*ch);
+        updateOutputBufferFrames();
+        outputStream_=device_->start_streaming(si,*cfg,[this,bytes,ch](uint8_t*d,uint n){onOutput(d,n,bytes,ch);},outputBurstPackets_);
+        outputSampleRate_=cfg->tSampleRate;outputBitResolution_=cfg->bBitResolution;outputChannels_=cfg->bChannelCount;
+        USB_HOST_LOGI("USB output actual format=%u Hz/%u-bit/%u ch, subframe=%u B",outputSampleRate_,outputBitResolution_,outputChannels_,cfg->bSubframeSize);
+    }
     void updateOutputBufferFrames(){if(outputTransferFrames_<=0)return;int minMs=std::clamp(outputMinBufferMs_.load(),8,200),maxMs=std::clamp(outputMaxBufferMs_.load(),8,500);if(maxMs<minMs)maxMs=minMs;uint32_t minFrames=std::max<uint32_t>((uint32_t)outputTransferFrames_,(uint32_t)((rate_*minMs+999)/1000)),maxFrames=std::max<uint32_t>(minFrames,(uint32_t)((rate_*maxMs+999)/1000));maxFrames=std::min<uint32_t>(maxFrames,kRingFrames);outputMinFrames_.store(minFrames);outputPrerollFrames_.store(minFrames+(maxFrames-minFrames)/2);outputMaxPrerollFrames_.store(maxFrames);}
     std::shared_ptr<uac::uac_context> context_;std::shared_ptr<uac::uac_device_handle> device_;std::shared_ptr<uac::uac_stream_handle> inputStream_,outputStream_;std::atomic<bool> stopping_{false};int rate_=48000,bitDepth_=16,inputBurstPackets_=8,outputBurstPackets_=8,outputTransferFrames_=0;std::vector<float> inputRing_,outputRing_;std::atomic<uint32_t> inputRead_{0},inputWrite_{0},outputRead_{0},outputWrite_{0};std::atomic<int> inputMaxBufferMs_{20},outputMinBufferMs_,outputMaxBufferMs_;std::atomic<uint32_t> outputMinFrames_{1},outputPrerollFrames_{1},outputMaxPrerollFrames_{1};std::atomic<bool> outputPrimed_{false},outputHasData_{false};std::atomic<uint64_t> inputRingOverruns_{0},inputBufferClears_{0},outputRingOverruns_{0},outputUnderruns_{0},outputBufferClears_{0},inputCallbackMaxUs_{0},outputCallbackMaxUs_{0};uint32_t inputSampleRate_=0,outputSampleRate_=0;uint8_t inputBitResolution_=0,inputChannels_=0,outputBitResolution_=0,outputChannels_=0;
 };
