@@ -91,6 +91,7 @@ namespace uac {
 
     struct uac_endpoint_desc {
         uint8_t bEndpointAddress;
+        uint8_t bInterval;
         uint16_t wMaxPacketSize;
         iso_endpoint_desc iso_desc;
     };
@@ -121,6 +122,7 @@ namespace uac {
                                                                          uint8_t bitResolution = 0) const override;
 
         uint8_t bInterfaceNr;
+        bool highSpeed = false;
         std::vector<uac_altsetting> altsettings;
     };
 
@@ -133,6 +135,8 @@ namespace uac {
         }
 
         std::vector<uac_stream_if_impl> streams;
+        bool uac2 = false;
+        bool highSpeed = false;
 
         std::vector<std::shared_ptr<uac_input_terminal>> inputTerminals;
         std::vector<std::shared_ptr<uac_output_terminal>> outputTerminals;

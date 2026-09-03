@@ -16,6 +16,7 @@
 #include "logging.h"
 #include "uac_context.h"
 #include "uac_exceptions.h"
+#include <algorithm>
 #include <list>
 #include <sstream>
 #include <utility>
@@ -46,7 +47,7 @@ namespace uac {
     static std::unique_ptr<uac_audiocontrol> parse_audiocontrol(const libusb_interface_descriptor *ifdesc);
     
     static void scan_audiostreaming(uac_audiocontrol& ac, const libusb_interface *usbintf);
-    static void parse_audiostreaming_intf(uac_stream_if_impl &stream_if, const libusb_interface_descriptor *altsettings, int num_altsetting);
+    static void parse_audiostreaming_intf(uac_stream_if_impl &stream_if, const libusb_interface_descriptor *altsettings, int num_altsetting, bool uac2);
 
     std::unique_ptr<uac_audiocontrol> uac_scan_device(libusb_device *udev) {
         uac_config_desc configDesc(udev);
@@ -75,6 +76,8 @@ namespace uac {
             // this is not a valid USB Audio Class device
             throw invalid_device_exception();
         }
+        audiocontrol->highSpeed = libusb_get_device_speed(udev) >= LIBUSB_SPEED_HIGH;
+        for (auto &stream : audiocontrol->streams) stream.highSpeed = audiocontrol->highSpeed;
         return audiocontrol;
     }
 
@@ -91,6 +94,10 @@ namespace uac {
         int subtype = data[2];
         if (subtype != UAC_AC_HEADER || descSize < 8) {
             LOG_ERROR("expected a HEADER first but got an invalid descriptor sizeof(%d) %d:%d", descSize, descriptorType, subtype);
+            return nullptr;
+        }
+        if (TO_WORD(data + 3) >= 0x0200 && descSize < 9) {
+            LOG_ERROR("UAC2 HEADER descriptor too short: %d", descSize);
             return nullptr;
         }
         LOG_DEBUG("got HEADER descriptor. sizeof(%d)", descSize);
@@ -148,9 +155,22 @@ namespace uac {
             auto ifdesc = usbintf->altsetting;
             if (stream.bInterfaceNr == ifdesc->bInterfaceNumber) {
                 LOG_DEBUG("parse AS interface %d", ifdesc->bInterfaceNumber);
-                parse_audiostreaming_intf(stream, usbintf->altsetting, usbintf->num_altsetting);
+                parse_audiostreaming_intf(stream, usbintf->altsetting, usbintf->num_altsetting, ac.uac2);
                 return;
             }
+        }
+        if (ac.uac2) {
+            auto ifdesc = usbintf->altsetting;
+            LOG_DEBUG("parse unlisted AudioStreaming interface %d", ifdesc->bInterfaceNumber);
+            auto found = std::find_if(ac.streams.begin(), ac.streams.end(),
+                                      [ifdesc](const uac_stream_if_impl& stream) {
+                                          return stream.bInterfaceNr == ifdesc->bInterfaceNumber;
+                                      });
+            if (found == ac.streams.end()) {
+                ac.streams.emplace_back(ifdesc->bInterfaceNumber);
+                parse_audiostreaming_intf(ac.streams.back(), usbintf->altsetting, usbintf->num_altsetting, ac.uac2);
+            }
+            return;
         }
         LOG_DEBUG("This AudioStreaming interface is not part of current AudioControl.");
     }
@@ -251,10 +271,16 @@ namespace uac {
 
     void parse_ac_header(uac_audiocontrol& ac, const uint8_t *data, int size) {
         ac.bcdADC = TO_WORD(data+3);
-        ac.wTotalLength = TO_WORD(data+5);
+        /* UAC1: bcdADC, wTotalLength, bInCollection start at offsets 3/5/7.
+         * UAC2 inserts bCategory before wTotalLength, shifting the latter
+         * fields by one byte. */
+        const bool uac2 = ac.bcdADC >= 0x0200;
+        ac.uac2 = uac2;
+        ac.wTotalLength = TO_WORD(data + (uac2 ? 6 : 5));
+        if (uac2) return;
         uint8_t bInCollection = data[7];
         for (size_t i = 0; i < bInCollection; ++i) {
-            ac.streams.emplace_back(data[8+i]);
+            ac.streams.emplace_back(data[8 + i]);
             LOG_DEBUG("\t got Audio Streaming interface at: %d", ac.streams.back().bInterfaceNr);
         }
     }
@@ -300,23 +326,60 @@ namespace uac {
         return unit;
     }
 
-    uac_format_type_1* parse_as_format_type_1_3(const uint8_t *data, int size) {
-        uint8_t bSamFreqType = data[7];
+    uac_format_type_1* parse_as_format_type_1_3(const uint8_t *data, int size, bool uac2) {
+        // Some UAC devices (including the Meizu DAC seen on VIVO) expose a
+        // truncated six-byte FORMAT_TYPE descriptor and omit the sampling-rate
+        // fields entirely.  Do not read past the descriptor; infer the PCM bit
+        // depth from the subframe size and treat the rate as device-continuous.
+        const bool truncated = size < 8;
+        uint8_t bSamFreqType = truncated ? 0 : data[7];
         uac_format_type_1 *desc = (uac_format_type_1*) malloc(
                 sizeof(uac_format_type_1) + sizeof(uint32_t) * bSamFreqType);
         desc->bFormatType = (uac_format_type) data[3];
-        desc->bNrChannels = data[4];
-        desc->bSubframeSize = data[5];
-        desc->bBitResolution = data[6];
+        if (uac2 && size == 6) {
+            // This DAC emits a non-compliant six-byte descriptor retaining
+            // the UAC1 field order: format, channels, bit resolution.
+            desc->bNrChannels = data[4];
+            desc->bBitResolution = data[5];
+            desc->bSubframeSize = (uint8_t)std::max(1, (int)desc->bBitResolution / 8);
+        } else {
+            desc->bNrChannels = size > 4 ? data[4] : 0;
+            desc->bSubframeSize = size > 5 ? data[5] : 0;
+            desc->bBitResolution = size > 6 ? data[6] : 0;
+        }
+        if (truncated && !uac2) {
+            // This non-compliant device uses the six-byte descriptor form
+            // [format, channels, bit-resolution]; derive byte subframe size.
+            desc->bBitResolution = desc->bSubframeSize;
+            desc->bSubframeSize = (uint8_t)std::max(1, (int)desc->bBitResolution / 8);
+        }
         desc->bSamFreqType = bSamFreqType;
+        LOG_DEBUG("AS FORMAT I: len=%d ch=%u subframe=%u bits=%u freqType=%u", size,
+                  desc->bNrChannels, desc->bSubframeSize, desc->bBitResolution, bSamFreqType);
         if (desc->bSamFreqType == 0) {
-            desc->tLowerSamFreq = TO_DWORD24(data + 8);
-            desc->tUpperSamFreq = TO_DWORD24(data + 11);
+            if (uac2) {
+                if (size < 16) {
+                    desc->tLowerSamFreq = 8000;
+                    desc->tUpperSamFreq = 384000;
+                } else {
+                    desc->tLowerSamFreq = TO_DWORD(data + 8);
+                    desc->tUpperSamFreq = TO_DWORD(data + 12);
+                }
+            } else {
+                if (size < 14) {
+                    desc->tLowerSamFreq = 8000;
+                    desc->tUpperSamFreq = 384000;
+                } else {
+                    desc->tLowerSamFreq = TO_DWORD24(data + 8);
+                    desc->tUpperSamFreq = TO_DWORD24(data + 11);
+                }
+            }
+            LOG_DEBUG("AS FORMAT I continuous rates: %u..%u", desc->tLowerSamFreq, desc->tUpperSamFreq);
         } else {
             desc->tLowerSamFreq = 0;
             desc->tUpperSamFreq = 0;
             for (size_t i = 0; i < desc->bSamFreqType; ++i) {
-                desc->tSamFreq[i] = TO_DWORD24(data + 8 + i*3);
+                desc->tSamFreq[i] = uac2 ? TO_DWORD(data + 8 + i*4) : TO_DWORD24(data + 8 + i*3);
                 LOG_DEBUG("supported freq %d", desc->tSamFreq[i]);
             }
             
@@ -324,19 +387,30 @@ namespace uac {
         return desc;
     }
 
-    void parse_as_general(uac_as_general &generalDesc, const uint8_t *data, int size) {
+    void parse_as_general(uac_as_general &generalDesc, const uint8_t *data, int size, bool uac2) {
         generalDesc.bTerminalLink = data[3];
-        generalDesc.bDelay = data[4];
-        generalDesc.wFormatTag = (uac_audio_data_format_type) TO_WORD(data+5);
+        if (uac2) {
+            // UAC2 uses bmControls at byte 4 and a four-byte format code at
+            // bytes 5..8. A few DACs report the PCM code as 0x0101; the low
+            // byte is still the UAC PCM identifier (0x01).
+            generalDesc.bDelay = 0;
+            const uint32_t formatCode = size >= 9 ? TO_DWORD(data + 5) : TO_WORD(data + 5);
+            generalDesc.wFormatTag = (formatCode & 0xffu) == 0x01u
+                    ? UAC_FORMAT_DATA_PCM
+                    : (uac_audio_data_format_type)(formatCode & 0xffffu);
+        } else {
+            generalDesc.bDelay = data[4];
+            generalDesc.wFormatTag = (uac_audio_data_format_type) TO_WORD(data+5);
+        }
     }
 
-    std::unique_ptr<uac_format_type_desc> parse_as_format_type(const uint8_t *data, int size) {
+    std::unique_ptr<uac_format_type_desc> parse_as_format_type(const uint8_t *data, int size, bool uac2) {
         std::unique_ptr<uac_format_type_desc> format;
         uint8_t bFormatType = data[3];
         switch (bFormatType) {
         case UAC_FORMAT_TYPE_I:
         case UAC_FORMAT_TYPE_III:
-            format = std::unique_ptr<uac_format_type_desc>(parse_as_format_type_1_3(data, size));
+            format = std::unique_ptr<uac_format_type_desc>(parse_as_format_type_1_3(data, size, uac2));
             break;
         
         default:
@@ -361,7 +435,7 @@ namespace uac {
         
     }
 
-    void parse_audiostreaming_intf(uac_stream_if_impl &stream_if, const libusb_interface_descriptor *altsettings, int num_altsetting) {
+    void parse_audiostreaming_intf(uac_stream_if_impl &stream_if, const libusb_interface_descriptor *altsettings, int num_altsetting, bool uac2) {
         // skip altsetting 0, because it is non-configurable
         for (size_t i = 1; i < num_altsetting; ++i) {
             auto ifdesc = &altsettings[i];
@@ -380,12 +454,12 @@ namespace uac {
                 switch (subtype) {
                 case UAC_AS_GENERAL:
                     LOG_DEBUG("got AS_GENERAL descriptor");
-                    parse_as_general(altsetting.general, data, descSize);
+                    parse_as_general(altsetting.general, data, descSize, uac2);
                     hasGeneralDescriptor = true;
                     break;
                 case UAC_AS_FORMAT_TYPE:
                     LOG_DEBUG("got AS_FORMAT_TYPE descriptor");
-                    altsetting.formatTypeDesc = parse_as_format_type(data, descSize);
+                    altsetting.formatTypeDesc = parse_as_format_type(data, descSize, uac2);
                     hasFormatDescriptor = true;
                     break;
                 case UAC_AS_FORMAT_SPECIFIC:
@@ -410,6 +484,7 @@ namespace uac {
                 LOG_DEBUG("altsetting endpointAddress=%x, wMaxPacketSize=%d", ifdesc->endpoint->bEndpointAddress, ifdesc->endpoint->wMaxPacketSize);
                 auto& epDesc = altsetting.endpoint;
                 epDesc.bEndpointAddress = ifdesc->endpoint->bEndpointAddress;
+                epDesc.bInterval = ifdesc->endpoint->bInterval;
                 epDesc.wMaxPacketSize = ifdesc->endpoint->wMaxPacketSize;
                 if ((ifdesc->endpoint->bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) == LIBUSB_TRANSFER_TYPE_ISOCHRONOUS) {
                     parse_iso_ep(epDesc.iso_desc, ifdesc->endpoint->extra, ifdesc->endpoint->extra_length);

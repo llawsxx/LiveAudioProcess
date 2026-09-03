@@ -202,7 +202,9 @@ namespace uac {
                             format1->bBitResolution,
                             format1->bNrChannels,
                             setting.endpoint.wMaxPacketSize,
-                            sampleRate
+                            sampleRate,
+                            setting.endpoint.bInterval,
+                            highSpeed
                             });
             }
         }

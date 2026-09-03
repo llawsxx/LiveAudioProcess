@@ -234,6 +234,8 @@ namespace uac {
         const uint8_t bChannelCount;
         const uint16_t wMaxPacketSize;
         uint32_t tSampleRate;
+        uint8_t bInterval;
+        bool highSpeed;
     };
 
     struct uac_audio_config_compressed {

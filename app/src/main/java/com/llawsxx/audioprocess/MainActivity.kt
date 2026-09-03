@@ -187,7 +187,12 @@ private fun LiveAudioProcessApp() {
         while (true) {
             running = engine.isRunning
             recording = engine.isRecording
-            routeNotice = engine.routeNotice ?: engine.lastError
+            /* Keep the last actionable route/error message visible. The
+             * engine may clear its transient route warning after a refresh,
+             * but a fallback or user-facing restriction must not flash away
+             * on the next 100 ms polling tick. */
+            val engineNotice = engine.routeNotice ?: engine.lastError
+            if (!engineNotice.isNullOrBlank()) routeNotice = engineNotice
             delay(100)
         }
     }
@@ -275,6 +280,9 @@ private fun LiveAudioProcessApp() {
         engine.configureSystemInputBuffer(applied)
     }
     fun startMonitoring() {
+        // A previous USB format fallback may have left a local notice visible;
+        // the new start attempt will repopulate it only if the route fails.
+        routeNotice = null
         syncEngine()
         ContextCompat.startForegroundService(
             context,
