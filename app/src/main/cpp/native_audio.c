@@ -68,6 +68,11 @@ typedef struct {
     pthread_t thread;
     atomic_int running, recording, flags;
     _Atomic(float) levels[6];
+    _Atomic(float) peak_levels[4];
+    uint64_t peak_hold_until_ns[4];
+    float waveform_dry[512], waveform_wet[512];
+    int waveform_count, waveform_pos;
+    pthread_mutex_t waveform_lock;
     int rate, frames, in_channels, pair;
     float values[28];
     pthread_mutex_t param_lock, file_lock, stream_lock;
@@ -149,6 +154,12 @@ typedef struct {
     uint8_t net_tx_buffer[NET_TCP_BUFFER_BYTES];
     uint64_t net_tx_blocked_since_ns;
     uint64_t net_tcp_next_connect_ns;
+    atomic_int tone_enabled;
+    int tone_waveform;
+    int tone_channels;
+    float tone_frequency, tone_level;
+    double tone_phase;
+    uint32_t tone_noise_state;
     float net_send_buffer[NET_AAC_FRAMES * 2];
 } Engine;
 
@@ -166,7 +177,9 @@ static Engine g = {
     .record_cv_mutex = PTHREAD_MUTEX_INITIALIZER,
     .record_cv = PTHREAD_COND_INITIALIZER,
     .net_codec_lock = PTHREAD_MUTEX_INITIALIZER,
-    .reverb_lock = PTHREAD_MUTEX_INITIALIZER
+    .reverb_lock = PTHREAD_MUTEX_INITIALIZER,
+    .waveform_lock = PTHREAD_MUTEX_INITIALIZER,
+    .tone_noise_state = 0x13579BDFu
 };
 
 #define NET_MAGIC 0x50464C58u
@@ -1402,12 +1415,22 @@ static void *audio_thread(void *unused) {
         int want=g.frames<MAX_FRAMES?g.frames:MAX_FRAMES;
         aaudio_result_t got;
         int using_network=atomic_load(&g.use_network_input)&&atomic_load(&g.net_role)==2;
+        int using_tone=atomic_load(&g.tone_enabled);
         if(using_network){ got=network_receive(output,want); if(got<=0){ memset(output,0,(size_t)want*2*sizeof(float)); got=want; } memcpy(dry,output,(size_t)got*2*sizeof(float)); }
         else if(g.usb_input_host && g.usb_audio){got=usb_host_audio_read(g.usb_audio,input,want);}
         else if(g.input){if(atomic_load(&g.net_role)==2)network_fill();got=input_ring_read(input,(uint32_t)want);}
+        else if(using_tone){ got=want; }
         else { memset(input,0,(size_t)want*MAX_INPUT_CHANNELS*sizeof(float)); got=want; }
         if(got<=0){usleep(1000);continue;}
-        pthread_mutex_lock(&g.param_lock); memcpy(p,g.values,sizeof(p)); pthread_mutex_unlock(&g.param_lock);
+        int tone_waveform, tone_channels;
+        float tone_frequency, tone_level;
+        pthread_mutex_lock(&g.param_lock);
+        memcpy(p,g.values,sizeof(p));
+        tone_waveform=g.tone_waveform;
+        tone_channels=g.tone_channels;
+        tone_frequency=g.tone_frequency;
+        tone_level=g.tone_level;
+        pthread_mutex_unlock(&g.param_lock);
         int flags=atomic_load(&g.flags); float peaks[4]={0.f,0.f,0.f,0.f};
         if (!(flags&DSP_ON) || !(flags&LIMITER_ON)) {
             g.limiter_delay_frames=0;
@@ -1423,8 +1446,27 @@ static void *audio_thread(void *unused) {
         for(int i=0;i<got;i++) {
             int first=g.pair*2; if(first>=g.in_channels)first=0;
             int second=first+1; if(second>=g.in_channels)second=first;
-            float l = using_network ? output[i*2] : (g.usb_input_host ? input[i*2] : input[i*g.in_channels+first]);
-            float r = using_network ? output[i*2+1] : (g.usb_input_host ? input[i*2+1] : input[i*g.in_channels+second]);
+            float l, r;
+            if (using_network) { l=output[i*2]; r=output[i*2+1]; }
+            else if (using_tone) {
+                double phase=g.tone_phase;
+                double value;
+                switch(tone_waveform) {
+                    case 1: value=phase<0.5?1.0:-1.0; break;
+                    case 2: value=4.0*fabs(phase-0.5)-1.0; break;
+                    case 3:
+                        g.tone_noise_state = g.tone_noise_state * 1664525u + 1013904223u;
+                        value = ((double)(g.tone_noise_state >> 8) / 16777216.0) * 2.0 - 1.0;
+                        break;
+                    default: value=sin(phase*6.283185307179586); break;
+                }
+                value*=clampf(tone_level,0.f,1.f);
+                l=(tone_channels==2)?0.f:(float)value;
+                r=(tone_channels==1)?0.f:(float)value;
+                phase += (double)tone_frequency/(double)g.rate;
+                phase -= floor(phase);
+                g.tone_phase=phase;
+            } else { l=g.usb_input_host ? input[i*2] : input[i*g.in_channels+first]; r=g.usb_input_host ? input[i*2+1] : input[i*g.in_channels+second]; }
             dry[i*2]=l;dry[i*2+1]=r;
             peaks[0]=fmaxf(peaks[0],fabsf(l)); peaks[1]=fmaxf(peaks[1],fabsf(r));
             if(flags&DSP_ON) {
@@ -1437,6 +1479,22 @@ static void *audio_thread(void *unused) {
         }
         if(reverb) pthread_mutex_unlock(&g.reverb_lock);
         for(int i=0;i<4;i++)atomic_store(&g.levels[i],atomic_load(&g.levels[i])*.84f+peaks[i]*.16f);
+        uint64_t peak_now=now_ns();
+        for(int i=0;i<4;i++) {
+            float held=atomic_load(&g.peak_levels[i]);
+            if(peaks[i]>=held) { atomic_store(&g.peak_levels[i],peaks[i]); g.peak_hold_until_ns[i]=peak_now+1500000000ull; }
+            else if(peak_now>g.peak_hold_until_ns[i]) atomic_store(&g.peak_levels[i],held*.985f);
+        }
+        pthread_mutex_lock(&g.waveform_lock);
+        int wave_start=got>512?got-512:0;
+        for(int i=wave_start;i<got;i++) {
+            int pos=g.waveform_pos;
+            g.waveform_dry[pos]=(dry[i*2]+dry[i*2+1])*0.5f;
+            g.waveform_wet[pos]=(output[i*2]+output[i*2+1])*0.5f;
+            g.waveform_pos=(pos+1)&511;
+            if(g.waveform_count<512)g.waveform_count++;
+        }
+        pthread_mutex_unlock(&g.waveform_lock);
         if(g.net_role==1) network_send(output,got);
         if (g.usb_output_host && g.usb_audio) usb_host_audio_write(g.usb_audio, output, got);
         else if (g.output) output_ring_write(output, (uint32_t)got);
@@ -1544,6 +1602,12 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
     output_ring_destroy();
     atomic_store(&g.dsp_last_us, 0);
     atomic_store(&g.dsp_max_us, 0);
+    for(int i=0;i<4;i++){atomic_store(&g.peak_levels[i],0.f);g.peak_hold_until_ns[i]=0;}
+    pthread_mutex_lock(&g.waveform_lock);
+    memset(g.waveform_dry,0,sizeof(g.waveform_dry));
+    memset(g.waveform_wet,0,sizeof(g.waveform_wet));
+    g.waveform_count=g.waveform_pos=0;
+    pthread_mutex_unlock(&g.waveform_lock);
     memset(g.eq,0,sizeof(g.eq));g.rate=rate;g.frames=frames;g.in_channels=channels;g.pair=pair;g.limiter_gain=1.0;g.limiter_delta=0.0;g.limiter_delay_frames=0;g.limiter_next_iter=g.limiter_next_len=0;loudness_init(rate);g.usb_audio=NULL;g.usb_input_host=usbInputHost?1:0;g.usb_output_host=usbOutputHost?1:0;if(usbFd<0){g.usb_input_host=0;g.usb_output_host=0;}atomic_store(&g.use_network_input,useNetworkInput?1:0);if(useNetworkInput)atomic_store(&g.net_last_packet_ns,now_ns());
     atomic_store(&g.reverb_worker_started,0);
     if(usbFd >= 0 && (g.usb_input_host || g.usb_output_host)) {
@@ -1555,7 +1619,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
         usb_host_audio_configure_input_buffer(g.usb_audio, atomic_load(&g.usb_input_buffer_max_ms));
         if (g.usb_input_host) g.in_channels = 2;
     }
-    if(!g.usb_input_host && !atomic_load(&g.use_network_input) && !open_stream(&g.input,AAUDIO_DIRECTION_INPUT,channels,inDev,rate,frames)){LOGE("AAudio input open failed");usb_host_audio_stop(g.usb_audio);g.usb_audio=NULL;return JNI_FALSE;}
+    if(!g.usb_input_host && !atomic_load(&g.use_network_input) && !atomic_load(&g.tone_enabled) && !open_stream(&g.input,AAUDIO_DIRECTION_INPUT,channels,inDev,rate,frames)){LOGE("AAudio input open failed");usb_host_audio_stop(g.usb_audio);g.usb_audio=NULL;return JNI_FALSE;}
     if(!g.usb_output_host && !open_stream(&g.output,AAUDIO_DIRECTION_OUTPUT,2,outDev,rate,frames)){LOGE("AAudio output open failed");if(g.input){AAudioStream_close(g.input);g.input=NULL;}input_ring_destroy();usb_host_audio_stop(g.usb_audio);g.usb_audio=NULL;return JNI_FALSE;}
     g.reverb=convolution_reverb_create(rate,g.values[P_ROOM],g.values[P_DECAY],g.values[P_DAMP]);
     g.net_jitter=calloc(NET_JITTER_SLOTS,sizeof(*g.net_jitter));
@@ -1643,7 +1707,32 @@ static void native_stop_internal(int finalize_recording, int preserve_network) {
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stop(JNIEnv*e,jobject o){(void)e;(void)o;native_stop_internal(1,0);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stopForRouteChange(JNIEnv*e,jobject o){(void)e;(void)o;native_stop_internal(0,1);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_update(JNIEnv*e,jobject o,jint flags,jfloatArray values){(void)o;float incoming[28]={0};jsize n=(*e)->GetArrayLength(e,values);if(n>28)n=28;(*e)->GetFloatArrayRegion(e,values,0,n,incoming);pthread_mutex_lock(&g.param_lock);int reverb_changed=n>P_DAMP&&(g.values[P_ROOM]!=incoming[P_ROOM]||g.values[P_DECAY]!=incoming[P_DECAY]||g.values[P_DAMP]!=incoming[P_DAMP]);memcpy(g.values,incoming,(size_t)n*sizeof(float));pthread_mutex_unlock(&g.param_lock);if(reverb_changed)atomic_fetch_add(&g.reverb_generation,1);atomic_store(&g.flags,flags);}
-JNIEXPORT jfloatArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_levels(JNIEnv*e,jobject o){(void)o;jfloat v[6];for(int i=0;i<6;i++)v[i]=atomic_load(&g.levels[i]);jfloatArray a=(*e)->NewFloatArray(e,6);(*e)->SetFloatArrayRegion(e,a,0,6,v);return a;}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureTone(JNIEnv*e,jobject o,jboolean enabled,jint waveform,jint channels,jfloat frequency,jfloat level){
+    (void)e;(void)o;
+    float max_frequency=g.rate>0?(float)g.rate*.45f:20000.f;
+    pthread_mutex_lock(&g.param_lock);
+    g.tone_waveform=waveform<0?0:(waveform>3?3:waveform);
+    g.tone_channels=channels<0?0:(channels>2?2:channels);
+    g.tone_frequency=frequency<1.f?1.f:(frequency>max_frequency?max_frequency:frequency);
+    g.tone_level=level<0.f?0.f:(level>1.f?1.f:level);
+    pthread_mutex_unlock(&g.param_lock);
+    atomic_store(&g.tone_enabled,enabled?1:0);
+}
+JNIEXPORT jfloatArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_levels(JNIEnv*e,jobject o){(void)o;jfloat v[10];for(int i=0;i<6;i++)v[i]=atomic_load(&g.levels[i]);for(int i=0;i<4;i++)v[6+i]=atomic_load(&g.peak_levels[i]);jfloatArray a=(*e)->NewFloatArray(e,10);(*e)->SetFloatArrayRegion(e,a,0,10,v);return a;}
+JNIEXPORT jfloatArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_waveform(JNIEnv*e,jobject o){
+    (void)o; jfloat v[1024]={0};
+    pthread_mutex_lock(&g.waveform_lock);
+    int n=g.waveform_count<512?g.waveform_count:512;
+    int start=(g.waveform_pos-n+512)&511;
+    int dst=512-n;
+    for(int i=0;i<n;i++) {
+        int src=(start+i)&511;
+        v[dst+i]=g.waveform_dry[src];
+        v[512+dst+i]=g.waveform_wet[src];
+    }
+    pthread_mutex_unlock(&g.waveform_lock);
+    jfloatArray a=(*e)->NewFloatArray(e,1024); (*e)->SetFloatArrayRegion(e,a,0,1024,v); return a;
+}
 JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetwork(JNIEnv*e,jobject o,jint role,jint transport,jint codec,jint sampleRate,jint bitrate,jstring host,jint port,jint minMs,jint maxMs){
     (void)o;
     if(transport!=NET_TRANSPORT_UDP&&transport!=NET_TRANSPORT_TCP)return JNI_FALSE;

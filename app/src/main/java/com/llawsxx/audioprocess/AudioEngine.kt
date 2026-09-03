@@ -41,6 +41,10 @@ class AudioEngine(private val context: Context) {
     init { if (Build.VERSION.SDK_INT >= 23) deviceCallback?.let { audioManager.registerAudioDeviceCallback(it, routeHandler) } }
     @Volatile var inputSource = InputSource.BUILT_IN
         internal set
+    @Volatile var toneWaveform = 0
+    @Volatile var toneChannels = 0
+    @Volatile var toneFrequency = 1000f
+    @Volatile var toneLevel = .25f
     @Volatile var outputSource = OutputSource.SPEAKER
         internal set
     @Volatile var sampleRate = 48_000; @Volatile var bufferFrames = 256; @Volatile var inputPair = 0
@@ -445,6 +449,9 @@ class AudioEngine(private val context: Context) {
     }
     fun stop() { if (isRecording) setRecording(false); routeHandler.removeCallbacks(routeRestart); routeHandler.removeCallbacks(routeRefresh); routeHandler.removeCallbacks(wifiHealthMonitor); routeHandler.removeCallbacks(bluetoothRouteMonitor); NativeAudio.stop(); usbConnection?.close(); usbConnection = null; clearBluetoothRoute(); activeInputDeviceId = -1; activeOutputDeviceId = -1; observedBluetoothDeviceId = Int.MIN_VALUE; bluetoothRetryCount = 0; nextBluetoothRetryAtMs = 0L; isRecording = false; isRunning = false }
     fun refreshNativeParameters() { pushNativeParameters() }
+    fun configureTone(enabled: Boolean) {
+        if (NativeAudio.available) NativeAudio.configureTone(enabled, toneWaveform, toneChannels, toneFrequency, toneLevel)
+    }
     private fun pushNativeParameters() {
         if (!NativeAudio.available) return
         val flags = (if (dspEnabled) 1 else 0) or
@@ -460,6 +467,7 @@ class AudioEngine(private val context: Context) {
             limiterLookAhead, if (limiterAdaptiveRelease) 1f else 0f,
             loudnessTarget, loudnessLra, loudnessTruePeak
         ))
+        NativeAudio.configureTone(inputSource == InputSource.TEST_TONE, toneWaveform, toneChannels, toneFrequency, toneLevel)
     }
 
     companion object {
@@ -471,6 +479,6 @@ class AudioEngine(private val context: Context) {
     }
 }
 
-enum class InputSource(val label: String) { BUILT_IN("内置麦克风"), USB("USB 声卡 / AD2R"), WIFI("Wi-Fi 音频") }
+enum class InputSource(val label: String) { BUILT_IN("内置麦克风"), USB("USB 声卡 / AD2R"), WIFI("Wi-Fi 音频"), TEST_TONE("测试 Tone") }
 enum class OutputSource(val label: String) { SPEAKER("扬声器 / 有线"), USB("USB 声卡 / AD2R"), BLUETOOTH("蓝牙耳机"), WIFI("Wi-Fi 音频") }
 data class ChannelPair(val index: Int, val label: String)
