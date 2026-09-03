@@ -347,16 +347,17 @@ class AudioEngine(private val context: Context) {
         val usbFd = if (requestedUsbInputHost || requestedUsbOutputHost) openUsbHostConnection() else -1
         val usbInputHost = requestedUsbInputHost && usbFd >= 0
         val usbOutputHost = requestedUsbOutputHost && usbFd >= 0
-        var started = NativeAudio.start(sampleRate, bufferFrames, inputDeviceId, outputDeviceId, nativeInputChannels, inputPair, useNetworkInput, usbFd, usbInputHost, usbOutputHost, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
+        val enableOutput = outputSource != OutputSource.NONE
+        var started = NativeAudio.start(sampleRate, bufferFrames, inputDeviceId, outputDeviceId, enableOutput, nativeInputChannels, inputPair, useNetworkInput, usbFd, usbInputHost, usbOutputHost, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
         if (!started && usbFd >= 0) {
             usbConnection?.close()
             usbConnection = null
             lastError = "USB Host 不支持 ${formatSampleRate(sampleRate)} / ${usbBitDepth}-bit，正在回退到系统 USB 音频"
-            started = NativeAudio.start(sampleRate, bufferFrames, inputDeviceId, outputDeviceId, nativeInputChannels, inputPair, useNetworkInput, -1, false, false, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
+            started = NativeAudio.start(sampleRate, bufferFrames, inputDeviceId, outputDeviceId, enableOutput, nativeInputChannels, inputPair, useNetworkInput, -1, false, false, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
         }
         if (!started && inputSource == InputSource.USB && nativeInputChannels == 2) {
             // Keep USB usable on devices whose driver rejects a stereo AAudio request.
-            started = NativeAudio.start(sampleRate, bufferFrames, inputDeviceId, outputDeviceId, 1, inputPair, useNetworkInput, -1, false, false, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
+            started = NativeAudio.start(sampleRate, bufferFrames, inputDeviceId, outputDeviceId, enableOutput, 1, inputPair, useNetworkInput, -1, false, false, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
             if (started) lastError = "USB 输入驱动拒绝立体声，已回退为单声道"
         }
         if (started) isRunning = true
@@ -478,5 +479,5 @@ class AudioEngine(private val context: Context) {
 }
 
 enum class InputSource(val label: String) { BUILT_IN("内置麦克风"), USB("USB 声卡 / AD2R"), WIFI("Wi-Fi 音频"), TEST_TONE("测试 Tone") }
-enum class OutputSource(val label: String) { SPEAKER("扬声器 / 有线"), USB("USB 声卡 / AD2R"), BLUETOOTH("蓝牙耳机"), WIFI("Wi-Fi 音频") }
+enum class OutputSource(val label: String) { NONE("不输出"), SPEAKER("扬声器 / 有线"), USB("USB 声卡 / AD2R"), BLUETOOTH("蓝牙耳机"), WIFI("Wi-Fi 音频") }
 data class ChannelPair(val index: Int, val label: String)

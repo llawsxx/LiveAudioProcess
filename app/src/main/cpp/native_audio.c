@@ -1593,7 +1593,7 @@ static int open_stream(AAudioStream **stream, aaudio_direction_t direction, int 
     return 1;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEnv*e,jobject o,jint rate,jint frames,jint inDev,jint outDev,jint channels,jint pair,jboolean useNetworkInput,jint usbFd,jboolean usbInputHost,jboolean usbOutputHost,jint usbBitDepth,jint usbInputBurstPackets,jint usbOutputBurstPackets){
+JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEnv*e,jobject o,jint rate,jint frames,jint inDev,jint outDev,jboolean enableOutput,jint channels,jint pair,jboolean useNetworkInput,jint usbFd,jboolean usbInputHost,jboolean usbOutputHost,jint usbBitDepth,jint usbInputBurstPackets,jint usbOutputBurstPackets){
     (void)e;(void)o;
     if(atomic_load(&g.running))return JNI_TRUE;
     int input_started=0, output_started=0, audio_thread_started=0;
@@ -1620,7 +1620,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
         if (g.usb_input_host) g.in_channels = 2;
     }
     if(!g.usb_input_host && !atomic_load(&g.use_network_input) && !atomic_load(&g.tone_enabled) && !open_stream(&g.input,AAUDIO_DIRECTION_INPUT,channels,inDev,rate,frames)){LOGE("AAudio input open failed");usb_host_audio_stop(g.usb_audio);g.usb_audio=NULL;return JNI_FALSE;}
-    if(!g.usb_output_host && !open_stream(&g.output,AAUDIO_DIRECTION_OUTPUT,2,outDev,rate,frames)){LOGE("AAudio output open failed");if(g.input){AAudioStream_close(g.input);g.input=NULL;}input_ring_destroy();usb_host_audio_stop(g.usb_audio);g.usb_audio=NULL;return JNI_FALSE;}
+    if(enableOutput && !g.usb_output_host && !open_stream(&g.output,AAUDIO_DIRECTION_OUTPUT,2,outDev,rate,frames)){LOGE("AAudio output open failed");if(g.input){AAudioStream_close(g.input);g.input=NULL;}input_ring_destroy();usb_host_audio_stop(g.usb_audio);g.usb_audio=NULL;return JNI_FALSE;}
     g.reverb=convolution_reverb_create(rate,g.values[P_ROOM],g.values[P_DECAY],g.values[P_DAMP]);
     g.net_jitter=calloc(NET_JITTER_SLOTS,sizeof(*g.net_jitter));
     g.net_aac_jitter=calloc(NET_AAC_JITTER_SLOTS,sizeof(*g.net_aac_jitter));
