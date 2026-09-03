@@ -92,7 +92,7 @@ namespace uac {
         int descSize = data[0];
         int descriptorType = data[1];
         int subtype = data[2];
-        if (subtype != UAC_AC_HEADER || descSize < 8) {
+        if (descSize < 3 || descSize > remaining || subtype != UAC_AC_HEADER || descSize < 8) {
             LOG_ERROR("expected a HEADER first but got an invalid descriptor sizeof(%d) %d:%d", descSize, descriptorType, subtype);
             return nullptr;
         }
@@ -116,7 +116,7 @@ namespace uac {
             descSize = data[0];
             descriptorType = data[1];
             subtype = data[2];
-            if (remaining < descSize) {
+            if (descSize < 3 || remaining < descSize) {
                 LOG_WARN("Bad descriptor size, exceeds remaining bytes %d < %d", remaining, descSize);
                 break;
             }
@@ -126,16 +126,34 @@ namespace uac {
                 LOG_DEBUG("got another HEADER descriptor. A bug or buggy device?");
                 break;
             case UAC_AC_INPUT_TERMINAL:
-                audiocontrol->inputTerminals.push_back(parse_input_terminal(data, descSize));
+                if (descSize >= (audiocontrol->uac2 ? 17 : 12))
+                    audiocontrol->inputTerminals.push_back(parse_input_terminal(data, descSize, audiocontrol->uac2));
+                else
+                    LOG_WARN("Input terminal descriptor too short: %d", descSize);
                 break;
             case UAC_AC_OUTPUT_TERMINAL:
-                audiocontrol->outputTerminals.push_back(parse_output_terminal(data, descSize));
+                if (descSize >= (audiocontrol->uac2 ? 12 : 9))
+                    audiocontrol->outputTerminals.push_back(parse_output_terminal(data, descSize, audiocontrol->uac2));
+                else
+                    LOG_WARN("Output terminal descriptor too short: %d", descSize);
                 break;
             case UAC_AC_MIXER_UNIT:
                 audiocontrol->units.push_back(parse_mixer_unit(data, descSize));
                 break;
             case UAC_AC_FEATURE_UNIT:
-                audiocontrol->units.push_back(parse_feature_unit(data, descSize));
+                if (descSize >= 6)
+                    audiocontrol->units.push_back(parse_feature_unit(data, descSize, audiocontrol->uac2));
+                else
+                    LOG_WARN("Feature unit descriptor too short: %d", descSize);
+                break;
+            case 0x0A: // UAC2 CLOCK_SOURCE
+                if (audiocontrol->uac2 && descSize >= 8) {
+                    uac_clock_source clock;
+                    clock.bClockID = data[3];
+                    clock.bmAttributes = data[4];
+                    clock.bmControls = data[5];
+                    audiocontrol->clockSources.push_back(clock);
+                }
                 break;
             
             default:
@@ -285,26 +303,41 @@ namespace uac {
         }
     }
 
-    std::shared_ptr<uac_input_terminal> parse_input_terminal(const uint8_t *data, int size) {
+    std::shared_ptr<uac_input_terminal> parse_input_terminal(const uint8_t *data, int size, bool uac2) {
         auto terminal = std::make_shared<uac_input_terminal>();
         terminal->bTerminalID = data[3];
         terminal->wTerminalType = TO_WORD(data+4);
         terminal->bAssocTerminal = data[6];
-        terminal->bNrChannels = data[7];
-        terminal->wChannelConfig = TO_WORD(data+8);
-        terminal->iChannelNames = data[10];
-        terminal->iTerminal = data[11];
+        if (uac2) {
+            // UAC2 adds a clock-source ID and widens channel count/configuration.
+            terminal->bCSourceID = size > 7 ? data[7] : 0;
+            terminal->bNrChannels = data[8];
+            // The public UAC1-compatible structure retains the low 16 bits.
+            terminal->wChannelConfig = TO_WORD(data + 9);
+            terminal->iChannelNames = data[13];
+            terminal->iTerminal = data[16];
+        } else {
+            terminal->bNrChannels = data[7];
+            terminal->wChannelConfig = TO_WORD(data+8);
+            terminal->iChannelNames = data[10];
+            terminal->iTerminal = data[11];
+        }
         LOG_DEBUG("\t got INPUT_TERMINAL %d: type=0x%x", terminal->bTerminalID, terminal->wTerminalType);
         return terminal;
     }
 
-    std::shared_ptr<uac_output_terminal> parse_output_terminal(const uint8_t *data, int size) {
+    std::shared_ptr<uac_output_terminal> parse_output_terminal(const uint8_t *data, int size, bool uac2) {
         auto terminal = std::make_shared<uac_output_terminal>();
         terminal->bTerminalID = data[3];
         terminal->wTerminalType = TO_WORD(data+4);
         terminal->bAssocTerminal = data[6];
         terminal->bSourceID = data[7];
-        terminal->iTerminal = data[8];
+        if (uac2) {
+            terminal->bCSourceID = size > 8 ? data[8] : 0;
+            terminal->iTerminal = size > 11 ? data[11] : 0;
+        } else {
+            terminal->iTerminal = data[8];
+        }
         LOG_DEBUG("\t got OUTPUT_TERMINAL %d: type=0x%x", terminal->bTerminalID, terminal->wTerminalType);
         return terminal;
     }
@@ -316,32 +349,29 @@ namespace uac {
         return unit;
     }
 
-    std::shared_ptr<uac_feature_unit> parse_feature_unit(const uint8_t *data, int size) {
+    std::shared_ptr<uac_feature_unit> parse_feature_unit(const uint8_t *data, int size, bool uac2) {
         auto unit = std::make_unique<uac_feature_unit>();
         unit->unitType = (uac_ac_descriptor_subtype) data[2];
         unit->bUnitID = data[3];
         unit->bSourceId = data[4];
-        unit->bControlSize = data[5];
+        // UAC2 stores four bytes per control; UAC1 carries bControlSize here.
+        unit->bControlSize = uac2 ? 4 : data[5];
         LOG_DEBUG("\t got FEATURE_UNIT %d: bSourceId=0x%x", unit->bUnitID, unit->bSourceId);
         return unit;
     }
 
     uac_format_type_1* parse_as_format_type_1_3(const uint8_t *data, int size, bool uac2) {
-        // Some UAC devices (including the Meizu DAC seen on VIVO) expose a
-        // truncated six-byte FORMAT_TYPE descriptor and omit the sampling-rate
-        // fields entirely.  Do not read past the descriptor; infer the PCM bit
-        // depth from the subframe size and treat the rate as device-continuous.
+        // UAC2 Type I has a fixed six-byte descriptor; channels live in
+        // AS_GENERAL and rates are supplied by the linked clock source.
         const bool truncated = size < 8;
-        uint8_t bSamFreqType = truncated ? 0 : data[7];
+        uint8_t bSamFreqType = (uac2 || truncated) ? 0 : data[7];
         uac_format_type_1 *desc = (uac_format_type_1*) malloc(
                 sizeof(uac_format_type_1) + sizeof(uint32_t) * bSamFreqType);
         desc->bFormatType = (uac_format_type) data[3];
-        if (uac2 && size == 6) {
-            // This DAC emits a non-compliant six-byte descriptor retaining
-            // the UAC1 field order: format, channels, bit resolution.
-            desc->bNrChannels = data[4];
+        if (uac2) {
+            desc->bNrChannels = 0; // filled from the UAC2 AS_GENERAL descriptor
+            desc->bSubframeSize = size > 4 ? data[4] : 0;
             desc->bBitResolution = data[5];
-            desc->bSubframeSize = (uint8_t)std::max(1, (int)desc->bBitResolution / 8);
         } else {
             desc->bNrChannels = size > 4 ? data[4] : 0;
             desc->bSubframeSize = size > 5 ? data[5] : 0;
@@ -358,13 +388,10 @@ namespace uac {
                   desc->bNrChannels, desc->bSubframeSize, desc->bBitResolution, bSamFreqType);
         if (desc->bSamFreqType == 0) {
             if (uac2) {
-                if (size < 16) {
-                    desc->tLowerSamFreq = 8000;
-                    desc->tUpperSamFreq = 384000;
-                } else {
-                    desc->tLowerSamFreq = TO_DWORD(data + 8);
-                    desc->tUpperSamFreq = TO_DWORD(data + 12);
-                }
+                // The exact UAC2 range is a runtime Clock Source GET_RANGE
+                // property, not part of this descriptor.
+                desc->tLowerSamFreq = 8000;
+                desc->tUpperSamFreq = 384000;
             } else {
                 if (size < 14) {
                     desc->tLowerSamFreq = 8000;
@@ -390,14 +417,16 @@ namespace uac {
     void parse_as_general(uac_as_general &generalDesc, const uint8_t *data, int size, bool uac2) {
         generalDesc.bTerminalLink = data[3];
         if (uac2) {
-            // UAC2 uses bmControls at byte 4 and a four-byte format code at
-            // bytes 5..8. A few DACs report the PCM code as 0x0101; the low
-            // byte is still the UAC PCM identifier (0x01).
+            // UAC2 AS_GENERAL: bFormatType is byte 5, bmFormats is bytes 6..9,
+            // and the channel cluster follows it. For Type I, bmFormats bit 0
+            // denotes PCM.
             generalDesc.bDelay = 0;
-            const uint32_t formatCode = size >= 9 ? TO_DWORD(data + 5) : TO_WORD(data + 5);
-            generalDesc.wFormatTag = (formatCode & 0xffu) == 0x01u
+            const uint32_t formats = size >= 10 ? (uint32_t)TO_DWORD(data + 6) : 0;
+            generalDesc.wFormatTag = (formats & 0x01u) != 0
                     ? UAC_FORMAT_DATA_PCM
-                    : (uac_audio_data_format_type)(formatCode & 0xffffu);
+                    : UAC_FORMAT_DATA_TYPE_I_UNDEFINED;
+            generalDesc.bNrChannels = size >= 11 ? data[10] : 0;
+            generalDesc.bmChannelConfig = size >= 15 ? (uint32_t)TO_DWORD(data + 11) : 0;
         } else {
             generalDesc.bDelay = data[4];
             generalDesc.wFormatTag = (uac_audio_data_format_type) TO_WORD(data+5);
@@ -423,33 +452,46 @@ namespace uac {
 
     void parse_iso_ep(iso_endpoint_desc& desc, const uint8_t *data, int size) {
         int remaining = size;
-        while (remaining > 3) {
+        while (remaining >= 3) {
             int length = data[0];
-            remaining -= length;
-            if (data[2] == EP_GENERAL) {
+            if (length < 3 || length > remaining) {
+                LOG_WARN("Invalid class-specific endpoint descriptor length=%d remaining=%d", length, remaining);
+                break;
+            }
+            if (data[2] == EP_GENERAL && length >= 7) {
                 desc.bmAttributes = data[3];
                 desc.bLockDelayUnits = data[4];
                 desc.wLockDelay = TO_WORD(data + 5);
             }
+            data += length;
+            remaining -= length;
         }
         
     }
 
     void parse_audiostreaming_intf(uac_stream_if_impl &stream_if, const libusb_interface_descriptor *altsettings, int num_altsetting, bool uac2) {
-        // skip altsetting 0, because it is non-configurable
-        for (size_t i = 1; i < num_altsetting; ++i) {
+        stream_if.uac2 = uac2;
+        for (size_t i = 0; i < num_altsetting; ++i) {
             auto ifdesc = &altsettings[i];
+            // The zero-bandwidth alternate setting has no data endpoint.
+            if (ifdesc->bAlternateSetting == 0 && ifdesc->bNumEndpoints == 0)
+                continue;
             LOG_DEBUG("parsing altsetting=%d descriptor...", ifdesc->bAlternateSetting);
             auto& altsetting = stream_if.altsettings.emplace_back();
             auto data = ifdesc->extra;
             int remaining = ifdesc->extra_length;
 
             altsetting.bAlternateSetting = ifdesc->bAlternateSetting;
+            altsetting.uac2 = uac2;
 
             bool hasGeneralDescriptor = false;
             bool hasFormatDescriptor = false;
             while (remaining >= 3) {
                 int descSize = data[0];
+                if (descSize < 3 || descSize > remaining) {
+                    LOG_WARN("Bad AS descriptor size %d (remaining %d)", descSize, remaining);
+                    break;
+                }
                 auto subtype = data[2];
                 switch (subtype) {
                 case UAC_AS_GENERAL:
@@ -458,9 +500,13 @@ namespace uac {
                     hasGeneralDescriptor = true;
                     break;
                 case UAC_AS_FORMAT_TYPE:
-                    LOG_DEBUG("got AS_FORMAT_TYPE descriptor");
-                    altsetting.formatTypeDesc = parse_as_format_type(data, descSize, uac2);
-                    hasFormatDescriptor = true;
+                    if (descSize >= 6) {
+                        LOG_DEBUG("got AS_FORMAT_TYPE descriptor");
+                        altsetting.formatTypeDesc = parse_as_format_type(data, descSize, uac2);
+                        hasFormatDescriptor = true;
+                    } else {
+                        LOG_WARN("AS_FORMAT_TYPE descriptor too short: %d", descSize);
+                    }
                     break;
                 case UAC_AS_FORMAT_SPECIFIC:
                     LOG_DEBUG("got AS_FORMAT_SPECIFIC descriptor");
@@ -472,26 +518,45 @@ namespace uac {
                 data += descSize;
             }
 
+            if (uac2 && hasGeneralDescriptor && hasFormatDescriptor) {
+                auto *format = const_cast<uac_format_type_1 *>(altsetting.getFormatType1());
+                if (format != nullptr && altsetting.general.bNrChannels != 0)
+                    format->bNrChannels = altsetting.general.bNrChannels;
+            }
+
             if (!hasGeneralDescriptor || !hasFormatDescriptor || ifdesc->bNumEndpoints == 0) {
                 stream_if.altsettings.pop_back();
                 continue;
             }
             
-            if (ifdesc->bNumEndpoints != 1) {
-                stream_if.altsettings.pop_back();
-                LOG_ERROR("Invalid number of endpoints in this interface(%d): %d", i, ifdesc->bNumEndpoints);
-            } else {
-                LOG_DEBUG("altsetting endpointAddress=%x, wMaxPacketSize=%d", ifdesc->endpoint->bEndpointAddress, ifdesc->endpoint->wMaxPacketSize);
-                auto& epDesc = altsetting.endpoint;
-                epDesc.bEndpointAddress = ifdesc->endpoint->bEndpointAddress;
-                epDesc.bInterval = ifdesc->endpoint->bInterval;
-                epDesc.wMaxPacketSize = ifdesc->endpoint->wMaxPacketSize;
-                if ((ifdesc->endpoint->bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) == LIBUSB_TRANSFER_TYPE_ISOCHRONOUS) {
-                    parse_iso_ep(epDesc.iso_desc, ifdesc->endpoint->extra, ifdesc->endpoint->extra_length);
-                } else {
-                    LOG_DEBUG("Unsupported transfer type.");
-                    stream_if.altsettings.pop_back();
+            const libusb_endpoint_descriptor *dataEndpoint = nullptr;
+            for (uint8_t epIndex = 0; epIndex < ifdesc->bNumEndpoints; ++epIndex) {
+                const auto *candidate = &ifdesc->endpoint[epIndex];
+                const bool isIso = (candidate->bmAttributes & LIBUSB_TRANSFER_TYPE_MASK)
+                                   == LIBUSB_TRANSFER_TYPE_ISOCHRONOUS;
+                // Bits 5..4 are the isochronous usage type.  Explicit feedback
+                // endpoints (01b) are not audio data endpoints.
+                const bool isFeedback = (candidate->bmAttributes & 0x30u) == 0x10u;
+                if (isIso && !isFeedback) {
+                    dataEndpoint = candidate;
+                    break;
                 }
+            }
+            if (dataEndpoint == nullptr) {
+                stream_if.altsettings.pop_back();
+                LOG_ERROR("No isochronous data endpoint in interface(%d), endpoints=%d",
+                          i, ifdesc->bNumEndpoints);
+            } else {
+                LOG_DEBUG("altsetting endpointAddress=%x, wMaxPacketSize=%d, endpoints=%d",
+                          dataEndpoint->bEndpointAddress, dataEndpoint->wMaxPacketSize,
+                          ifdesc->bNumEndpoints);
+                auto& epDesc = altsetting.endpoint;
+                epDesc.bEndpointAddress = dataEndpoint->bEndpointAddress;
+                epDesc.bInterval = dataEndpoint->bInterval;
+                const uint16_t rawMaxPacket = dataEndpoint->wMaxPacketSize;
+                epDesc.wMaxPacketSize = (rawMaxPacket & 0x07ffu) *
+                        (uint16_t)(1u + ((rawMaxPacket >> 11) & 0x03u));
+                parse_iso_ep(epDesc.iso_desc, dataEndpoint->extra, dataEndpoint->extra_length);
             }
         }
         

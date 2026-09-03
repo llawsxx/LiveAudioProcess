@@ -46,6 +46,7 @@ namespace uac {
         std::unique_ptr<uac_audiocontrol> audiocontrol;
 
         friend class uac_device_handle_impl;
+        friend class uac_stream_handle_impl;
 
         // device quirks
         bool quirk_swap_channels = false;

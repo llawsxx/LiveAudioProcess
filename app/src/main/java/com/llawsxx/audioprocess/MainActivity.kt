@@ -100,6 +100,7 @@ private val Muted = Color(0xFF8EA0A8)
 private val Teal = Color(0xFF43D5C1)
 private val Amber = Color(0xFFFFC857)
 private val Red = Color(0xFFFF6B6B)
+private val UsbBurstPacketOptions = listOf(1, 2, 4, 8, 16, 24, 32, 48, 64, 128)
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun LiveAudioProcessApp() {
@@ -151,10 +152,10 @@ private fun LiveAudioProcessApp() {
     }
     val legacyUsbBurstPackets = prefs.getInt("usbBurstPackets", 8)
     var usbInputBurstPackets by remember {
-        mutableIntStateOf(prefs.getInt("usbInputBurstPackets", legacyUsbBurstPackets).takeIf { it == 1 || it == 2 || it == 4 || it == 8 || it == 16 } ?: 8)
+        mutableIntStateOf(prefs.getInt("usbInputBurstPackets", legacyUsbBurstPackets).takeIf { it in UsbBurstPacketOptions } ?: 8)
     }
     var usbOutputBurstPackets by remember {
-        mutableIntStateOf(prefs.getInt("usbOutputBurstPackets", legacyUsbBurstPackets).takeIf { it == 1 || it == 2 || it == 4 || it == 8 || it == 16 } ?: 8)
+        mutableIntStateOf(prefs.getInt("usbOutputBurstPackets", legacyUsbBurstPackets).takeIf { it in UsbBurstPacketOptions } ?: 8)
     }
     var usbStats by remember { mutableStateOf(LongArray(18)) }
     var inputInfo by remember { mutableStateOf(LongArray(14)) }

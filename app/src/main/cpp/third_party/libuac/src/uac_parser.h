@@ -51,6 +51,15 @@
                       (((int64_t)(p)[7]) << 56))
 
 namespace uac {
+
+    struct uac_clock_source {
+        uint8_t bClockID = 0;
+        uint8_t bmAttributes = 0;
+        uint8_t bmControls = 0;
+
+        bool frequencyReadable() const { return (bmControls & 0x03u) != 0; }
+        bool frequencyWritable() const { return (bmControls & 0x03u) == 0x03u; }
+    };
     
     struct uac_topology_entity {
         uac_topology_entity* sink = nullptr;
@@ -101,6 +110,8 @@ namespace uac {
         uac_as_general general;
         uac_endpoint_desc endpoint;
         std::unique_ptr<uac_format_type_desc> formatTypeDesc;
+        bool uac2 = false;
+        uint8_t bClockSourceID = 0;
 
         const uac_format_type_1* getFormatType1() const;
         bool supportsSampleRate(uint32_t sampleRate) const;
@@ -123,6 +134,7 @@ namespace uac {
 
         uint8_t bInterfaceNr;
         bool highSpeed = false;
+        bool uac2 = false;
         std::vector<uac_altsetting> altsettings;
     };
 
@@ -141,6 +153,7 @@ namespace uac {
         std::vector<std::shared_ptr<uac_input_terminal>> inputTerminals;
         std::vector<std::shared_ptr<uac_output_terminal>> outputTerminals;
         std::vector<std::shared_ptr<uac_unit>> units;
+        std::vector<uac_clock_source> clockSources;
 
         const uint8_t bInterfaceNumber;
         const uint8_t iInterface;
@@ -155,8 +168,8 @@ namespace uac {
     std::unique_ptr<uac_audiocontrol> uac_scan_device(libusb_device *udev);
 
     void parse_ac_header(uac_audiocontrol& ac, const uint8_t *data, int size);
-    std::shared_ptr<uac_input_terminal> parse_input_terminal(const uint8_t *data, int size);
-    std::shared_ptr<uac_output_terminal> parse_output_terminal(const uint8_t *data, int size);
+    std::shared_ptr<uac_input_terminal> parse_input_terminal(const uint8_t *data, int size, bool uac2 = false);
+    std::shared_ptr<uac_output_terminal> parse_output_terminal(const uint8_t *data, int size, bool uac2 = false);
     std::shared_ptr<uac_mixer_unit> parse_mixer_unit(const uint8_t *data, int size);
-    std::shared_ptr<uac_feature_unit> parse_feature_unit(const uint8_t *data, int size);
+    std::shared_ptr<uac_feature_unit> parse_feature_unit(const uint8_t *data, int size, bool uac2 = false);
 }

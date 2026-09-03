@@ -236,6 +236,10 @@ namespace uac {
         uint32_t tSampleRate;
         uint8_t bInterval;
         bool highSpeed;
+        // True when the configuration came from a USB Audio Class 2
+        // descriptor.  Kept at the end for source compatibility with older
+        // aggregate initializers.
+        bool uac2 = false;
     };
 
     struct uac_audio_config_compressed {

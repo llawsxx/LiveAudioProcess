@@ -33,9 +33,7 @@ namespace uac {
                 // For an OUT endpoint the callback supplies the next payload.
                 // IN endpoints keep the original per-packet delivery behavior.
                 if ((strmh->altsetting.endpoint.bEndpointAddress & 0x80) == 0) {
-                    if (strmh->cb_func) {
-                        strmh->cb_func(transfer->buffer, transfer->length);
-                    }
+                    strmh->prepare_output_transfer(transfer);
                 } else for (int packet_id = 0; packet_id < transfer->num_iso_packets; ++packet_id) {
                     libusb_iso_packet_descriptor* packet = transfer->iso_packet_desc + packet_id;
                     //LOG_DEBUG("packet %d actual_len=%u", packet_id, packet->actual_length);
@@ -204,15 +202,16 @@ namespace uac {
                             setting.endpoint.wMaxPacketSize,
                             sampleRate,
                             setting.endpoint.bInterval,
-                            highSpeed
+                            highSpeed,
+                            setting.uac2
                             });
             }
         }
         return {nullptr};
     }
 
-    uac_stream_handle_impl::uac_stream_handle_impl(const std::shared_ptr<uac_device_handle_impl>& dev_handle, uint8_t interfaceNr, const uac_altsetting& altsetting) :
-        dev_handle(dev_handle), bInterfaceNr(interfaceNr), altsetting(altsetting), mActiveTransfers(0) {
+    uac_stream_handle_impl::uac_stream_handle_impl(const std::shared_ptr<uac_device_handle_impl>& dev_handle, uint8_t interfaceNr, const uac_altsetting& altsetting, uint8_t clockSourceId, bool clockFrequencyReadable, bool clockFrequencyWritable) :
+        dev_handle(dev_handle), altsetting(altsetting), bInterfaceNr(interfaceNr), mActiveTransfers(0), clockSourceId(clockSourceId), clockFrequencyReadable(clockFrequencyReadable), clockFrequencyWritable(clockFrequencyWritable) {
 
         int errval;
         LOG_DEBUG("claim AS intf(%d)", bInterfaceNr);
@@ -221,7 +220,7 @@ namespace uac {
             throw usb_exception_impl("libusb_claim_interface()", (libusb_error)errval);
         }
         uac_format_type_1 *format = (uac_format_type_1*) altsetting.formatTypeDesc.get();
-        target_sampling_rate = format->tSamFreq[0];
+        target_sampling_rate = format->bSamFreqType ? format->tSamFreq[0] : format->tLowerSamFreq;
         stride = format->bSubframeSize * format->bNrChannels;
 
         if (dev_handle->device->hasQuirkSwapChannels()) {
@@ -247,7 +246,14 @@ namespace uac {
         const int transfer_size = iso_packets * wMaxPacketSize;
         LOG_DEBUG("configure iso packets: wMaxPacketSize=%d, transfer_size=%d", wMaxPacketSize, transfer_size);
         auto bmAttributes = altsetting.endpoint.iso_desc.bmAttributes;
-        if (bmAttributes & SAMPLING_FREQ_CONTROL) { // the endpoints supports sampling frequency, so probe it
+        if (altsetting.uac2 && clockSourceId != 0 && clockFrequencyReadable) {
+            uint32_t current = get_sampling_freq();
+            if (current != target_sampling_rate && !clockFrequencyWritable) {
+                throw std::runtime_error("UAC2 clock source is read-only at a different sample rate");
+            }
+        }
+        if ((!altsetting.uac2 && (bmAttributes & SAMPLING_FREQ_CONTROL)) ||
+            (altsetting.uac2 && clockSourceId != 0 && clockFrequencyWritable)) {
             set_sampling_freq(target_sampling_rate);
         }
 
@@ -258,6 +264,16 @@ namespace uac {
         }
 
         mActiveTransfers = 0;
+        if ((altsetting.endpoint.bEndpointAddress & 0x80) == 0) {
+            const int speed = libusb_get_device_speed(libusb_get_device(dev_handle->usb_handle));
+            const uint32_t baseIntervalUs = speed >= LIBUSB_SPEED_HIGH ? 125u : 1000u;
+            const uint32_t intervalShift = std::min<uint32_t>(15u,
+                    altsetting.endpoint.bInterval > 0 ? altsetting.endpoint.bInterval - 1u : 0u);
+            outputPacketStep = (uint64_t)target_sampling_rate * (baseIntervalUs << intervalShift);
+            outputPacketNumerator.store(0, std::memory_order_relaxed);
+            LOG_DEBUG("OUT packet scheduler rate=%u interval=%u us stride=%u max=%u",
+                      target_sampling_rate, baseIntervalUs << intervalShift, stride, wMaxPacketSize);
+        }
         // Transfers can complete immediately after submission. Mark the stream
         // active first so an early callback resubmits instead of withering.
         active = true;
@@ -274,10 +290,10 @@ namespace uac {
             memset(buffer, 0, transfer_size);
 
             libusb_fill_iso_transfer(transfer, dev_handle->usb_handle, altsetting.endpoint.bEndpointAddress, buffer, transfer_size, iso_packets, cb, this, 1000);
-            libusb_set_iso_packet_lengths(transfer, wMaxPacketSize);
-            if ((altsetting.endpoint.bEndpointAddress & 0x80) == 0 && cb_func) {
-                cb_func(buffer, transfer_size);
-            }
+            if ((altsetting.endpoint.bEndpointAddress & 0x80) == 0)
+                prepare_output_transfer(transfer);
+            else
+                libusb_set_iso_packet_lengths(transfer, wMaxPacketSize);
             errval = libusb_submit_transfer(transfer);
             LOG_DEBUG("submit transfer %d... %s", i, libusb_error_name(errval));
             if (errval == LIBUSB_SUCCESS) {
@@ -294,6 +310,30 @@ namespace uac {
             libusb_set_interface_alt_setting(dev_handle->usb_handle, bInterfaceNr, 0);
             throw std::runtime_error("No transfers submitted!");
         }
+    }
+
+    void uac_stream_handle_impl::prepare_output_transfer(libusb_transfer *transfer) {
+        uint32_t totalBytes = 0;
+        const uint32_t maxPacket = altsetting.endpoint.wMaxPacketSize;
+        for (int packetId = 0; packetId < transfer->num_iso_packets; ++packetId) {
+            const uint64_t previous = outputPacketNumerator.fetch_add(
+                    outputPacketStep, std::memory_order_relaxed);
+            const uint64_t next = previous + outputPacketStep;
+            uint64_t frames = next / 1000000u - previous / 1000000u;
+            uint64_t bytes = frames * stride;
+            if (bytes > maxPacket) {
+                uint64_t count = packetErrors.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (count == 1 || count % 100 == 0)
+                    LOG_WARN("scheduled OUT packet exceeds endpoint capacity: %llu > %u",
+                             (unsigned long long)bytes, maxPacket);
+                bytes = maxPacket - (maxPacket % std::max<uint32_t>(1, stride));
+            }
+            transfer->iso_packet_desc[packetId].length = (unsigned int)bytes;
+            totalBytes += (uint32_t)bytes;
+        }
+        transfer->length = (int)totalBytes;
+        if (cb_func && totalBytes > 0)
+            cb_func(transfer->buffer, totalBytes);
     }
 
     void uac_stream_handle_impl::stop() {
@@ -327,7 +367,7 @@ namespace uac {
     void uac_stream_handle_impl::set_sampling_rate(const uint32_t samplingRate) {
         if (samplingRate == 0) {
             uac_format_type_1 *format = (uac_format_type_1*) altsetting.formatTypeDesc.get();
-            target_sampling_rate = format->tSamFreq[0];
+            target_sampling_rate = format->bSamFreqType ? format->tSamFreq[0] : format->tLowerSamFreq;
         } else {
             target_sampling_rate = samplingRate;
         }
@@ -335,18 +375,24 @@ namespace uac {
 
     void uac_stream_handle_impl::set_sampling_freq(uint32_t sampling) {
         const int cs = SAMPLING_FREQ_CONTROL;
+        const bool uac2 = altsetting.uac2;
         const int ep = altsetting.endpoint.bEndpointAddress;
-        uint8_t data[3] = H_DWORD24(sampling);
+        uint8_t data[4] = {
+            (uint8_t)(sampling & 0xffu),
+            (uint8_t)((sampling >> 8) & 0xffu),
+            (uint8_t)((sampling >> 16) & 0xffu),
+            (uint8_t)((sampling >> 24) & 0xffu)
+        };
 
         LOG_DEBUG("set_sampling_freq (%d)", sampling);
         int errval = libusb_control_transfer(
             dev_handle->usb_handle,
-            REQ_TYPE_EP_SET,
+            uac2 ? REQ_TYPE_IF_SET : REQ_TYPE_EP_SET,
             REQ_SET_CUR,
             cs << 8,
-            ep,
+            uac2 ? ((int)clockSourceId << 8 | dev_handle->device->audiocontrol->bInterfaceNumber) : ep,
             (uint8_t*) &data,
-            sizeof(data),
+            uac2 ? 4 : 3,
             0 /* timeout */);
 
         if (errval < 0)
@@ -356,22 +402,23 @@ namespace uac {
     uint32_t uac_stream_handle_impl::get_sampling_freq() {
         const int cs = SAMPLING_FREQ_CONTROL;
         const int ep = altsetting.endpoint.bEndpointAddress;
-        uint8_t data[3];
+        uint8_t data[4]{};
+        const bool uac2 = altsetting.uac2;
 
         int errval = libusb_control_transfer(
             dev_handle->usb_handle,
-            REQ_TYPE_EP_GET,
-            REQ_GET_CUR,
+            uac2 ? REQ_TYPE_IF_GET : REQ_TYPE_EP_GET,
+            uac2 ? REQ_SET_CUR : REQ_GET_CUR,
             cs << 8,
-            ep,
+            uac2 ? ((int)clockSourceId << 8 | dev_handle->device->audiocontrol->bInterfaceNumber) : ep,
             (uint8_t *)&data,
-            sizeof(data),
+            uac2 ? 4 : 3,
             0 /* timeout */);
 
         if (errval < 0)
             throw usb_exception_impl("get_sampling_freq()", (libusb_error)errval);
 
-        uint32_t samplingFreq = TO_DWORD24(data);
+        uint32_t samplingFreq = uac2 ? (uint32_t)TO_DWORD(data) : TO_DWORD24(data);
         LOG_DEBUG("get_sampling_freq (%d)", samplingFreq);
         return samplingFreq;
     }

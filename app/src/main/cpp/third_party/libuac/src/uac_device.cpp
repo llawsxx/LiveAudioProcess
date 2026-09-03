@@ -174,7 +174,38 @@ namespace uac {
             throw usb_exception_impl("libusb_claim_interface()", (libusb_error)errval);
         }
 
-        auto streamHandle = std::make_shared<uac_stream_handle_impl>(shared_from_this(), streamIfImpl->bInterfaceNr, altsetting);
+        uint8_t clockSourceId = 0;
+        bool clockReadable = false;
+        bool clockWritable = false;
+        if (device->audiocontrol->uac2) {
+            for (const auto &terminal : device->audiocontrol->inputTerminals) {
+                if (terminal->bTerminalID == altsetting.general.bTerminalLink) {
+                    clockSourceId = terminal->bCSourceID;
+                    break;
+                }
+            }
+            if (clockSourceId == 0) {
+                for (const auto &terminal : device->audiocontrol->outputTerminals) {
+                    if (terminal->bTerminalID == altsetting.general.bTerminalLink) {
+                        clockSourceId = terminal->bCSourceID;
+                        break;
+                    }
+                }
+            }
+            for (const auto &clock : device->audiocontrol->clockSources) {
+                if (clock.bClockID == clockSourceId) {
+                    clockReadable = clock.frequencyReadable();
+                    clockWritable = clock.frequencyWritable();
+                    break;
+                }
+            }
+            LOG_DEBUG("UAC2 stream clock source=%u readable=%d writable=%d",
+                      clockSourceId, clockReadable, clockWritable);
+        }
+
+        auto streamHandle = std::make_shared<uac_stream_handle_impl>(
+                shared_from_this(), streamIfImpl->bInterfaceNr, altsetting,
+                clockSourceId, clockReadable, clockWritable);
         streamHandle->set_sampling_rate(config.tSampleRate);
         streamHandle->start(cb_func, burst);
         return streamHandle;

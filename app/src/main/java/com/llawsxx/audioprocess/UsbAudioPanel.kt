@@ -185,7 +185,7 @@ private fun BurstChoice(
         modifier = Modifier.horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        listOf(1, 2, 4, 8, 16).forEach { packets ->
+        listOf(1, 2, 4, 8, 16, 24, 32, 48 ,64, 128).forEach { packets ->
             FilterChip(
                 selected = selectedPackets == packets,
                 onClick = { onSelected(packets) },

@@ -111,7 +111,7 @@ class AudioEngine(private val context: Context) {
         }
     }
     fun configureUsbBursts(inputPackets: Int, outputPackets: Int) {
-        fun normalize(value: Int) = value.takeIf { it == 1 || it == 2 || it == 4 || it == 8 || it == 16 } ?: 8
+        fun normalize(value: Int) = value.takeIf { it == 1 || it == 2 || it == 4 || it == 8 || it == 16 || it == 24  || it == 32  || it == 48  || it == 64  || it == 128 } ?: 8
         val normalizedInput = normalize(inputPackets)
         val normalizedOutput = normalize(outputPackets)
         if (usbInputBurstPackets == normalizedInput && usbOutputBurstPackets == normalizedOutput) return

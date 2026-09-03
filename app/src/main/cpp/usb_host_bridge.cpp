@@ -30,8 +30,8 @@ class UsbHostAudio {
 public:
     UsbHostAudio(int fd, int rate, int bitDepth, bool in, bool out, int outputMaxBufferMs,
                  int processingFrames, int inputBurstPackets, int outputBurstPackets)
-        : rate_(rate), bitDepth_(bitDepth), inputBurstPackets_(std::clamp(inputBurstPackets, 1, 16)),
-          outputBurstPackets_(std::clamp(outputBurstPackets, 1, 16)), inputRing_(kRingFrames * 2),
+        : rate_(rate), bitDepth_(bitDepth), inputBurstPackets_(std::clamp(inputBurstPackets, 1, 128)),
+          outputBurstPackets_(std::clamp(outputBurstPackets, 1, 128)), inputRing_(kRingFrames * 2),
           outputRing_(kRingFrames * 2) {
         processingFrames_ = std::max(1, processingFrames);
         outputMaxBufferMs_.store(std::clamp(outputMaxBufferMs, 5, 200), std::memory_order_relaxed);
@@ -184,16 +184,16 @@ private:
         if(!cfg) cfg=findCompatibleConfig(si, 1, rate, bitDepth_);
         if(!cfg) { USB_HOST_LOGE("USB output: no compatible PCM format requested=%d Hz/%d-bit", rate, bitDepth_); return; }
         int bytes=cfg->bSubframeSize,ch=cfg->bChannelCount;
-        const uint32_t packetFrames = (uint32_t)cfg->wMaxPacketSize / (uint32_t)std::max(1, bytes * ch);
         const uint32_t packetIntervalUs = cfg->highSpeed
                 ? (125u << std::max(0, (int)cfg->bInterval - 1))
                 : (1000u << std::max(0, (int)cfg->bInterval - 1));
-        const uint32_t physicalRate = packetIntervalUs > 0
-                ? (packetFrames * 1000000u) / packetIntervalUs : rate;
-        outputRateScale_ = std::max<uint32_t>(1, (physicalRate + (uint32_t)rate - 1u) / (uint32_t)std::max(1, rate));
-        outputTransferFrames_=(outputBurstPackets_*packetFrames + outputRateScale_ - 1u) / outputRateScale_;
+        const uint32_t packetFrames = packetIntervalUs > 0
+                ? (uint32_t)(((uint64_t)(uint32_t)rate * packetIntervalUs + 999999u) / 1000000u) : 1u;
+        outputRateScale_ = 1;
+        outputTransferFrames_=outputBurstPackets_*packetFrames;
         outputResamplePhase_ = 0;
-        USB_HOST_LOGI("USB output timing packetFrames=%u intervalUs=%u physicalRate=%u resample=%u", packetFrames, packetIntervalUs, physicalRate, outputRateScale_);
+        USB_HOST_LOGI("USB output timing packetFrames<=%u intervalUs=%u endpointCapacity=%u bytes",
+                      packetFrames, packetIntervalUs, cfg->wMaxPacketSize);
         updateOutputBufferFrames();
         outputStream_=device_->start_streaming(si,*cfg,[this,bytes,ch](uint8_t*d,uint n){onOutput(d,n,bytes,ch);},outputBurstPackets_);
         outputSampleRate_=cfg->tSampleRate;outputBitResolution_=cfg->bBitResolution;outputChannels_=cfg->bChannelCount;

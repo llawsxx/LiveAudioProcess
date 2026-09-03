@@ -105,6 +105,8 @@ namespace uac {
         uint16_t wChannelConfig;
         uint8_t  iChannelNames;
         uint8_t  iTerminal;
+        // UAC2 clock source association (zero for UAC1 descriptors).
+        uint8_t  bCSourceID = 0;
     };
 
     /**
@@ -116,6 +118,8 @@ namespace uac {
         uint8_t  bAssocTerminal;
         uint8_t  bSourceID;
         uint8_t  iTerminal;
+        // UAC2 clock source association (zero for UAC1 descriptors).
+        uint8_t  bCSourceID = 0;
     };
 
     /**
@@ -166,6 +170,8 @@ namespace uac {
         uint8_t  bTerminalLink;
         uint8_t  bDelay;
         uint16_t wFormatTag;
+        uint8_t  bNrChannels = 0;
+        uint32_t bmChannelConfig = 0;
     };
 
     /**

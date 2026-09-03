@@ -1613,8 +1613,8 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
         g.usb_audio = usb_host_audio_start(usbFd, rate, usbBitDepth, g.usb_input_host, g.usb_output_host,
                                            g.usb_buffer_max_ms,
                                            frames,
-                                           usbInputBurstPackets < 1 ? 1 : (usbInputBurstPackets > 16 ? 16 : usbInputBurstPackets),
-                                           usbOutputBurstPackets < 1 ? 1 : (usbOutputBurstPackets > 16 ? 16 : usbOutputBurstPackets));
+                                           usbInputBurstPackets < 1 ? 1 : (usbInputBurstPackets > 128 ? 128 : usbInputBurstPackets),
+                                           usbOutputBurstPackets < 1 ? 1 : (usbOutputBurstPackets > 128 ? 128 : usbOutputBurstPackets));
         if (!g.usb_audio) { LOGE("USB Host audio initialization failed"); return JNI_FALSE; }
         usb_host_audio_configure_input_buffer(g.usb_audio, atomic_load(&g.usb_input_buffer_max_ms));
         if (g.usb_input_host) g.in_channels = 2;
