@@ -127,7 +127,7 @@ typedef struct {
     NetAacJitterSlot *net_aac_jitter;
     usb_host_audio_t usb_audio;
     int usb_input_host, usb_output_host;
-    int usb_buffer_min_ms, usb_buffer_max_ms;
+    int usb_buffer_max_ms;
     atomic_int usb_input_buffer_max_ms;
     atomic_int output_buffer_max_ms;
     float *input_ring;
@@ -166,7 +166,6 @@ typedef struct {
 static Engine g = {
     .net_sock = -1,
     .net_listen_sock = -1,
-    .usb_buffer_min_ms = 16,
     .usb_buffer_max_ms = 50,
     .output_buffer_max_ms = ATOMIC_VAR_INIT(40),
     .usb_input_buffer_max_ms = ATOMIC_VAR_INIT(20),
@@ -1612,7 +1611,8 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
     atomic_store(&g.reverb_worker_started,0);
     if(usbFd >= 0 && (g.usb_input_host || g.usb_output_host)) {
         g.usb_audio = usb_host_audio_start(usbFd, rate, usbBitDepth, g.usb_input_host, g.usb_output_host,
-                                           g.usb_buffer_min_ms, g.usb_buffer_max_ms,
+                                           g.usb_buffer_max_ms,
+                                           frames,
                                            usbInputBurstPackets < 1 ? 1 : (usbInputBurstPackets > 16 ? 16 : usbInputBurstPackets),
                                            usbOutputBurstPackets < 1 ? 1 : (usbOutputBurstPackets > 16 ? 16 : usbOutputBurstPackets));
         if (!g.usb_audio) { LOGE("USB Host audio initialization failed"); return JNI_FALSE; }
@@ -1811,7 +1811,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
     atomic_store(&g.net_role,role);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_TRUE;
 }
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearNetwork(JNIEnv*e,jobject o){(void)e;(void)o;if(g.net_sock>=0)close(g.net_sock);if(g.net_listen_sock>=0)close(g.net_listen_sock);g.net_sock=g.net_listen_sock=-1;g.net_tcp_connecting=0;g.net_tcp_next_connect_ns=0;g.net_rx_used=g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);atomic_store(&g.net_role,0);g.net_send_count=0;network_clear_jitter_state();pthread_mutex_lock(&g.net_codec_lock);wifi_aac_destroy(g.net_aac);g.net_aac=NULL;pthread_mutex_unlock(&g.net_codec_lock);}
-JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureUsbOutputBuffer(JNIEnv*e,jobject o,jint minMs,jint maxMs){(void)e;(void)o;g.usb_buffer_min_ms=minMs<8?8:(minMs>200?200:minMs);g.usb_buffer_max_ms=maxMs<8?8:(maxMs>500?500:maxMs);if(g.usb_buffer_max_ms<g.usb_buffer_min_ms)g.usb_buffer_max_ms=g.usb_buffer_min_ms;usb_host_audio_configure_output_buffer(g.usb_audio,g.usb_buffer_min_ms,g.usb_buffer_max_ms);}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureUsbOutputBuffer(JNIEnv*e,jobject o,jint maxMs){(void)e;(void)o;g.usb_buffer_max_ms=maxMs<5?5:(maxMs>200?200:maxMs);usb_host_audio_configure_output_buffer(g.usb_audio,g.usb_buffer_max_ms);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureOutputBufferMaxMs(JNIEnv*e,jobject o,jint maxMs){(void)e;(void)o;int normalized=maxMs<5?5:(maxMs>200?200:maxMs);atomic_store(&g.output_buffer_max_ms,normalized);output_ring_update_limits(g.rate,g.frames);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureInputBufferMaxMs(JNIEnv*e,jobject o,jint maxMs){(void)e;(void)o;int normalized=maxMs<5?5:(maxMs>200?200:maxMs);atomic_store(&g.input_buffer_max_ms,normalized);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureUsbInputBuffer(JNIEnv*e,jobject o,jint maxMs){(void)e;(void)o;int normalized=maxMs<5?5:(maxMs>200?200:maxMs);atomic_store(&g.usb_input_buffer_max_ms,normalized);usb_host_audio_configure_input_buffer(g.usb_audio,normalized);}

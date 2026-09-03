@@ -140,7 +140,6 @@ private fun LiveAudioProcessApp() {
     var wifiTransport by remember { mutableIntStateOf(prefs.getInt("wifiTransport", 0).coerceIn(0, 1)) }
     var wifiCodec by remember { mutableIntStateOf(prefs.getInt("wifiCodec", 0).coerceIn(0, 1)) }
     var wifiAacBitrate by remember { mutableIntStateOf(prefs.getInt("wifiAacBitrate", 128_000).takeIf { it in listOf(64_000, 96_000, 128_000, 192_000, 256_000, 320_000) } ?: 128_000) }
-    var usbMinBuffer by remember { mutableStateOf(prefs.getInt("usbMinBuffer", 16).toString()) }
     var usbMaxBuffer by remember { mutableStateOf(prefs.getInt("usbMaxBuffer", 50).toString()) }
     var usbInputBufferMaxMs by remember { mutableStateOf(prefs.getInt("usbInputBufferMaxMs", 20).coerceIn(5, 200).toString()) }
     var usbBitDepth by remember {
@@ -236,14 +235,12 @@ private fun LiveAudioProcessApp() {
         engine.configureTone(input == InputSource.TEST_TONE)
         if (input == InputSource.TEST_TONE) engine.refreshNativeParameters()
     }
-    LaunchedEffect(usbMinBuffer, usbMaxBuffer) {
-        val minMs = usbMinBuffer.toIntOrNull() ?: return@LaunchedEffect
+    LaunchedEffect(usbMaxBuffer) {
         val maxMs = usbMaxBuffer.toIntOrNull() ?: return@LaunchedEffect
         delay(400)
-        val appliedMinMs = minMs.coerceIn(8, 200)
-        val appliedMaxMs = maxMs.coerceIn(8, 500).coerceAtLeast(appliedMinMs)
-        prefs.edit().putInt("usbMinBuffer", appliedMinMs).putInt("usbMaxBuffer", appliedMaxMs).apply()
-        engine.configureUsbOutputBuffer(appliedMinMs, appliedMaxMs)
+        val appliedMaxMs = maxMs.coerceIn(5, 200)
+        prefs.edit().putInt("usbMaxBuffer", appliedMaxMs).apply()
+        engine.configureUsbOutputBuffer(appliedMaxMs)
     }
     LaunchedEffect(usbInputBufferMaxMs) {
         val entered = usbInputBufferMaxMs.toIntOrNull() ?: return@LaunchedEffect
@@ -295,7 +292,7 @@ private fun LiveAudioProcessApp() {
             SystemInputPanel(inputInfo, input != InputSource.USB && input != InputSource.WIFI, systemInputBufferMaxMs) { systemInputBufferMaxMs = it }
             SystemOutputPanel(outputInfo, output != OutputSource.USB, systemOutputBufferMaxMs) { systemOutputBufferMaxMs = it }
             if (input == InputSource.USB || output == OutputSource.USB) {
-                UsbAudioPanel(usbMinBuffer, usbMaxBuffer, usbInputBufferMaxMs, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets, input == InputSource.USB, output == OutputSource.USB, running, usbStats, { usbMinBuffer = it }, { usbMaxBuffer = it }, { usbInputBufferMaxMs = it }, { usbBitDepth = it }, { usbInputBurstPackets = it }, { usbOutputBurstPackets = it })
+                UsbAudioPanel(usbMaxBuffer, usbInputBufferMaxMs, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets, input == InputSource.USB, output == OutputSource.USB, running, usbStats, { usbMaxBuffer = it }, { usbInputBufferMaxMs = it }, { usbBitDepth = it }, { usbInputBurstPackets = it }, { usbOutputBurstPackets = it })
             }
             Float32Badge()
             ProcessingControlPanel(effects) { effects = it }

@@ -88,11 +88,9 @@ class AudioEngine(private val context: Context) {
         wifiReconnectCount = 0
         wifiReconnectPending = false
     }
-    fun configureUsbOutputBuffer(minBufferMs: Int, maxBufferMs: Int) {
+    fun configureUsbOutputBuffer(maxBufferMs: Int) {
         if (!NativeAudio.available) return
-        val minMs = minBufferMs.coerceIn(8, 200)
-        val maxMs = maxBufferMs.coerceIn(8, 500).coerceAtLeast(minMs)
-        NativeAudio.configureUsbOutputBuffer(minMs, maxMs)
+        NativeAudio.configureUsbOutputBuffer(maxBufferMs.coerceIn(5, 200))
     }
     fun configureUsbInputBuffer(maxBufferMs: Int) {
         val normalized = maxBufferMs.coerceIn(5, 200)

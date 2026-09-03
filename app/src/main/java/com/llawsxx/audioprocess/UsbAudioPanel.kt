@@ -26,7 +26,6 @@ import androidx.compose.ui.unit.sp
 
 @Composable
 fun UsbAudioPanel(
-    minBuffer: String,
     maxBuffer: String,
     inputMaxBuffer: String,
     bitDepth: Int,
@@ -36,7 +35,6 @@ fun UsbAudioPanel(
     outputEnabled: Boolean,
     active: Boolean,
     stats: LongArray,
-    onMinBuffer: (String) -> Unit,
     onMaxBuffer: (String) -> Unit,
     onInputMaxBuffer: (String) -> Unit,
     onBitDepth: (Int) -> Unit,
@@ -72,29 +70,17 @@ fun UsbAudioPanel(
                 }
             }
             Text("输出缓冲", color = muted, fontSize = 12.sp)
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(
-                    value = minBuffer,
-                    onValueChange = { if (it.all(Char::isDigit)) onMinBuffer(it) },
-                    label = { Text("最小缓冲 ms") },
-                    singleLine = true,
-                    enabled = outputEnabled,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    colors = fieldColors,
-                    modifier = Modifier.weight(1f)
-                )
-                OutlinedTextField(
-                    value = maxBuffer,
-                    onValueChange = { if (it.all(Char::isDigit)) onMaxBuffer(it) },
-                    label = { Text("最大缓冲 ms") },
-                    singleLine = true,
-                    enabled = outputEnabled,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    colors = fieldColors,
-                    modifier = Modifier.weight(1f)
-                )
-            }
-            Text("范围：最小 8–200 ms，最大 8–500 ms", color = muted, fontSize = 10.sp)
+            OutlinedTextField(
+                value = maxBuffer,
+                onValueChange = { if (it.length <= 3 && it.all(Char::isDigit)) onMaxBuffer(it) },
+                label = { Text("输出缓冲上限 ms") },
+                singleLine = true,
+                enabled = outputEnabled,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                colors = fieldColors,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Text("范围：5–200 ms", color = muted, fontSize = 10.sp)
             OutlinedTextField(
                 value = inputMaxBuffer,
                 onValueChange = { if (it.length <= 3 && it.all(Char::isDigit)) onInputMaxBuffer(it) },

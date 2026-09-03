@@ -7,6 +7,7 @@
 #include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 #include "libuac.h"
 
@@ -27,21 +28,22 @@ static void update_max(std::atomic<uint64_t> &target, uint64_t value) {
 
 class UsbHostAudio {
 public:
-    UsbHostAudio(int fd, int rate, int bitDepth, bool in, bool out, int outputMinBufferMs,
-                 int outputMaxBufferMs, int inputBurstPackets, int outputBurstPackets)
+    UsbHostAudio(int fd, int rate, int bitDepth, bool in, bool out, int outputMaxBufferMs,
+                 int processingFrames, int inputBurstPackets, int outputBurstPackets)
         : rate_(rate), bitDepth_(bitDepth), inputBurstPackets_(std::clamp(inputBurstPackets, 1, 16)),
           outputBurstPackets_(std::clamp(outputBurstPackets, 1, 16)), inputRing_(kRingFrames * 2),
-          outputRing_(kRingFrames * 2), outputMinBufferMs_(outputMinBufferMs),
-          outputMaxBufferMs_(outputMaxBufferMs) {
+          outputRing_(kRingFrames * 2) {
+        processingFrames_ = std::max(1, processingFrames);
+        outputMaxBufferMs_.store(std::clamp(outputMaxBufferMs, 5, 200), std::memory_order_relaxed);
         context_ = uac::uac_context::create();
         device_ = context_->wrap(fd);
         if (in) startInput(rate);
         if (out) startOutput(rate);
         if ((in && !inputStream_) || (out && !outputStream_)) throw std::runtime_error("requested USB audio route/format not found");
-        USB_HOST_LOGI("USB Host audio started input=%d output=%d, requested=%d Hz/%d-bit, buffer=%d/%d/%d ms, burst=%d/%d",
+        USB_HOST_LOGI("USB Host audio started input=%d output=%d, requested=%d Hz/%d-bit, output buffer target=%u/max=%u frames, burst=%d/%d",
                       inputStream_ != nullptr, outputStream_ != nullptr, rate_, bitDepth_,
-                      outputMinBufferMs_.load(), outputMinBufferMs_.load() + (outputMaxBufferMs_.load() - outputMinBufferMs_.load()) / 2,
-                      outputMaxBufferMs_.load(), inputBurstPackets_, outputBurstPackets_);
+                      outputPrerollFrames_.load(), outputMaxPrerollFrames_.load(),
+                      inputBurstPackets_, outputBurstPackets_);
     }
     ~UsbHostAudio() {
         stopping_.store(true, std::memory_order_release);
@@ -72,13 +74,21 @@ public:
 
     int write(const float *src, int frames) {
         if (!src || frames <= 0) return 0;
-        uint32_t write = outputWrite_.load(std::memory_order_relaxed);
-        uint32_t read = outputRead_.load(std::memory_order_acquire);
-        uint32_t queued = write - read;
-        if (queued > kRingFrames || (uint32_t)frames > kRingFrames - queued) {
+        if ((uint32_t)frames > kRingFrames) {
             outputRingOverruns_.fetch_add(1, std::memory_order_relaxed);
             return 0;
         }
+        uint32_t write;
+        while (!stopping_.load(std::memory_order_acquire)) {
+            write = outputWrite_.load(std::memory_order_relaxed);
+            uint32_t read = outputRead_.load(std::memory_order_acquire);
+            uint32_t queued = write - read;
+            uint32_t limit = outputMaxPrerollFrames_.load(std::memory_order_acquire);
+            if (limit == 0 || limit > kRingFrames) limit = kRingFrames;
+            if (queued <= limit && (uint32_t)frames <= limit - queued) break;
+            std::this_thread::sleep_for(std::chrono::microseconds(250));
+        }
+        if (stopping_.load(std::memory_order_acquire)) return 0;
         uint32_t offset = write & kRingMask, count = (uint32_t)frames;
         uint32_t first = std::min(count, kRingFrames - offset);
         std::memcpy(outputRing_.data() + (size_t)offset * 2u, src, (size_t)first * 2u * sizeof(float));
@@ -88,15 +98,12 @@ public:
         return frames;
     }
 
-    void configureOutputBuffer(int minBufferMs, int maxBufferMs) {
-        outputMinBufferMs_.store(std::clamp(minBufferMs, 8, 200), std::memory_order_relaxed);
-        outputMaxBufferMs_.store(std::clamp(maxBufferMs, 8, 500), std::memory_order_relaxed);
-        int minMs = outputMinBufferMs_.load(), maxMs = outputMaxBufferMs_.load();
-        if (maxMs < minMs) { maxMs = minMs; outputMaxBufferMs_.store(maxMs); }
+    void configureOutputBuffer(int maxBufferMs) {
+        outputMaxBufferMs_.store(std::clamp(maxBufferMs, 5, 200), std::memory_order_relaxed);
         updateOutputBufferFrames();
         outputPrimed_.store(false, std::memory_order_relaxed);
         outputUnderruns_.store(0, std::memory_order_relaxed);
-        USB_HOST_LOGI("USB output buffer configured min=%d, target=%u, max=%u frames", minMs, outputPrerollFrames_.load(), outputMaxPrerollFrames_.load());
+        USB_HOST_LOGI("USB output buffer configured target=%u/max=%u frames", outputPrerollFrames_.load(), outputMaxPrerollFrames_.load());
     }
 
     void configureInputBuffer(int maxBufferMs) {
@@ -139,8 +146,8 @@ private:
     }
     void onOutput(uint8_t *data,uint len,int bytes,int ch){
         uint64_t begin=now_us(); if(stopping_.load(std::memory_order_acquire)){std::memset(data,0,len);return;} int stride=bytes*ch;if(stride<=0)return;uint32_t count=(uint32_t)(len/(uint)stride);
-        uint32_t write=outputWrite_.load(std::memory_order_acquire),read=outputRead_.load(std::memory_order_relaxed),available=write-read,maxFrames=outputMaxPrerollFrames_.load(std::memory_order_acquire);
-        if(available>kRingFrames||available>maxFrames){outputRead_.store(write,std::memory_order_release);outputPrimed_.store(false);outputBufferClears_.fetch_add(1);std::memset(data,0,len);update_max(outputCallbackMaxUs_,now_us()-begin);return;}
+        uint32_t write=outputWrite_.load(std::memory_order_acquire),read=outputRead_.load(std::memory_order_relaxed),available=write-read;
+        if(available>kRingFrames){outputRead_.store(write,std::memory_order_release);outputPrimed_.store(false);outputBufferClears_.fetch_add(1);std::memset(data,0,len);update_max(outputCallbackMaxUs_,now_us()-begin);return;}
         if(!outputPrimed_.load(std::memory_order_relaxed)){uint32_t prefill=outputPrerollFrames_.load(std::memory_order_acquire);if(available<prefill){std::memset(data,0,len);update_max(outputCallbackMaxUs_,now_us()-begin);return;}outputPrimed_.store(true);}
         uint32_t take=std::min(count,available),offset=read&kRingMask;
         for(uint32_t i=0;i<take;++i){uint32_t p=(offset+i)&kRingMask;uint8_t*f=data+(size_t)i*stride;encode(f,outputRing_[2u*p],bytes);if(ch>1)encode(f+bytes,outputRing_[2u*p+1u],bytes);for(int c=2;c<ch;++c)encode(f+c*bytes,0.0f,bytes);}
@@ -179,14 +186,14 @@ private:
         outputSampleRate_=cfg->tSampleRate;outputBitResolution_=cfg->bBitResolution;outputChannels_=cfg->bChannelCount;
         USB_HOST_LOGI("USB output actual format=%u Hz/%u-bit/%u ch, subframe=%u B",outputSampleRate_,outputBitResolution_,outputChannels_,cfg->bSubframeSize);
     }
-    void updateOutputBufferFrames(){if(outputTransferFrames_<=0)return;int minMs=std::clamp(outputMinBufferMs_.load(),8,200),maxMs=std::clamp(outputMaxBufferMs_.load(),8,500);if(maxMs<minMs)maxMs=minMs;uint32_t minFrames=std::max<uint32_t>((uint32_t)outputTransferFrames_,(uint32_t)((rate_*minMs+999)/1000)),maxFrames=std::max<uint32_t>(minFrames,(uint32_t)((rate_*maxMs+999)/1000));maxFrames=std::min<uint32_t>(maxFrames,kRingFrames);outputMinFrames_.store(minFrames);outputPrerollFrames_.store(minFrames+(maxFrames-minFrames)/2);outputMaxPrerollFrames_.store(maxFrames);}
-    std::shared_ptr<uac::uac_context> context_;std::shared_ptr<uac::uac_device_handle> device_;std::shared_ptr<uac::uac_stream_handle> inputStream_,outputStream_;std::atomic<bool> stopping_{false};int rate_=48000,bitDepth_=16,inputBurstPackets_=8,outputBurstPackets_=8,outputTransferFrames_=0;std::vector<float> inputRing_,outputRing_;std::atomic<uint32_t> inputRead_{0},inputWrite_{0},outputRead_{0},outputWrite_{0};std::atomic<int> inputMaxBufferMs_{20},outputMinBufferMs_,outputMaxBufferMs_;std::atomic<uint32_t> outputMinFrames_{1},outputPrerollFrames_{1},outputMaxPrerollFrames_{1};std::atomic<bool> outputPrimed_{false},outputHasData_{false};std::atomic<uint64_t> inputRingOverruns_{0},inputBufferClears_{0},outputRingOverruns_{0},outputUnderruns_{0},outputBufferClears_{0},inputCallbackMaxUs_{0},outputCallbackMaxUs_{0};uint32_t inputSampleRate_=0,outputSampleRate_=0;uint8_t inputBitResolution_=0,inputChannels_=0,outputBitResolution_=0,outputChannels_=0;
+    void updateOutputBufferFrames(){if(outputTransferFrames_<=0)return;int maxMs=std::clamp(outputMaxBufferMs_.load(),5,200);uint32_t maxFrames=std::max<uint32_t>({(uint32_t)outputTransferFrames_,(uint32_t)processingFrames_,(uint32_t)((rate_*maxMs+999)/1000)});maxFrames=std::min<uint32_t>(maxFrames,kRingFrames);uint32_t prefill=std::max<uint32_t>({maxFrames/2u,(uint32_t)outputTransferFrames_,(uint32_t)processingFrames_});if(prefill>maxFrames)prefill=maxFrames;outputPrerollFrames_.store(prefill);outputMaxPrerollFrames_.store(maxFrames);}
+    std::shared_ptr<uac::uac_context> context_;std::shared_ptr<uac::uac_device_handle> device_;std::shared_ptr<uac::uac_stream_handle> inputStream_,outputStream_;std::atomic<bool> stopping_{false};int rate_=48000,bitDepth_=16,inputBurstPackets_=8,outputBurstPackets_=8,outputTransferFrames_=0,processingFrames_=256;std::vector<float> inputRing_,outputRing_;std::atomic<uint32_t> inputRead_{0},inputWrite_{0},outputRead_{0},outputWrite_{0};std::atomic<int> inputMaxBufferMs_{20},outputMaxBufferMs_{50};std::atomic<uint32_t> outputPrerollFrames_{1},outputMaxPrerollFrames_{1};std::atomic<bool> outputPrimed_{false},outputHasData_{false};std::atomic<uint64_t> inputRingOverruns_{0},inputBufferClears_{0},outputRingOverruns_{0},outputUnderruns_{0},outputBufferClears_{0},inputCallbackMaxUs_{0},outputCallbackMaxUs_{0};uint32_t inputSampleRate_=0,outputSampleRate_=0;uint8_t inputBitResolution_=0,inputChannels_=0,outputBitResolution_=0,outputChannels_=0;
 };
 }
-extern "C" usb_host_audio_t usb_host_audio_start(int fd,int rate,int bitDepth,int in,int out,int minMs,int maxMs,int inputBurst,int outputBurst){try{return new UsbHostAudio(fd,rate,bitDepth,in!=0,out!=0,minMs,maxMs,inputBurst,outputBurst);}catch(const std::exception&e){USB_HOST_LOGE("USB Host audio start failed: %s",e.what());return nullptr;}catch(...){USB_HOST_LOGE("USB Host audio start failed");return nullptr;}}
+extern "C" usb_host_audio_t usb_host_audio_start(int fd,int rate,int bitDepth,int in,int out,int maxMs,int processingFrames,int inputBurst,int outputBurst){try{return new UsbHostAudio(fd,rate,bitDepth,in!=0,out!=0,maxMs,processingFrames,inputBurst,outputBurst);}catch(const std::exception&e){USB_HOST_LOGE("USB Host audio start failed: %s",e.what());return nullptr;}catch(...){USB_HOST_LOGE("USB Host audio start failed");return nullptr;}}
 extern "C" int usb_host_audio_read(usb_host_audio_t a,float*d,int n){return a?static_cast<UsbHostAudio*>(a)->read(d,n):0;}
 extern "C" int usb_host_audio_write(usb_host_audio_t a,const float*d,int n){return a?static_cast<UsbHostAudio*>(a)->write(d,n):0;}
-extern "C" void usb_host_audio_configure_output_buffer(usb_host_audio_t a,int minMs,int maxMs){if(a)static_cast<UsbHostAudio*>(a)->configureOutputBuffer(minMs,maxMs);}
+extern "C" void usb_host_audio_configure_output_buffer(usb_host_audio_t a,int maxMs){if(a)static_cast<UsbHostAudio*>(a)->configureOutputBuffer(maxMs);}
 extern "C" void usb_host_audio_configure_input_buffer(usb_host_audio_t a,int maxMs){if(a)static_cast<UsbHostAudio*>(a)->configureInputBuffer(maxMs);}
 extern "C" void usb_host_audio_get_stats(usb_host_audio_t a,usb_host_audio_stats_t*stats){if(!stats)return;*stats=a?static_cast<UsbHostAudio*>(a)->stats():usb_host_audio_stats_t{};}
 extern "C" void usb_host_audio_stop(usb_host_audio_t a){delete static_cast<UsbHostAudio*>(a);}
