@@ -30,11 +30,13 @@ private val WifiMuted = Color(0xFF8EA0A8)
 fun WifiAudioPanel(
     sendHost: String,
     sendPort: String,
+    transport: Int,
     codec: Int,
     aacBitrate: Int,
     sendActive: Boolean,
     onSendHost: (String) -> Unit,
     onSendPort: (String) -> Unit,
+    onTransport: (Int) -> Unit,
     onCodec: (Int) -> Unit,
     onAacBitrate: (Int) -> Unit,
     receiveHost: String,
@@ -68,6 +70,8 @@ fun WifiAudioPanel(
 
             Text("传输格式", color = WifiMuted, fontSize = 12.sp)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = transport == 0, onClick = { onTransport(0) }, label = { Text("UDP") })
+                FilterChip(selected = transport == 1, onClick = { onTransport(1) }, label = { Text("TCP") })
                 FilterChip(selected = codec == 0, onClick = { onCodec(0) }, label = { Text("PCM Float32") })
                 FilterChip(selected = codec == 1, onClick = { onCodec(1) }, label = { Text("AAC-LC") })
             }

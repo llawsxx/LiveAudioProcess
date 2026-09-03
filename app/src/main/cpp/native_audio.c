@@ -13,6 +13,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
 #include <time.h>
@@ -34,6 +35,9 @@
 #define NET_JITTER_SLOTS 1024
 #define NET_REORDER_BACKTRACK_PACKETS 8
 #define NET_PROTOCOL_VERSION 2
+#define NET_TRANSPORT_UDP 0
+#define NET_TRANSPORT_TCP 1
+#define NET_TCP_BUFFER_BYTES 262144
 #define EQ_BANDS 4
 #define MAX_INPUT_CHANNELS 8
 
@@ -106,10 +110,13 @@ typedef struct {
        the format/timebase captured when the files were opened. */
     int record_rate;
     atomic_ullong dsp_last_us, dsp_max_us;
-    int net_sock, net_codec, net_bitrate, net_port, net_min_ms, net_max_ms;
+    int net_sock, net_listen_sock, net_transport, net_codec, net_bitrate, net_port, net_min_ms, net_max_ms;
+    int net_tcp_connecting;
     wifi_aac_t net_aac;
     pthread_mutex_t net_codec_lock;
     atomic_int net_role, use_network_input, net_packet_seen;
+    atomic_int net_rx_disconnect_requested, net_rx_timeout_reported, net_tx_disconnect_requested;
+    atomic_uint net_tcp_connect_attempts;
     atomic_ullong net_last_packet_ns;
     NetJitterSlot *net_jitter;
     NetAacJitterSlot *net_aac_jitter;
@@ -137,11 +144,17 @@ typedef struct {
     uint32_t net_seq, net_play_seq, net_high_seq;
     uint32_t net_aac_play_seq, net_aac_high_seq;
     uint64_t net_missing_packets, net_late_packets, net_duplicate_packets;
+    uint8_t net_rx_buffer[NET_TCP_BUFFER_BYTES];
+    size_t net_rx_used, net_tx_used, net_tx_offset;
+    uint8_t net_tx_buffer[NET_TCP_BUFFER_BYTES];
+    uint64_t net_tx_blocked_since_ns;
+    uint64_t net_tcp_next_connect_ns;
     float net_send_buffer[NET_AAC_FRAMES * 2];
 } Engine;
 
 static Engine g = {
     .net_sock = -1,
+    .net_listen_sock = -1,
     .usb_buffer_min_ms = 16,
     .usb_buffer_max_ms = 50,
     .output_buffer_max_ms = ATOMIC_VAR_INIT(40),
@@ -926,16 +939,102 @@ static void stop_recording_internal(void) {
     atomic_store(&g.record_written_frames, 0);
 }
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec*1000000000ull + (uint64_t)t.tv_nsec; }
+static void network_tcp_open_sender(void) {
+    if(g.net_transport!=NET_TRANSPORT_TCP||atomic_load(&g.net_role)!=1||g.net_sock>=0)return;
+    uint64_t now=now_ns();
+    if(now<g.net_tcp_next_connect_ns)return;
+    atomic_fetch_add(&g.net_tcp_connect_attempts,1);
+    g.net_sock=socket(AF_INET,SOCK_STREAM,0);
+    if(g.net_sock<0){LOGI("Wi-Fi TCP sender socket failed errno=%d",errno);g.net_tcp_next_connect_ns=now+1000000000ull;return;}
+    fcntl(g.net_sock,F_SETFL,O_NONBLOCK);
+    int rc=connect(g.net_sock,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr));
+    if(rc==0) {
+        g.net_tcp_connecting=0;
+        g.net_tcp_next_connect_ns=0;
+        LOGI("Wi-Fi TCP sender connected");
+    } else if(errno==EINPROGRESS) {
+        g.net_tcp_connecting=1;
+    } else {
+        LOGI("Wi-Fi TCP sender connect failed errno=%d",errno);
+        close(g.net_sock);g.net_sock=-1;g.net_tcp_connecting=0;
+        g.net_tcp_next_connect_ns=now+1000000000ull;
+    }
+}
+static void network_tcp_flush(void) {
+    if (g.net_transport != NET_TRANSPORT_TCP || g.net_sock < 0) return;
+    if (atomic_exchange(&g.net_tx_disconnect_requested,0)) {
+        shutdown(g.net_sock,SHUT_RDWR); close(g.net_sock); g.net_sock=-1;
+        g.net_tcp_connecting=0; g.net_tx_used=g.net_tx_offset=0;
+        g.net_tx_blocked_since_ns=0;
+        return;
+    }
+    if (g.net_tcp_connecting) {
+        struct pollfd pfd={g.net_sock,POLLOUT|POLLERR|POLLHUP,0};
+        int ready=poll(&pfd,1,0);
+        if(ready<=0)return;
+        g.net_tcp_connecting=0;
+    }
+    int error=0; socklen_t error_len=sizeof(error);
+    if (getsockopt(g.net_sock,SOL_SOCKET,SO_ERROR,&error,&error_len)==0 && error!=0) {
+        LOGI("Wi-Fi TCP sender connection error errno=%d",error);
+        close(g.net_sock);g.net_sock=-1;g.net_tcp_connecting=0;
+        g.net_tcp_next_connect_ns=now_ns()+1000000000ull;
+        g.net_tx_offset=g.net_tx_used=0;
+        g.net_tx_blocked_since_ns=0;
+        return;
+    }
+    while (g.net_tx_offset < g.net_tx_used) {
+        ssize_t n=send(g.net_sock,g.net_tx_buffer+g.net_tx_offset,
+                       g.net_tx_used-g.net_tx_offset,MSG_DONTWAIT);
+        if(n>0) { g.net_tx_offset+=(size_t)n; g.net_tx_blocked_since_ns=0; continue; }
+        if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR)) break;
+        LOGI("Wi-Fi TCP sender send failed errno=%d",errno);
+        close(g.net_sock); g.net_sock=-1; g.net_tcp_connecting=0;
+        g.net_tcp_next_connect_ns=now_ns()+1000000000ull;
+        g.net_tx_offset=g.net_tx_used;
+        g.net_tx_blocked_since_ns=0;
+        break;
+    }
+    if(g.net_tx_offset==g.net_tx_used) {
+        g.net_tx_used=g.net_tx_offset=0;
+        g.net_tx_blocked_since_ns=0;
+    } else if(g.net_tx_blocked_since_ns==0) {
+        g.net_tx_blocked_since_ns=now_ns();
+    }
+}
+static void network_write_packet(const uint8_t *packet, size_t size) {
+    if(!packet||size==0)return;
+    if(g.net_transport==NET_TRANSPORT_TCP) {
+        network_tcp_open_sender();
+        if(g.net_sock<0)return;
+        uint32_t wire_len=htonl((uint32_t)size);
+        size_t total=size+sizeof(wire_len);
+        network_tcp_flush();
+        if(total>sizeof(g.net_tx_buffer)-g.net_tx_used)return;
+        memcpy(g.net_tx_buffer+g.net_tx_used,&wire_len,sizeof(wire_len));
+        memcpy(g.net_tx_buffer+g.net_tx_used+sizeof(wire_len),packet,size);
+        g.net_tx_used+=total;
+        if(g.net_tx_blocked_since_ns==0)g.net_tx_blocked_since_ns=now_ns();
+        network_tcp_flush();
+    } else {
+        if(g.net_sock<0)return;
+        sendto(g.net_sock,packet,size,0,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr));
+    }
+}
 static void network_send_pcm_packet(const float *data) {
     NetHeader h={NET_MAGIC,NET_PROTOCOL_VERSION,0,2,(uint32_t)g.rate,
                  NET_PACKET_FRAMES,now_ns(),g.net_seq++};
     uint8_t packet[sizeof(NetHeader)+NET_PACKET_FRAMES*2*sizeof(float)];
     memcpy(packet,&h,sizeof(h));
     memcpy(packet+sizeof(h),data,NET_PACKET_FRAMES*2*sizeof(float));
-    ssize_t expected=(ssize_t)sizeof(packet);
-    ssize_t sent=sendto(g.net_sock,packet,sizeof(packet),0,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr));
-    if(sent!=expected && (h.sequence==0 || h.sequence%100==0))
+    if(g.net_transport==NET_TRANSPORT_TCP) {
+        network_write_packet(packet,sizeof(packet));
+    } else {
+        ssize_t expected=(ssize_t)sizeof(packet);
+        ssize_t sent=sendto(g.net_sock,packet,sizeof(packet),0,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr));
+        if(sent!=expected && (h.sequence==0 || h.sequence%100==0))
         LOGI("Wi-Fi send dropped sequence=%u bytes=%zd/%zd",h.sequence,sent,expected);
+    }
     if(h.sequence==0)
         LOGI("Wi-Fi protocol v%d fixed packet: frames=%d bytes=%zu",NET_PROTOCOL_VERSION,
              NET_PACKET_FRAMES,sizeof(packet));
@@ -953,16 +1052,26 @@ static void network_send_aac_packet(const float *data) {
     g.net_seq+=NET_AAC_FRAMES/NET_PACKET_FRAMES;
     memcpy(packet,&h,sizeof(h));
     size_t packet_size=sizeof(h)+(size_t)encoded;
-    ssize_t sent=sendto(g.net_sock,packet,packet_size,0,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr));
-    if(sent!=(ssize_t)packet_size && (h.sequence==0 || h.sequence%800==0))
+    if(g.net_transport==NET_TRANSPORT_TCP) {
+        network_write_packet(packet,packet_size);
+    } else {
+        ssize_t sent=sendto(g.net_sock,packet,packet_size,0,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr));
+        if(sent!=(ssize_t)packet_size && (h.sequence==0 || h.sequence%800==0))
         LOGI("Wi-Fi AAC send dropped sequence=%u bytes=%zd/%zu",h.sequence,sent,packet_size);
+    }
     if(h.sequence==0)
         LOGI("Wi-Fi AAC protocol v%d: frames=%d bitrate=%d bytes=%zu",NET_PROTOCOL_VERSION,
              NET_AAC_FRAMES,g.net_bitrate,packet_size);
 }
 
 static void network_send(const float *data, int frames) {
-    if (g.net_sock < 0 || atomic_load(&g.net_role) != 1 || !data || frames<=0) return;
+    if (atomic_load(&g.net_role) != 1 || !data || frames<=0) return;
+    if (atomic_exchange(&g.net_tx_disconnect_requested,0)) {
+        if(g.net_sock>=0){shutdown(g.net_sock,SHUT_RDWR);close(g.net_sock);}
+        g.net_sock=-1; g.net_tcp_connecting=0;
+        g.net_tx_used=g.net_tx_offset=0; g.net_tx_blocked_since_ns=0;
+    }
+    if (g.net_transport != NET_TRANSPORT_TCP && g.net_sock < 0) return;
     int offset=0;
     while(offset<frames) {
         int packet_frames=g.net_codec==1?NET_AAC_FRAMES:NET_PACKET_FRAMES;
@@ -1152,36 +1261,78 @@ static void network_decode_aac_packets(void) {
     }
 }
 
+static void network_process_packet(const uint8_t *packet, size_t n) {
+    if(!packet||n<sizeof(NetHeader))return;
+    NetHeader h; memcpy(&h,packet,sizeof(h));
+    if(h.magic!=NET_MAGIC||h.version!=NET_PROTOCOL_VERSION||h.channels!=2||
+       h.rate!=(uint32_t)g.rate||h.codec!=(uint8_t)g.net_codec)return;
+    uint64_t arrival=now_ns();
+    if(h.codec==0) {
+        size_t expected=sizeof(NetHeader)+NET_PACKET_FRAMES*2*sizeof(float);
+        if(h.frames!=NET_PACKET_FRAMES||n!=expected)return;
+        network_store_packet(&h,(const float *)(packet+sizeof(h)),arrival);
+    } else if(h.codec==1) {
+        if(h.frames!=NET_AAC_FRAMES||n<=sizeof(NetHeader)||
+           n-sizeof(NetHeader)>NET_AAC_STORED_PACKET_BYTES)return;
+        network_store_aac_packet(&h,packet+sizeof(NetHeader),
+                                 (uint32_t)(n-sizeof(NetHeader)));
+    } else return;
+    atomic_store(&g.net_last_packet_ns,arrival);
+    if(!atomic_exchange(&g.net_packet_seen,1))
+        LOGI("first valid Wi-Fi packet: protocol=%u codec=%u rate=%u frames=%u bytes=%zu",
+             h.version,h.codec,h.rate,h.frames,n);
+    atomic_store(&g.net_rx_timeout_reported,0);
+}
+
 static void network_fill(void) {
-    if (g.net_sock < 0 || atomic_load(&g.net_role) != 2 || !g.net_jitter) return;
+    if (atomic_load(&g.net_role) != 2 || !g.net_jitter) return;
+    if (atomic_exchange(&g.net_rx_disconnect_requested,0)) {
+        if(g.net_sock>=0){shutdown(g.net_sock,SHUT_RDWR);close(g.net_sock);}
+        g.net_sock=-1; g.net_rx_used=0;
+    }
+    if(g.net_transport==NET_TRANSPORT_TCP) {
+        if(g.net_sock<0 && g.net_listen_sock>=0) {
+            int accepted=accept(g.net_listen_sock,NULL,NULL);
+            if(accepted>=0) { fcntl(accepted,F_SETFL,O_NONBLOCK); g.net_sock=accepted; g.net_rx_used=0; LOGI("Wi-Fi TCP client connected"); }
+        }
+        if(g.net_sock>=0) {
+            for(;;) {
+                if(g.net_rx_used==sizeof(g.net_rx_buffer))break;
+                ssize_t n=recv(g.net_sock,g.net_rx_buffer+g.net_rx_used,
+                               sizeof(g.net_rx_buffer)-g.net_rx_used,MSG_DONTWAIT);
+                if(n>0){g.net_rx_used+=(size_t)n;continue;}
+                if(n==0){close(g.net_sock);g.net_sock=-1;g.net_rx_used=0;break;}
+                if(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR)break;
+                close(g.net_sock);g.net_sock=-1;g.net_rx_used=0;break;
+            }
+            size_t consumed=0;
+            while(g.net_rx_used-consumed>=sizeof(uint32_t)) {
+                uint32_t wire_len; memcpy(&wire_len,g.net_rx_buffer+consumed,sizeof(wire_len));
+                size_t packet_len=ntohl(wire_len);
+                if(packet_len<sizeof(NetHeader)||packet_len>sizeof(g.net_rx_buffer)-sizeof(uint32_t)) { consumed=g.net_rx_used; break; }
+                if(g.net_rx_used-consumed<sizeof(uint32_t)+packet_len)break;
+                network_process_packet(g.net_rx_buffer+consumed+sizeof(uint32_t),packet_len);
+                consumed+=sizeof(uint32_t)+packet_len;
+            }
+            if(consumed){memmove(g.net_rx_buffer,g.net_rx_buffer+consumed,g.net_rx_used-consumed);g.net_rx_used-=consumed;}
+        }
+        if(g.net_codec==1)network_decode_aac_packets();
+        return;
+    }
+    if (g.net_sock < 0) return;
     uint8_t packet[sizeof(NetHeader)+NET_AAC_MAX_PACKET_BYTES];
     for (;;) {
         ssize_t n=recvfrom(g.net_sock,packet,sizeof(packet),MSG_DONTWAIT,NULL,NULL);
         if(n<(ssize_t)sizeof(NetHeader)) break;
-        NetHeader h; memcpy(&h,packet,sizeof(h));
-        if(h.magic!=NET_MAGIC || h.version!=NET_PROTOCOL_VERSION || h.channels!=2 ||
-           h.rate!=(uint32_t)g.rate || h.codec!=(uint8_t)g.net_codec) continue;
-        uint64_t arrival=now_ns();
-        if(h.codec==0) {
-            size_t expected=sizeof(NetHeader)+NET_PACKET_FRAMES*2*sizeof(float);
-            if(h.frames!=NET_PACKET_FRAMES || n!=(ssize_t)expected)continue;
-            network_store_packet(&h,(const float *)(packet+sizeof(h)),arrival);
-        } else if(h.codec==1) {
-            if(h.frames!=NET_AAC_FRAMES || n<=(ssize_t)sizeof(NetHeader) ||
-               n-(ssize_t)sizeof(NetHeader)>NET_AAC_STORED_PACKET_BYTES)continue;
-            network_store_aac_packet(&h,packet+sizeof(NetHeader),(uint32_t)(n-sizeof(NetHeader)));
-        } else continue;
-        atomic_store(&g.net_last_packet_ns,arrival);
-        if(!atomic_exchange(&g.net_packet_seen,1))
-            LOGI("first valid Wi-Fi packet: protocol=%u codec=%u rate=%u frames=%u bytes=%zd",
-                 h.version,h.codec,h.rate,h.frames,n);
+        network_process_packet(packet,(size_t)n);
     }
     if(g.net_codec==1)network_decode_aac_packets();
 }
 
 static int network_receive(float *data, int frames) {
     network_fill();
-    if (g.net_sock < 0 || atomic_load(&g.net_role) != 2 || !g.net_jitter) return 0;
+    if ((g.net_sock < 0 && !(g.net_transport==NET_TRANSPORT_TCP && g.net_listen_sock>=0)) ||
+        atomic_load(&g.net_role) != 2 || !g.net_jitter) return 0;
     int min_frames=(g.rate*g.net_min_ms)/1000;
     int max_frames=(g.rate*g.net_max_ms)/1000;
     int target_frames=(min_frames+max_frames)/2;
@@ -1453,7 +1604,10 @@ fail:
     output_ring_destroy();
     return JNI_FALSE;
 }
-static void native_stop_internal(int finalize_recording) {
+/* Route changes restart AAudio/DSP, but the Wi-Fi transport can remain alive.
+ * Keeping the socket avoids turning a transient input timeout into a server
+ * teardown/reconnect cycle. A full stop still closes all network resources. */
+static void native_stop_internal(int finalize_recording, int preserve_network) {
     int was_running = atomic_exchange(&g.running,0);
     if (!was_running) {
         if (finalize_recording) stop_recording_internal();
@@ -1473,13 +1627,26 @@ static void native_stop_internal(int finalize_recording) {
     usb_host_audio_stop(g.usb_audio);g.usb_audio=NULL;g.usb_input_host=g.usb_output_host=0;
     pthread_mutex_lock(&g.reverb_lock);ConvolutionReverb *reverb=g.reverb;g.reverb=NULL;pthread_mutex_unlock(&g.reverb_lock);
     convolution_reverb_destroy(reverb);free(g.lookahead);g.lookahead=NULL;free(g.limiter_next_pos);g.limiter_next_pos=NULL;free(g.limiter_next_delta);g.limiter_next_delta=NULL;free(g.net_jitter);g.net_jitter=NULL;free(g.net_aac_jitter);g.net_aac_jitter=NULL;input_ring_destroy();output_ring_destroy();network_clear_jitter_state();
+    if (!preserve_network) {
+        if(g.net_sock>=0)close(g.net_sock);
+        if(g.net_listen_sock>=0)close(g.net_listen_sock);
+        g.net_sock=g.net_listen_sock=-1;
+        g.net_tcp_connecting=0;
+        g.net_tcp_next_connect_ns=0;
+        g.net_rx_used=g.net_tx_used=g.net_tx_offset=0;
+        g.net_tx_blocked_since_ns=0;
+        atomic_store(&g.net_rx_disconnect_requested,0);
+        atomic_store(&g.net_rx_timeout_reported,0);
+        atomic_store(&g.net_tx_disconnect_requested,0);
+    }
 }
-JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stop(JNIEnv*e,jobject o){(void)e;(void)o;native_stop_internal(1);}
-JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stopForRouteChange(JNIEnv*e,jobject o){(void)e;(void)o;native_stop_internal(0);}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stop(JNIEnv*e,jobject o){(void)e;(void)o;native_stop_internal(1,0);}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stopForRouteChange(JNIEnv*e,jobject o){(void)e;(void)o;native_stop_internal(0,1);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_update(JNIEnv*e,jobject o,jint flags,jfloatArray values){(void)o;float incoming[28]={0};jsize n=(*e)->GetArrayLength(e,values);if(n>28)n=28;(*e)->GetFloatArrayRegion(e,values,0,n,incoming);pthread_mutex_lock(&g.param_lock);int reverb_changed=n>P_DAMP&&(g.values[P_ROOM]!=incoming[P_ROOM]||g.values[P_DECAY]!=incoming[P_DECAY]||g.values[P_DAMP]!=incoming[P_DAMP]);memcpy(g.values,incoming,(size_t)n*sizeof(float));pthread_mutex_unlock(&g.param_lock);if(reverb_changed)atomic_fetch_add(&g.reverb_generation,1);atomic_store(&g.flags,flags);}
 JNIEXPORT jfloatArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_levels(JNIEnv*e,jobject o){(void)o;jfloat v[6];for(int i=0;i<6;i++)v[i]=atomic_load(&g.levels[i]);jfloatArray a=(*e)->NewFloatArray(e,6);(*e)->SetFloatArrayRegion(e,a,0,6,v);return a;}
-JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetwork(JNIEnv*e,jobject o,jint role,jint codec,jint sampleRate,jint bitrate,jstring host,jint port,jint minMs,jint maxMs){
+JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetwork(JNIEnv*e,jobject o,jint role,jint transport,jint codec,jint sampleRate,jint bitrate,jstring host,jint port,jint minMs,jint maxMs){
     (void)o;
+    if(transport!=NET_TRANSPORT_UDP&&transport!=NET_TRANSPORT_TCP)return JNI_FALSE;
     if(codec!=0&&codec!=1)return JNI_FALSE;
     int normalized_rate=sampleRate==44100||sampleRate==48000||sampleRate==96000?sampleRate:48000;
     int normalized_bitrate=bitrate<32000?32000:(bitrate>512000?512000:bitrate);
@@ -1490,7 +1657,8 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
     struct in_addr requested_addr={0};
     inet_aton(h,&requested_addr);
     int current_role=atomic_load(&g.net_role);
-    int same_transport=current_role==role && g.net_sock>=0 &&
+    int socket_ready=g.net_sock>=0 || (g.net_transport==NET_TRANSPORT_TCP&&g.net_listen_sock>=0);
+    int same_transport=current_role==role && socket_ready && g.net_transport==transport &&
             g.net_codec==codec && g.rate==normalized_rate && g.net_port==port &&
             g.net_addr.sin_addr.s_addr==requested_addr.s_addr;
     int normalized_min=minMs<0?0:(minMs>200?200:minMs);
@@ -1522,21 +1690,82 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
     pthread_mutex_unlock(&g.net_codec_lock);
     atomic_store(&g.net_role,0);
     if(g.net_sock>=0)close(g.net_sock);
+    if(g.net_listen_sock>=0)close(g.net_listen_sock);
     g.net_sock=socket(AF_INET,SOCK_DGRAM,0);
-    if(g.net_sock<0){atomic_store(&g.net_role,0);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;}
-    fcntl(g.net_sock,F_SETFL,O_NONBLOCK);memset(&g.net_addr,0,sizeof(g.net_addr));g.net_addr.sin_family=AF_INET;g.net_addr.sin_port=htons((uint16_t)port);g.net_addr.sin_addr=requested_addr;
+    g.net_listen_sock=-1;
+    if(transport==NET_TRANSPORT_TCP) {
+        close(g.net_sock); g.net_sock=-1;
+        if(role==2) {
+            g.net_listen_sock=socket(AF_INET,SOCK_STREAM,0);
+            if(g.net_listen_sock>=0) { int yes=1; setsockopt(g.net_listen_sock,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes)); fcntl(g.net_listen_sock,F_SETFL,O_NONBLOCK); }
+        } else {
+            g.net_sock=socket(AF_INET,SOCK_STREAM,0);
+            if(g.net_sock>=0) { atomic_fetch_add(&g.net_tcp_connect_attempts,1); struct sockaddr_in target={0}; target.sin_family=AF_INET; target.sin_port=htons((uint16_t)port); target.sin_addr=requested_addr; fcntl(g.net_sock,F_SETFL,O_NONBLOCK); int rc=connect(g.net_sock,(struct sockaddr*)&target,sizeof(target)); if(rc==0)g.net_tcp_connecting=0; else if(errno==EINPROGRESS)g.net_tcp_connecting=1; else {close(g.net_sock);g.net_sock=-1;g.net_tcp_connecting=0;g.net_tcp_next_connect_ns=now_ns()+1000000000ull;} }
+        }
+    } else {
+        g.net_sock=socket(AF_INET,SOCK_DGRAM,0);
+        if(g.net_sock>=0) fcntl(g.net_sock,F_SETFL,O_NONBLOCK);
+    }
+    if((role==1&&g.net_sock<0)||(role==2&&transport==NET_TRANSPORT_TCP&&g.net_listen_sock<0)||(role==2&&transport==NET_TRANSPORT_UDP&&g.net_sock<0)){atomic_store(&g.net_role,0);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;}
+    memset(&g.net_addr,0,sizeof(g.net_addr));g.net_addr.sin_family=AF_INET;g.net_addr.sin_port=htons((uint16_t)port);g.net_addr.sin_addr=requested_addr;
     atomic_store(&g.net_last_packet_ns,now_ns());atomic_store(&g.net_packet_seen,0);
-    g.net_codec=codec;g.net_bitrate=normalized_bitrate;g.net_port=port;g.net_min_ms=minMs<0?0:(minMs>200?200:minMs);g.net_max_ms=maxMs<50?50:(maxMs>1000?1000:maxMs);if(g.net_max_ms<g.net_min_ms)g.net_min_ms=g.net_max_ms;
-    g.net_send_count=0;g.net_seq=0;g.net_missing_packets=g.net_late_packets=g.net_duplicate_packets=0;network_clear_jitter_state();
-    if(role==2&&bind(g.net_sock,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr))<0){close(g.net_sock);g.net_sock=-1;atomic_store(&g.net_role,0);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;}
+    g.net_transport=transport;g.net_codec=codec;g.net_bitrate=normalized_bitrate;g.net_port=port;g.net_min_ms=minMs<0?0:(minMs>200?200:minMs);g.net_max_ms=maxMs<50?50:(maxMs>1000?1000:maxMs);if(g.net_max_ms<g.net_min_ms)g.net_min_ms=g.net_max_ms;
+    g.net_send_count=0;g.net_seq=0;g.net_tcp_connecting=0;g.net_tcp_next_connect_ns=0;g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_tcp_connect_attempts,0);atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);g.net_missing_packets=g.net_late_packets=g.net_duplicate_packets=0;network_clear_jitter_state();
+    if(role==2) {
+        int bind_sock=transport==NET_TRANSPORT_TCP?g.net_listen_sock:g.net_sock;
+        if(bind(bind_sock,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr))<0 ||
+           (transport==NET_TRANSPORT_TCP&&listen(g.net_listen_sock,1)<0)) {
+            if(g.net_sock>=0)close(g.net_sock); if(g.net_listen_sock>=0)close(g.net_listen_sock); g.net_sock=g.net_listen_sock=-1; atomic_store(&g.net_role,0); (*e)->ReleaseStringUTFChars(e,host,h); return JNI_FALSE;
+        }
+        if(transport==NET_TRANSPORT_TCP) LOGI("Wi-Fi TCP server listening on port=%d",port);
+    }
     atomic_store(&g.net_role,role);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_TRUE;
 }
-JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearNetwork(JNIEnv*e,jobject o){(void)e;(void)o;if(g.net_sock>=0)close(g.net_sock);g.net_sock=-1;atomic_store(&g.net_role,0);g.net_send_count=0;network_clear_jitter_state();pthread_mutex_lock(&g.net_codec_lock);wifi_aac_destroy(g.net_aac);g.net_aac=NULL;pthread_mutex_unlock(&g.net_codec_lock);}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearNetwork(JNIEnv*e,jobject o){(void)e;(void)o;if(g.net_sock>=0)close(g.net_sock);if(g.net_listen_sock>=0)close(g.net_listen_sock);g.net_sock=g.net_listen_sock=-1;g.net_tcp_connecting=0;g.net_tcp_next_connect_ns=0;g.net_rx_used=g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);atomic_store(&g.net_role,0);g.net_send_count=0;network_clear_jitter_state();pthread_mutex_lock(&g.net_codec_lock);wifi_aac_destroy(g.net_aac);g.net_aac=NULL;pthread_mutex_unlock(&g.net_codec_lock);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureUsbOutputBuffer(JNIEnv*e,jobject o,jint minMs,jint maxMs){(void)e;(void)o;g.usb_buffer_min_ms=minMs<8?8:(minMs>200?200:minMs);g.usb_buffer_max_ms=maxMs<8?8:(maxMs>500?500:maxMs);if(g.usb_buffer_max_ms<g.usb_buffer_min_ms)g.usb_buffer_max_ms=g.usb_buffer_min_ms;usb_host_audio_configure_output_buffer(g.usb_audio,g.usb_buffer_min_ms,g.usb_buffer_max_ms);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureOutputBufferMaxMs(JNIEnv*e,jobject o,jint maxMs){(void)e;(void)o;int normalized=maxMs<5?5:(maxMs>200?200:maxMs);atomic_store(&g.output_buffer_max_ms,normalized);output_ring_update_limits(g.rate,g.frames);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureInputBufferMaxMs(JNIEnv*e,jobject o,jint maxMs){(void)e;(void)o;int normalized=maxMs<5?5:(maxMs>200?200:maxMs);atomic_store(&g.input_buffer_max_ms,normalized);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureUsbInputBuffer(JNIEnv*e,jobject o,jint maxMs){(void)e;(void)o;int normalized=maxMs<5?5:(maxMs>200?200:maxMs);atomic_store(&g.usb_input_buffer_max_ms,normalized);usb_host_audio_configure_input_buffer(g.usb_audio,normalized);}
-JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkInputTimedOut(JNIEnv*e,jobject o,jint timeoutMs){(void)e;(void)o;if(atomic_load(&g.net_role)!=2||timeoutMs<=0)return JNI_FALSE;uint64_t last=atomic_load(&g.net_last_packet_ns),now=now_ns();return now>last&&(now-last)>=(uint64_t)timeoutMs*1000000ull?JNI_TRUE:JNI_FALSE;}
+JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkInputTimedOut(JNIEnv*e,jobject o,jint timeoutMs){
+    (void)e;(void)o;
+    if(atomic_load(&g.net_role)!=2||timeoutMs<=0)return JNI_FALSE;
+    if(g.net_transport==NET_TRANSPORT_TCP&&atomic_load(&g.net_rx_timeout_reported))return JNI_TRUE;
+    uint64_t last=atomic_load(&g.net_last_packet_ns),now=now_ns();
+    if(g.net_transport==NET_TRANSPORT_TCP&&now>last&&
+       now-last>=(uint64_t)timeoutMs*1000000ull) {
+        /* Ask the audio thread to drop only the stale client. The listening
+         * socket stays open so the sender can reconnect during fallback. */
+        LOGI("Wi-Fi TCP input stalled for %d ms; dropping client for fallback",timeoutMs);
+        atomic_store(&g.net_rx_timeout_reported,1);
+        atomic_store(&g.net_rx_disconnect_requested,1);
+        return JNI_TRUE;
+    }
+    return now>last&&(now-last)>=(uint64_t)timeoutMs*1000000ull?JNI_TRUE:JNI_FALSE;
+}
+JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkOutputTimedOut(JNIEnv*e,jobject o,jint timeoutMs){
+    (void)e;(void)o;
+    if(atomic_load(&g.net_role)!=1||g.net_transport!=NET_TRANSPORT_TCP||timeoutMs<=0||
+       g.net_tx_blocked_since_ns==0)return JNI_FALSE;
+    uint64_t now=now_ns();
+    if(now<=g.net_tx_blocked_since_ns||
+       now-g.net_tx_blocked_since_ns<(uint64_t)timeoutMs*1000000ull)return JNI_FALSE;
+    atomic_store(&g.net_tx_disconnect_requested,1);
+    g.net_tcp_next_connect_ns=0;
+    LOGI("Wi-Fi TCP sender stalled for %d ms; reconnecting",timeoutMs);
+    return JNI_TRUE;
+}
+JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkOutputConnected(JNIEnv*e,jobject o){
+    (void)e;(void)o;
+    if(atomic_load(&g.net_role)!=1||g.net_transport!=NET_TRANSPORT_TCP||
+       g.net_sock<0||g.net_tcp_connecting)return JNI_FALSE;
+    int error=0; socklen_t error_len=sizeof(error);
+    if(getsockopt(g.net_sock,SOL_SOCKET,SO_ERROR,&error,&error_len)!=0||error!=0)return JNI_FALSE;
+    return JNI_TRUE;
+}
+JNIEXPORT jint JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkOutputConnectAttempts(JNIEnv*e,jobject o){
+    (void)e;(void)o;
+    return (jint)atomic_load(&g.net_tcp_connect_attempts);
+}
 JNIEXPORT jintArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_routeInfo(JNIEnv*e,jobject o){(void)o;jint route[4];pthread_mutex_lock(&g.stream_lock);route[0]=g.usb_input_host?-3:(atomic_load(&g.use_network_input)&&atomic_load(&g.net_role)==2?-2:(g.input?AAudioStream_getDeviceId(g.input):-1));route[1]=g.usb_output_host?-4:(g.output?AAudioStream_getDeviceId(g.output):-1);route[2]=g.usb_input_host?2:(g.input?AAudioStream_getChannelCount(g.input):-1);route[3]=g.usb_output_host?2:(g.output?AAudioStream_getChannelCount(g.output):-1);pthread_mutex_unlock(&g.stream_lock);jintArray result=(*e)->NewIntArray(e,4);(*e)->SetIntArrayRegion(e,result,0,4,route);return result;}
 JNIEXPORT jlongArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_inputInfo(JNIEnv*e,jobject o){
     (void)o;

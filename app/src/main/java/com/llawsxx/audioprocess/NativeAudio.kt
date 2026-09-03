@@ -14,13 +14,16 @@ object NativeAudio {
     external fun levels(): FloatArray
     external fun startRecordingFd(dryFd: Int, wetFd: Int): Boolean
     external fun stopRecording()
-    external fun configureNetwork(role: Int, codec: Int, sampleRate: Int, bitrate: Int, host: String, port: Int, minBufferMs: Int, maxBufferMs: Int): Boolean
+    external fun configureNetwork(role: Int, transport: Int, codec: Int, sampleRate: Int, bitrate: Int, host: String, port: Int, minBufferMs: Int, maxBufferMs: Int): Boolean
     external fun configureUsbOutputBuffer(minBufferMs: Int, maxBufferMs: Int)
     external fun configureUsbInputBuffer(maxBufferMs: Int)
     external fun configureOutputBufferMaxMs(maxMs: Int)
     external fun configureInputBufferMaxMs(maxMs: Int)
     external fun clearNetwork()
     external fun networkInputTimedOut(timeoutMs: Int): Boolean
+    external fun networkOutputTimedOut(timeoutMs: Int): Boolean
+    external fun networkOutputConnected(): Boolean
+    external fun networkOutputConnectAttempts(): Int
     external fun routeInfo(): IntArray
     external fun inputInfo(): LongArray
     external fun outputInfo(): LongArray

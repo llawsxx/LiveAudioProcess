@@ -28,6 +28,8 @@ class AudioEngine(private val context: Context) {
     private var nextBluetoothRetryAtMs = 0L
     @Volatile private var networkRole = 0
     @Volatile private var wifiFallbackActive = false
+    @Volatile private var wifiReconnectCount = 0
+    @Volatile private var wifiReconnectPending = false
     @Volatile var wifiInputTimeoutMs = 1_000
     @Volatile var routeNotice: String? = null
         private set
@@ -68,9 +70,10 @@ class AudioEngine(private val context: Context) {
     private data class RecordingTarget(val dryUri: android.net.Uri?, val wetUri: android.net.Uri?, val dryPfd: ParcelFileDescriptor, val wetPfd: ParcelFileDescriptor)
     private var recordingTarget: RecordingTarget? = null
     private var usbConnection: UsbDeviceConnection? = null
-    fun configureNetwork(role: Int, codec: Int, bitrate: Int, host: String, port: Int, minBufferMs: Int, maxBufferMs: Int): Boolean {
-        val configured = NativeAudio.configureNetwork(role, codec, sampleRate, bitrate, host, port, minBufferMs, maxBufferMs)
+    fun configureNetwork(role: Int, transport: Int, codec: Int, bitrate: Int, host: String, port: Int, minBufferMs: Int, maxBufferMs: Int): Boolean {
+        val configured = NativeAudio.configureNetwork(role, transport, codec, sampleRate, bitrate, host, port, minBufferMs, maxBufferMs)
         networkRole = if (configured) role else 0
+        if (role != 1) { wifiReconnectCount = 0; wifiReconnectPending = false }
         if (!configured) routeNotice = "Wi-Fi 音频配置失败，所选 Wi-Fi 路由未生效"
         return configured
     }
@@ -78,6 +81,8 @@ class AudioEngine(private val context: Context) {
         NativeAudio.clearNetwork()
         networkRole = 0
         wifiFallbackActive = false
+        wifiReconnectCount = 0
+        wifiReconnectPending = false
     }
     fun configureUsbOutputBuffer(minBufferMs: Int, maxBufferMs: Int) {
         if (!NativeAudio.available) return
@@ -244,6 +249,25 @@ class AudioEngine(private val context: Context) {
     private val wifiHealthMonitor = object : Runnable {
         override fun run() {
             if (!isRunning) return
+            if (networkRole == 1) {
+                val timeout = NativeAudio.networkOutputTimedOut(wifiInputTimeoutMs.coerceIn(100, 60_000))
+                if (timeout && !wifiReconnectPending) {
+                    wifiReconnectCount = (NativeAudio.networkOutputConnectAttempts() - 1).coerceAtLeast(1)
+                    wifiReconnectPending = true
+                    routeNotice = "Wi-Fi 输出超过 ${wifiInputTimeoutMs} ms 无法发送，第 ${wifiReconnectCount} 次重连中"
+                }
+                if (wifiReconnectPending) {
+                    val attempts = (NativeAudio.networkOutputConnectAttempts() - 1).coerceAtLeast(1)
+                    if (attempts > wifiReconnectCount) {
+                        wifiReconnectCount = attempts
+                        routeNotice = "Wi-Fi 输出超过 ${wifiInputTimeoutMs} ms 无法发送，第 ${wifiReconnectCount} 次重连中"
+                    }
+                }
+                if (wifiReconnectPending && NativeAudio.networkOutputConnected()) {
+                    wifiReconnectPending = false
+                    routeNotice = null
+                }
+            }
             if (inputSource == InputSource.WIFI && networkRole == 2) {
                 val timedOut = NativeAudio.networkInputTimedOut(wifiInputTimeoutMs.coerceIn(100, 60_000))
                 if (timedOut && !wifiFallbackActive) {
