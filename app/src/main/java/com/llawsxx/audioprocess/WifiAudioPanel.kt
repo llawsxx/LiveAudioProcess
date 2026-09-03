@@ -72,9 +72,13 @@ fun WifiAudioPanel(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilterChip(selected = transport == 0, onClick = { onTransport(0) }, label = { Text("UDP") })
                 FilterChip(selected = transport == 1, onClick = { onTransport(1) }, label = { Text("TCP") })
-                FilterChip(selected = codec == 0, onClick = { onCodec(0) }, label = { Text("PCM") })
-                FilterChip(selected = codec == 1, onClick = { onCodec(1) }, label = { Text("AAC") })
             }
+            Text("编码格式", color = WifiMuted, fontSize = 12.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = codec == 0, onClick = { onCodec(0) }, label = { Text("PCM Float32") })
+                FilterChip(selected = codec == 1, onClick = { onCodec(1) }, label = { Text("AAC-LC") })
+            }
+
             if (codec == 1) {
                 Text("AAC 码率", color = WifiMuted, fontSize = 12.sp)
                 Row(

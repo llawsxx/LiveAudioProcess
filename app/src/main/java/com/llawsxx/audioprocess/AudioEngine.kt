@@ -327,6 +327,10 @@ class AudioEngine(private val context: Context) {
         if (isRunning) return
         lastError = null
         if (!NativeAudio.available) { lastError = "AAudio requires Android 8.0 or newer"; return }
+        if (inputSource == InputSource.TEST_TONE && outputSource == OutputSource.NONE) {
+            outputSource = OutputSource.SPEAKER
+            lastError = "测试 Tone 需要本地输出，已切换到扬声器"
+        }
         val usbInput = if (inputSource == InputSource.USB) usbInputDevice() else null
         val pairs = availableInputPairs()
         val channels = if (inputSource == InputSource.USB && usbInput != null) (pairs.size * 2).coerceIn(2, 8) else 1

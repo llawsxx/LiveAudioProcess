@@ -81,10 +81,10 @@ private fun GroupTitle(text: String) {
 @Composable
 private fun ParameterSlider(label: String, value: Float, range: ClosedFloatingPointRange<Float>, onChange: (Float) -> Unit, readout: String) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Text(label, color = Color.White, fontSize = 11.sp, modifier = Modifier.width(72.dp), maxLines = 1)
+        Text(label, color = Color.White, fontSize = 11.sp, modifier = Modifier.width(64.dp), maxLines = 1)
         Slider(value = value, onValueChange = onChange, valueRange = range, modifier = Modifier.weight(1f).height(30.dp))
-        Spacer(Modifier.width(14.dp))
-        Text(readout, color = UnifiedMuted, fontSize = 10.sp, modifier = Modifier.width(72.dp), maxLines = 1)
+        Spacer(Modifier.width(8.dp))
+        Text(readout, color = UnifiedMuted, fontSize = 10.sp, modifier = Modifier.width(64.dp), maxLines = 1)
     }
 }
 

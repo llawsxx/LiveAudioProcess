@@ -112,7 +112,11 @@ private fun LiveAudioProcessApp() {
     var recording by remember { mutableStateOf(false) }
     var input by remember { mutableStateOf(runCatching { InputSource.valueOf(prefs.getString("input", InputSource.BUILT_IN.name)!!) }.getOrDefault(InputSource.BUILT_IN)) }
     var channelPair by remember { mutableIntStateOf(prefs.getInt("channelPair", 0)) }
-    var output by remember { mutableStateOf(runCatching { OutputSource.valueOf(prefs.getString("output", OutputSource.SPEAKER.name)!!) }.getOrDefault(OutputSource.SPEAKER).let { if (it == OutputSource.WIFI) OutputSource.SPEAKER else it }) }
+    var output by remember {
+        val saved = runCatching { OutputSource.valueOf(prefs.getString("output", OutputSource.SPEAKER.name)!!) }
+            .getOrDefault(OutputSource.SPEAKER)
+        mutableStateOf(saved.let { if (it == OutputSource.WIFI || (input == InputSource.TEST_TONE && it == OutputSource.NONE)) OutputSource.SPEAKER else it })
+    }
     var wifiOutputEnabled by remember { mutableStateOf(input != InputSource.WIFI && prefs.getBoolean("wifiOutputEnabled", prefs.getString("output", "") == OutputSource.WIFI.name)) }
     var rate by remember { mutableIntStateOf(prefs.getInt("rate", 48_000)) }
     var buffer by remember { mutableIntStateOf(prefs.getInt("buffer", 256)) }
@@ -197,7 +201,7 @@ private fun LiveAudioProcessApp() {
             val levels = NativeAudio.levels(); if (levels.size >= 4) { inputLevelL = levels[0]; inputLevelR = levels[1]; outputLevelL = levels[2]; outputLevelR = levels[3] }; if (levels.size >= 6) { limiterGain = levels[4]; limiterReleaseMs = levels[5] }; if (levels.size >= 10) { inputPeakL = levels[6]; inputPeakR = levels[7]; outputPeakL = levels[8]; outputPeakR = levels[9] }; if (showWaveforms) waveformData = NativeAudio.waveform()
             inputInfo = NativeAudio.inputInfo()
             outputInfo = NativeAudio.outputInfo()
-            delay(50)
+            delay(100)
         }
     }
     LaunchedEffect(running, input, output) {
@@ -237,14 +241,14 @@ private fun LiveAudioProcessApp() {
     }
     LaunchedEffect(usbMaxBuffer) {
         val maxMs = usbMaxBuffer.toIntOrNull() ?: return@LaunchedEffect
-        delay(400)
+        delay(500)
         val appliedMaxMs = maxMs.coerceIn(5, 200)
         prefs.edit().putInt("usbMaxBuffer", appliedMaxMs).apply()
         engine.configureUsbOutputBuffer(appliedMaxMs)
     }
     LaunchedEffect(usbInputBufferMaxMs) {
         val entered = usbInputBufferMaxMs.toIntOrNull() ?: return@LaunchedEffect
-        delay(400)
+        delay(500)
         val applied = entered.coerceIn(5, 200)
         prefs.edit().putInt("usbInputBufferMaxMs", applied).apply()
         engine.configureUsbInputBuffer(applied)
@@ -258,14 +262,14 @@ private fun LiveAudioProcessApp() {
     }
     LaunchedEffect(systemOutputBufferMaxMs) {
         val entered = systemOutputBufferMaxMs.toIntOrNull() ?: return@LaunchedEffect
-        delay(400)
+        delay(500)
         val applied = entered.coerceIn(5, 200)
         prefs.edit().putInt("systemOutputBufferMaxMs", applied).apply()
         engine.configureSystemOutputBuffer(applied)
     }
     LaunchedEffect(systemInputBufferMaxMs) {
         val entered = systemInputBufferMaxMs.toIntOrNull() ?: return@LaunchedEffect
-        delay(400)
+        delay(500)
         val applied = entered.coerceIn(5, 200)
         prefs.edit().putInt("systemInputBufferMaxMs", applied).apply()
         engine.configureSystemInputBuffer(applied)
@@ -280,13 +284,13 @@ private fun LiveAudioProcessApp() {
     Scaffold(containerColor = Ink, topBar = { TopAppBar(title = { Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.GraphicEq, null, tint = Teal, modifier = Modifier.size(25.dp)); Spacer(Modifier.width(9.dp)); Text("LiveAudioProcess", fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp) } }, actions = { StatusDot(running) }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Ink, titleContentColor = Color.White)) }) { pad ->
         Column(Modifier.fillMaxSize().padding(pad).padding(horizontal = 16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Spacer(Modifier.height(2.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) { Column { Text("实时监听", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold); Text("LOW-LATENCY DSP CONSOLE", color = Muted, fontSize = 11.sp, letterSpacing = 1.2.sp) }; Text(if (running) "RUNNING" else "STANDBY", color = if (running) Teal else Muted, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) { Column { Text("LOW-LATENCY DSP CONSOLE", color = Muted, fontSize = 11.sp, letterSpacing = 1.2.sp) }; Text(if (running) "RUNNING" else "STANDBY", color = if (running) Teal else Muted, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
             ScreenAlwaysOnOption(screenAlwaysOn) { enabled ->
                 screenAlwaysOn = enabled
                 prefs.edit().putBoolean("screenAlwaysOn", enabled).apply()
             }
             LevelPanel(inputLevelL, inputLevelR, outputLevelL, outputLevelR, inputPeakL, inputPeakR, outputPeakL, outputPeakR, limiterGain, limiterReleaseMs, running, running && effects.dspEnabled && effects.limiterEnabled, waveformData, showWaveforms) { showWaveforms = it; prefs.edit().putBoolean("showWaveforms", it).apply() }
-            RoutingPanel2(input, { selected -> input = selected; channelPair = 0; if (selected == InputSource.WIFI) wifiOutputEnabled = false; wifiActive = configureWifiForCurrentRoute(); syncEngine() }, output, { selected -> if (selected == OutputSource.BLUETOOTH && Build.VERSION.SDK_INT >= 31 && ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) { pendingBluetoothOutput = selected; bluetoothPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT) } else { output = selected; syncEngine() } }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
+            RoutingPanel2(input, { selected -> input = selected; channelPair = 0; if (selected == InputSource.TEST_TONE && output == OutputSource.NONE) { output = OutputSource.SPEAKER; routeNotice = "测试 Tone 需要本地输出，已切换到扬声器" }; if (selected == InputSource.WIFI) wifiOutputEnabled = false; wifiActive = configureWifiForCurrentRoute(); syncEngine() }, output, { selected -> val applied = if (selected == OutputSource.NONE && input == InputSource.TEST_TONE) { routeNotice = "测试 Tone 需要本地输出，已保持扬声器输出"; OutputSource.SPEAKER } else selected; if (applied == OutputSource.BLUETOOTH && Build.VERSION.SDK_INT >= 31 && ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) { pendingBluetoothOutput = applied; bluetoothPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT) } else { output = applied; syncEngine() } }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
             if (input == InputSource.TEST_TONE) TonePanel(toneWaveform, toneChannels, toneFrequency, toneLevelDb, { toneWaveform = it }, { toneChannels = it }, { toneFrequency = it }, { toneLevelDb = it })
             EnginePanel(rate, { rate = it; syncEngine() }, buffer, { buffer = it; syncEngine() }, running)
             SystemInputPanel(inputInfo, input != InputSource.USB && input != InputSource.WIFI, systemInputBufferMaxMs) { systemInputBufferMaxMs = it }
