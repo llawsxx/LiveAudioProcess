@@ -73,7 +73,8 @@ typedef struct {
     float waveform_dry[512], waveform_wet[512];
     int waveform_count, waveform_pos;
     pthread_mutex_t waveform_lock;
-    int rate, frames, in_channels, pair;
+    int rate, output_rate, frames, in_channels, pair;
+    double output_resample_phase;
     float values[28];
     pthread_mutex_t param_lock, file_lock, stream_lock;
     Biquad eq[2][EQ_BANDS];
@@ -417,19 +418,31 @@ static aaudio_data_callback_result_t output_data_callback(
         atomic_store_explicit(&g.output_callback_started, 1, memory_order_relaxed);
     }
     uint32_t requested = (uint32_t)num_frames;
-    uint32_t take = available < requested ? available : requested;
-    uint32_t offset = read & (g.output_ring_capacity - 1u);
-    uint32_t first = take < g.output_ring_capacity - offset ? take : g.output_ring_capacity - offset;
-    memcpy(target, g.output_ring + (size_t)offset * 2u, (size_t)first * 2u * sizeof(float));
-    if (first < take)
-        memcpy(target + (size_t)first * 2u, g.output_ring, (size_t)(take - first) * 2u * sizeof(float));
-    if (take < requested) {
-        memset(target + (size_t)take * 2u, 0, (size_t)(requested - take) * 2u * sizeof(float));
+    double step = (double)(g.rate > 0 ? g.rate : 48000) /
+                  (double)(g.output_rate > 0 ? g.output_rate : (g.rate > 0 ? g.rate : 48000));
+    double end_position = g.output_resample_phase + (double)requested * step;
+    uint32_t source_needed = (uint32_t)end_position;
+    uint32_t last_index = requested > 0
+            ? (uint32_t)(g.output_resample_phase + (double)(requested - 1u) * step) : 0u;
+    if (available < source_needed || available <= last_index + 1u) {
+        memset(target, 0, (size_t)requested * 2u * sizeof(float));
         unsigned int count = atomic_fetch_add(&g.output_callback_underflows, 1) + 1;
         atomic_store_explicit(&g.output_callback_started, 0, memory_order_relaxed);
         if (count == 1 || count % 100 == 0) LOGI("AAudio output callback underflow count=%u", count);
+        return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
-    atomic_store_explicit(&g.output_read_frame, read + take, memory_order_release);
+    uint32_t offset = read & (g.output_ring_capacity - 1u);
+    for (uint32_t i = 0; i < requested; ++i) {
+        double position = g.output_resample_phase + (double)i * step;
+        uint32_t source_offset = (uint32_t)position;
+        float frac = (float)(position - (double)source_offset);
+        uint32_t p0 = (offset + source_offset) & (g.output_ring_capacity - 1u);
+        uint32_t p1 = (offset + source_offset + 1u) & (g.output_ring_capacity - 1u);
+        target[i * 2] = g.output_ring[p0 * 2] + (g.output_ring[p1 * 2] - g.output_ring[p0 * 2]) * frac;
+        target[i * 2 + 1] = g.output_ring[p0 * 2 + 1] + (g.output_ring[p1 * 2 + 1] - g.output_ring[p0 * 2 + 1]) * frac;
+    }
+    g.output_resample_phase = end_position - (double)source_needed;
+    atomic_store_explicit(&g.output_read_frame, read + source_needed, memory_order_release);
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -1543,14 +1556,14 @@ static int open_stream(AAudioStream **stream, aaudio_direction_t direction, int 
         return 0;
     }
     if (direction == AAUDIO_DIRECTION_OUTPUT) {
+        g.output_rate = AAudioStream_getSampleRate(*stream);
         int burst = AAudioStream_getFramesPerBurst(*stream);
         int capacity = AAudioStream_getBufferCapacityInFrames(*stream);
         int requested_buffer = burst > 0 ? burst * 2 : frames * 2;
         if (capacity > 0 && requested_buffer > capacity) requested_buffer = capacity;
         aaudio_result_t actual_buffer = AAudioStream_setBufferSizeInFrames(*stream, requested_buffer);
         if (actual_buffer < 0) LOGE("AAudio output buffer size request failed: %d", actual_buffer);
-        int output_rate = AAudioStream_getSampleRate(*stream);
-        if (!output_ring_create(burst, frames, output_rate)) {
+        if (!output_ring_create(burst, frames, g.rate)) {
             LOGE("AAudio output ring allocation failed");
             AAudioStream_close(*stream);
             *stream = NULL;
@@ -1593,7 +1606,7 @@ static int open_stream(AAudioStream **stream, aaudio_direction_t direction, int 
     return 1;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEnv*e,jobject o,jint rate,jint frames,jint inDev,jint outDev,jboolean enableOutput,jint channels,jint pair,jboolean useNetworkInput,jint usbFd,jboolean usbInputHost,jboolean usbOutputHost,jint usbBitDepth,jint usbInputBurstPackets,jint usbOutputBurstPackets){
+JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEnv*e,jobject o,jint rate,jint outputRate,jint frames,jint inDev,jint outDev,jboolean enableOutput,jint channels,jint pair,jboolean useNetworkInput,jint usbFd,jboolean usbInputHost,jboolean usbOutputHost,jint usbInputBitDepth,jint usbOutputBitDepth,jint usbInputBurstPackets,jint usbOutputBurstPackets){
     (void)e;(void)o;
     if(atomic_load(&g.running))return JNI_TRUE;
     int input_started=0, output_started=0, audio_thread_started=0;
@@ -1607,10 +1620,10 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
     memset(g.waveform_wet,0,sizeof(g.waveform_wet));
     g.waveform_count=g.waveform_pos=0;
     pthread_mutex_unlock(&g.waveform_lock);
-    memset(g.eq,0,sizeof(g.eq));g.rate=rate;g.frames=frames;g.in_channels=channels;g.pair=pair;g.limiter_gain=1.0;g.limiter_delta=0.0;g.limiter_delay_frames=0;g.limiter_next_iter=g.limiter_next_len=0;loudness_init(rate);g.usb_audio=NULL;g.usb_input_host=usbInputHost?1:0;g.usb_output_host=usbOutputHost?1:0;if(usbFd<0){g.usb_input_host=0;g.usb_output_host=0;}atomic_store(&g.use_network_input,useNetworkInput?1:0);if(useNetworkInput)atomic_store(&g.net_last_packet_ns,now_ns());
+    memset(g.eq,0,sizeof(g.eq));g.rate=rate;g.output_rate=outputRate>0?outputRate:rate;g.output_resample_phase=0.0;g.frames=frames;g.in_channels=channels;g.pair=pair;g.limiter_gain=1.0;g.limiter_delta=0.0;g.limiter_delay_frames=0;g.limiter_next_iter=g.limiter_next_len=0;loudness_init(rate);g.usb_audio=NULL;g.usb_input_host=usbInputHost?1:0;g.usb_output_host=usbOutputHost?1:0;if(usbFd<0){g.usb_input_host=0;g.usb_output_host=0;}atomic_store(&g.use_network_input,useNetworkInput?1:0);if(useNetworkInput)atomic_store(&g.net_last_packet_ns,now_ns());
     atomic_store(&g.reverb_worker_started,0);
     if(usbFd >= 0 && (g.usb_input_host || g.usb_output_host)) {
-        g.usb_audio = usb_host_audio_start(usbFd, rate, usbBitDepth, g.usb_input_host, g.usb_output_host,
+        g.usb_audio = usb_host_audio_start(usbFd, rate, rate, usbInputBitDepth, g.output_rate, usbOutputBitDepth, g.usb_input_host, g.usb_output_host,
                                            g.usb_buffer_max_ms,
                                            frames,
                                            usbInputBurstPackets < 1 ? 1 : (usbInputBurstPackets > 128 ? 128 : usbInputBurstPackets),
@@ -1620,7 +1633,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
         if (g.usb_input_host) g.in_channels = 2;
     }
     if(!g.usb_input_host && !atomic_load(&g.use_network_input) && !atomic_load(&g.tone_enabled) && !open_stream(&g.input,AAUDIO_DIRECTION_INPUT,channels,inDev,rate,frames)){LOGE("AAudio input open failed");usb_host_audio_stop(g.usb_audio);g.usb_audio=NULL;return JNI_FALSE;}
-    if(enableOutput && !g.usb_output_host && !open_stream(&g.output,AAUDIO_DIRECTION_OUTPUT,2,outDev,rate,frames)){LOGE("AAudio output open failed");if(g.input){AAudioStream_close(g.input);g.input=NULL;}input_ring_destroy();usb_host_audio_stop(g.usb_audio);g.usb_audio=NULL;return JNI_FALSE;}
+    if(enableOutput && !g.usb_output_host && !open_stream(&g.output,AAUDIO_DIRECTION_OUTPUT,2,outDev,g.output_rate,frames)){LOGE("AAudio output open failed");if(g.input){AAudioStream_close(g.input);g.input=NULL;}input_ring_destroy();usb_host_audio_stop(g.usb_audio);g.usb_audio=NULL;return JNI_FALSE;}
     g.reverb=convolution_reverb_create(rate,g.values[P_ROOM],g.values[P_DECAY],g.values[P_DAMP]);
     g.net_jitter=calloc(NET_JITTER_SLOTS,sizeof(*g.net_jitter));
     g.net_aac_jitter=calloc(NET_AAC_JITTER_SLOTS,sizeof(*g.net_aac_jitter));

@@ -7,7 +7,7 @@ object NativeAudio {
         System.loadLibrary("audioprocess")
     }.isSuccess
 
-    external fun start(sampleRate: Int, frames: Int, inputDeviceId: Int, outputDeviceId: Int, enableOutput: Boolean, inputChannels: Int, pair: Int, useNetworkInput: Boolean, usbFd: Int, usbInputHost: Boolean, usbOutputHost: Boolean, usbBitDepth: Int, usbInputBurstPackets: Int, usbOutputBurstPackets: Int): Boolean
+    external fun start(inputSampleRate: Int, outputSampleRate: Int, frames: Int, inputDeviceId: Int, outputDeviceId: Int, enableOutput: Boolean, inputChannels: Int, pair: Int, useNetworkInput: Boolean, usbFd: Int, usbInputHost: Boolean, usbOutputHost: Boolean, usbInputBitDepth: Int, usbOutputBitDepth: Int, usbInputBurstPackets: Int, usbOutputBurstPackets: Int): Boolean
     external fun stop()
     external fun stopForRouteChange()
     external fun update(flags: Int, values: FloatArray)

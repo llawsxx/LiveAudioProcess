@@ -28,9 +28,12 @@ static void update_max(std::atomic<uint64_t> &target, uint64_t value) {
 
 class UsbHostAudio {
 public:
-    UsbHostAudio(int fd, int rate, int bitDepth, bool in, bool out, int outputMaxBufferMs,
+    UsbHostAudio(int fd, int processingRate, int inputRate, int inputBitDepth,
+                 int outputRate, int outputBitDepth, bool in, bool out, int outputMaxBufferMs,
                  int processingFrames, int inputBurstPackets, int outputBurstPackets)
-        : rate_(rate), bitDepth_(bitDepth), inputBurstPackets_(std::clamp(inputBurstPackets, 1, 128)),
+        : processingRate_(processingRate), inputRate_(inputRate), inputBitDepth_(inputBitDepth),
+          outputRate_(outputRate), outputBitDepth_(outputBitDepth),
+          inputBurstPackets_(std::clamp(inputBurstPackets, 1, 128)),
           outputBurstPackets_(std::clamp(outputBurstPackets, 1, 128)), inputRing_(kRingFrames * 2),
           outputRing_(kRingFrames * 2) {
         processingFrames_ = std::max(1, processingFrames);
@@ -40,11 +43,12 @@ public:
         USB_HOST_LOGI("USB device opened vid=0x%04x pid=0x%04x name=%s",
                       device_->get_device()->get_vid(), device_->get_device()->get_pid(),
                       device_->get_name().c_str());
-        if (in) startInput(rate);
-        if (out) startOutput(rate);
+        if (in) startInput(inputRate_);
+        if (out) startOutput(outputRate_);
         if ((in && !inputStream_) || (out && !outputStream_)) throw std::runtime_error("requested USB audio route/format not found");
-        USB_HOST_LOGI("USB Host audio started input=%d output=%d, requested=%d Hz/%d-bit, output buffer target=%u/max=%u frames, burst=%d/%d",
-                      inputStream_ != nullptr, outputStream_ != nullptr, rate_, bitDepth_,
+        USB_HOST_LOGI("USB Host audio started input=%d output=%d, processing=%d Hz, input=%d/%d-bit output=%d/%d-bit, output buffer target=%u/max=%u frames, burst=%d/%d",
+                      inputStream_ != nullptr, outputStream_ != nullptr, processingRate_,
+                      inputRate_, inputBitDepth_, outputRate_, outputBitDepth_,
                       outputPrerollFrames_.load(), outputMaxPrerollFrames_.load(),
                       inputBurstPackets_, outputBurstPackets_);
     }
@@ -59,20 +63,32 @@ public:
         uint32_t read = inputRead_.load(std::memory_order_relaxed);
         uint32_t available = write - read;
         if (available > kRingFrames) return 0;
-        uint32_t maxFrames = (uint32_t)((uint64_t)std::max(1, rate_) * (uint32_t)inputMaxBufferMs_.load(std::memory_order_relaxed) / 1000u);
+        const int sourceRate = inputSampleRate_ > 0 ? (int)inputSampleRate_ : inputRate_;
+        uint32_t maxFrames = (uint32_t)((uint64_t)std::max(1, sourceRate) * (uint32_t)inputMaxBufferMs_.load(std::memory_order_relaxed) / 1000u);
         if (maxFrames < (uint32_t)frames) maxFrames = (uint32_t)frames;
         if (available > maxFrames) {
             inputRead_.store(write, std::memory_order_release);
             inputBufferClears_.fetch_add(1, std::memory_order_relaxed);
             return 0;
         }
-        uint32_t n = std::min<uint32_t>((uint32_t)frames, available);
-        uint32_t offset = read & kRingMask;
-        uint32_t first = std::min(n, kRingFrames - offset);
-        std::memcpy(dst, inputRing_.data() + (size_t)offset * 2u, (size_t)first * 2u * sizeof(float));
-        if (first < n) std::memcpy(dst + (size_t)first * 2u, inputRing_.data(), (size_t)(n - first) * 2u * sizeof(float));
-        inputRead_.store(read + n, std::memory_order_release);
-        return (int)n;
+        const double step = (double)sourceRate / (double)std::max(1, processingRate_);
+        int produced = 0;
+        while (produced < frames) {
+            const double position = inputResamplePhase_ + (double)produced * step;
+            const uint32_t index = (uint32_t)position;
+            if (index + 1u >= available) break;
+            const float frac = (float)(position - (double)index);
+            const uint32_t p0 = (read + index) & kRingMask;
+            const uint32_t p1 = (read + index + 1u) & kRingMask;
+            dst[produced * 2] = inputRing_[p0 * 2] + (inputRing_[p1 * 2] - inputRing_[p0 * 2]) * frac;
+            dst[produced * 2 + 1] = inputRing_[p0 * 2 + 1] + (inputRing_[p1 * 2 + 1] - inputRing_[p0 * 2 + 1]) * frac;
+            ++produced;
+        }
+        const double consumedPosition = inputResamplePhase_ + (double)produced * step;
+        const uint32_t consumed = (uint32_t)consumedPosition;
+        inputResamplePhase_ = consumedPosition - (double)consumed;
+        if (consumed > 0) inputRead_.store(read + consumed, std::memory_order_release);
+        return produced;
     }
 
     int write(const float *src, int frames) {
@@ -150,26 +166,40 @@ private:
     void onOutput(uint8_t *data,uint len,int bytes,int ch){
         uint64_t begin=now_us(); if(stopping_.load(std::memory_order_acquire)){std::memset(data,0,len);return;} int stride=bytes*ch;if(stride<=0)return;uint32_t count=(uint32_t)(len/(uint)stride);
         uint32_t write=outputWrite_.load(std::memory_order_acquire),read=outputRead_.load(std::memory_order_relaxed),available=write-read;
-        const uint32_t scale = outputRateScale_;
-        const uint32_t sourceNeeded = (uint32_t)((outputResamplePhase_ + count) / scale);
+        const double step = (double)std::max(1, processingRate_) /
+                            (double)std::max(1u, outputSampleRate_ > 0 ? outputSampleRate_ : (uint32_t)outputRate_);
+        const double endPosition = outputResamplePhase_ + (double)count * step;
+        const uint32_t sourceNeeded = (uint32_t)endPosition;
         if(available>kRingFrames){outputRead_.store(write,std::memory_order_release);outputPrimed_.store(false);outputBufferClears_.fetch_add(1);std::memset(data,0,len);update_max(outputCallbackMaxUs_,now_us()-begin);return;}
         if(!outputPrimed_.load(std::memory_order_relaxed)){uint32_t prefill=outputPrerollFrames_.load(std::memory_order_acquire);if(available<prefill){std::memset(data,0,len);update_max(outputCallbackMaxUs_,now_us()-begin);return;}outputPrimed_.store(true);}
-        if (available < sourceNeeded) {
+        const uint32_t lastIndex = count > 0
+                ? (uint32_t)(outputResamplePhase_ + (double)(count - 1u) * step) : 0u;
+        if (available < sourceNeeded || available <= lastIndex + 1u) {
             std::memset(data,0,len); outputUnderruns_.fetch_add(1); outputPrimed_.store(false);
             update_max(outputCallbackMaxUs_,now_us()-begin); return;
         }
         uint32_t offset=read&kRingMask;
-        for(uint32_t i=0;i<count;++i){uint32_t sourceOffset=(outputResamplePhase_+i)/scale;uint32_t p=(offset+sourceOffset)&kRingMask;uint8_t*f=data+(size_t)i*stride;encode(f,outputRing_[2u*p],bytes);if(ch>1)encode(f+bytes,outputRing_[2u*p+1u],bytes);for(int c=2;c<ch;++c)encode(f+c*bytes,0.0f,bytes);}
-        outputResamplePhase_=(outputResamplePhase_+count)%scale;
+        for(uint32_t i=0;i<count;++i){
+            const double position = outputResamplePhase_ + (double)i * step;
+            const uint32_t sourceOffset = (uint32_t)position;
+            const float frac = (float)(position - (double)sourceOffset);
+            const uint32_t p0=(offset+sourceOffset)&kRingMask;
+            const uint32_t p1=(offset+sourceOffset+1u)&kRingMask;
+            const float left = outputRing_[2u*p0] + (outputRing_[2u*p1] - outputRing_[2u*p0]) * frac;
+            const float right = outputRing_[2u*p0+1u] + (outputRing_[2u*p1+1u] - outputRing_[2u*p0+1u]) * frac;
+            uint8_t*f=data+(size_t)i*stride;encode(f,left,bytes);if(ch>1)encode(f+bytes,right,bytes);for(int c=2;c<ch;++c)encode(f+c*bytes,0.0f,bytes);
+        }
+        const uint32_t consumed = (uint32_t)endPosition;
+        outputResamplePhase_=endPosition-(double)consumed;
         outputRead_.store(read+sourceNeeded,std::memory_order_release);update_max(outputCallbackMaxUs_,now_us()-begin);
     }
     void startInput(int rate){
         auto routes=device_->get_device()->query_audio_routes(uac::UAC_TERMINAL_ANY,uac::UAC_TERMINAL_USB_STREAMING);
         if(routes.empty()){ USB_HOST_LOGE("USB input: no audio route found"); return; }
         const auto&si=device_->get_device()->get_stream_interface(routes.front().get());
-        auto cfg=findCompatibleConfig(si, 2, rate, bitDepth_);
-        if(!cfg) cfg=findCompatibleConfig(si, 1, rate, bitDepth_);
-        if(!cfg) { USB_HOST_LOGE("USB input: no compatible PCM format requested=%d Hz/%d-bit", rate, bitDepth_); return; }
+        auto cfg=findCompatibleConfig(si, 2, rate, inputBitDepth_);
+        if(!cfg) cfg=findCompatibleConfig(si, 1, rate, inputBitDepth_);
+        if(!cfg) { USB_HOST_LOGE("USB input: no compatible PCM format requested=%d Hz/%d-bit", rate, inputBitDepth_); return; }
         if(!cfg)return;
         int bytes=cfg->bSubframeSize,ch=cfg->bChannelCount;
         inputStream_=device_->start_streaming(si,*cfg,[this,bytes,ch](uint8_t*d,uint n){onInput(d,n,bytes,ch);},inputBurstPackets_);
@@ -180,23 +210,24 @@ private:
         auto routes=device_->get_device()->query_audio_routes(uac::UAC_TERMINAL_USB_STREAMING,uac::UAC_TERMINAL_ANY);
         if(routes.empty()){ USB_HOST_LOGE("USB output: no audio route found"); return; }
         const auto&si=device_->get_device()->get_stream_interface(routes.front().get());
-        auto cfg=findCompatibleConfig(si, 2, rate, bitDepth_);
-        if(!cfg) cfg=findCompatibleConfig(si, 1, rate, bitDepth_);
-        if(!cfg) { USB_HOST_LOGE("USB output: no compatible PCM format requested=%d Hz/%d-bit", rate, bitDepth_); return; }
+        auto cfg=findCompatibleConfig(si, 2, rate, outputBitDepth_);
+        if(!cfg) cfg=findCompatibleConfig(si, 1, rate, outputBitDepth_);
+        if(!cfg) { USB_HOST_LOGE("USB output: no compatible PCM format requested=%d Hz/%d-bit", rate, outputBitDepth_); return; }
         int bytes=cfg->bSubframeSize,ch=cfg->bChannelCount;
+        outputSampleRate_=cfg->tSampleRate;
+        outputBitResolution_=cfg->bBitResolution;
+        outputChannels_=cfg->bChannelCount;
         const uint32_t packetIntervalUs = cfg->highSpeed
                 ? (125u << std::max(0, (int)cfg->bInterval - 1))
                 : (1000u << std::max(0, (int)cfg->bInterval - 1));
         const uint32_t packetFrames = packetIntervalUs > 0
-                ? (uint32_t)(((uint64_t)(uint32_t)rate * packetIntervalUs + 999999u) / 1000000u) : 1u;
-        outputRateScale_ = 1;
+                ? (uint32_t)(((uint64_t)(outputSampleRate_ > 0 ? outputSampleRate_ : (uint32_t)outputRate_) * packetIntervalUs + 999999u) / 1000000u) : 1u;
         outputTransferFrames_=outputBurstPackets_*packetFrames;
         outputResamplePhase_ = 0;
         USB_HOST_LOGI("USB output timing packetFrames<=%u intervalUs=%u endpointCapacity=%u bytes",
                       packetFrames, packetIntervalUs, cfg->wMaxPacketSize);
         updateOutputBufferFrames();
         outputStream_=device_->start_streaming(si,*cfg,[this,bytes,ch](uint8_t*d,uint n){onOutput(d,n,bytes,ch);},outputBurstPackets_);
-        outputSampleRate_=cfg->tSampleRate;outputBitResolution_=cfg->bBitResolution;outputChannels_=cfg->bChannelCount;
         USB_HOST_LOGI("USB output actual format=%u Hz/%u-bit/%u ch, subframe=%u B",outputSampleRate_,outputBitResolution_,outputChannels_,cfg->bSubframeSize);
     }
     static std::unique_ptr<const uac::uac_audio_config_uncompressed> findCompatibleConfig(
@@ -218,6 +249,22 @@ private:
             }
         }
         if (!supportedRates.empty()) {
+            std::sort(supportedRates.begin(), supportedRates.end(), [requestedRate](uint32_t a, uint32_t b) {
+                const uint32_t da = a > (uint32_t)requestedRate ? a - (uint32_t)requestedRate : (uint32_t)requestedRate - a;
+                const uint32_t db = b > (uint32_t)requestedRate ? b - (uint32_t)requestedRate : (uint32_t)requestedRate - b;
+                return da < db;
+            });
+            for (uint32_t r : supportedRates) for (int b : bits) {
+                auto cfg = si.query_config_uncompressed(uac::UAC_FORMAT_DATA_PCM,
+                                                         (uint8_t)channels, r, (uint8_t)b);
+                if (!cfg && channels == 2)
+                    cfg = si.query_config_uncompressed(uac::UAC_FORMAT_DATA_PCM, 0, r, (uint8_t)b);
+                if (cfg) {
+                    USB_HOST_LOGI("USB format fallback: requested=%d/%d, selected=%u/%d ch=%d (resampling enabled)",
+                                  requestedRate, requestedBits, r, b, channels);
+                    return cfg;
+                }
+            }
             USB_HOST_LOGE("USB format unsupported at %d Hz; device reports %zu sample rates",
                           requestedRate, supportedRates.size());
             for (uint32_t supported : supportedRates)
@@ -225,11 +272,11 @@ private:
         }
         return nullptr;
     }
-    void updateOutputBufferFrames(){if(outputTransferFrames_<=0)return;int maxMs=std::clamp(outputMaxBufferMs_.load(),5,200);uint32_t maxFrames=std::max<uint32_t>({(uint32_t)outputTransferFrames_,(uint32_t)processingFrames_,(uint32_t)((rate_*maxMs+999)/1000)});maxFrames=std::min<uint32_t>(maxFrames,kRingFrames);uint32_t prefill=std::max<uint32_t>({maxFrames/2u,(uint32_t)outputTransferFrames_,(uint32_t)processingFrames_});if(prefill>maxFrames)prefill=maxFrames;outputPrerollFrames_.store(prefill);outputMaxPrerollFrames_.store(maxFrames);}
-    std::shared_ptr<uac::uac_context> context_;std::shared_ptr<uac::uac_device_handle> device_;std::shared_ptr<uac::uac_stream_handle> inputStream_,outputStream_;std::atomic<bool> stopping_{false};int rate_=48000,bitDepth_=16,inputBurstPackets_=8,outputBurstPackets_=8,outputTransferFrames_=0,processingFrames_=256;uint32_t outputRateScale_=1,outputResamplePhase_=0;std::vector<float> inputRing_,outputRing_;std::atomic<uint32_t> inputRead_{0},inputWrite_{0},outputRead_{0},outputWrite_{0};std::atomic<int> inputMaxBufferMs_{20},outputMaxBufferMs_{50};std::atomic<uint32_t> outputPrerollFrames_{1},outputMaxPrerollFrames_{1};std::atomic<bool> outputPrimed_{false},outputHasData_{false};std::atomic<uint64_t> inputRingOverruns_{0},inputBufferClears_{0},outputRingOverruns_{0},outputUnderruns_{0},outputBufferClears_{0},inputCallbackMaxUs_{0},outputCallbackMaxUs_{0};uint32_t inputSampleRate_=0,outputSampleRate_=0;uint8_t inputBitResolution_=0,inputChannels_=0,outputBitResolution_=0,outputChannels_=0;
+    void updateOutputBufferFrames(){if(outputTransferFrames_<=0)return;int maxMs=std::clamp(outputMaxBufferMs_.load(),5,200);uint32_t maxFrames=std::max<uint32_t>({(uint32_t)outputTransferFrames_,(uint32_t)processingFrames_,(uint32_t)((processingRate_*maxMs+999)/1000)});maxFrames=std::min<uint32_t>(maxFrames,kRingFrames);uint32_t prefill=std::max<uint32_t>({maxFrames/2u,(uint32_t)outputTransferFrames_,(uint32_t)processingFrames_});if(prefill>maxFrames)prefill=maxFrames;outputPrerollFrames_.store(prefill);outputMaxPrerollFrames_.store(maxFrames);}
+    std::shared_ptr<uac::uac_context> context_;std::shared_ptr<uac::uac_device_handle> device_;std::shared_ptr<uac::uac_stream_handle> inputStream_,outputStream_;std::atomic<bool> stopping_{false};int processingRate_=48000,inputRate_=48000,inputBitDepth_=16,outputRate_=48000,outputBitDepth_=16,inputBurstPackets_=8,outputBurstPackets_=8,outputTransferFrames_=0,processingFrames_=256;double inputResamplePhase_=0.0,outputResamplePhase_=0.0;std::vector<float> inputRing_,outputRing_;std::atomic<uint32_t> inputRead_{0},inputWrite_{0},outputRead_{0},outputWrite_{0};std::atomic<int> inputMaxBufferMs_{20},outputMaxBufferMs_{50};std::atomic<uint32_t> outputPrerollFrames_{1},outputMaxPrerollFrames_{1};std::atomic<bool> outputPrimed_{false},outputHasData_{false};std::atomic<uint64_t> inputRingOverruns_{0},inputBufferClears_{0},outputRingOverruns_{0},outputUnderruns_{0},outputBufferClears_{0},inputCallbackMaxUs_{0},outputCallbackMaxUs_{0};uint32_t inputSampleRate_=0,outputSampleRate_=0;uint8_t inputBitResolution_=0,inputChannels_=0,outputBitResolution_=0,outputChannels_=0;
 };
 }
-extern "C" usb_host_audio_t usb_host_audio_start(int fd,int rate,int bitDepth,int in,int out,int maxMs,int processingFrames,int inputBurst,int outputBurst){try{return new UsbHostAudio(fd,rate,bitDepth,in!=0,out!=0,maxMs,processingFrames,inputBurst,outputBurst);}catch(const std::exception&e){USB_HOST_LOGE("USB Host audio start failed: %s",e.what());return nullptr;}catch(...){USB_HOST_LOGE("USB Host audio start failed");return nullptr;}}
+extern "C" usb_host_audio_t usb_host_audio_start(int fd,int processingRate,int inputRate,int inputBitDepth,int outputRate,int outputBitDepth,int in,int out,int maxMs,int processingFrames,int inputBurst,int outputBurst){try{return new UsbHostAudio(fd,processingRate,inputRate,inputBitDepth,outputRate,outputBitDepth,in!=0,out!=0,maxMs,processingFrames,inputBurst,outputBurst);}catch(const std::exception&e){USB_HOST_LOGE("USB Host audio start failed: %s",e.what());return nullptr;}catch(...){USB_HOST_LOGE("USB Host audio start failed");return nullptr;}}
 extern "C" int usb_host_audio_read(usb_host_audio_t a,float*d,int n){return a?static_cast<UsbHostAudio*>(a)->read(d,n):0;}
 extern "C" int usb_host_audio_write(usb_host_audio_t a,const float*d,int n){return a?static_cast<UsbHostAudio*>(a)->write(d,n):0;}
 extern "C" void usb_host_audio_configure_output_buffer(usb_host_audio_t a,int maxMs){if(a)static_cast<UsbHostAudio*>(a)->configureOutputBuffer(maxMs);}

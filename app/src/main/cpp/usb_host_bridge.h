@@ -24,7 +24,9 @@ typedef struct {
     uint8_t output_bit_resolution;
     uint8_t output_channels;
 } usb_host_audio_stats_t;
-usb_host_audio_t usb_host_audio_start(int fd, int sample_rate, int bit_depth,
+usb_host_audio_t usb_host_audio_start(int fd, int processing_rate,
+                                      int input_sample_rate, int input_bit_depth,
+                                      int output_sample_rate, int output_bit_depth,
                                       int enable_input, int enable_output,
                                       int output_max_buffer_ms,
                                       int processing_frames,

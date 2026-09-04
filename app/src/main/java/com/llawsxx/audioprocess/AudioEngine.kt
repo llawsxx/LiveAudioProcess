@@ -48,7 +48,15 @@ class AudioEngine(private val context: Context) {
     @Volatile var outputSource = OutputSource.SPEAKER
         internal set
     @Volatile var sampleRate = 48_000; @Volatile var bufferFrames = 256; @Volatile var inputPair = 0
-    @Volatile var usbBitDepth = 16
+    @Volatile var outputSampleRate = 48_000
+        private set
+    @Volatile var usbInputRate = 48_000
+        private set
+    @Volatile var usbOutputRate = 48_000
+        private set
+    @Volatile var usbInputBitDepth = 16
+        private set
+    @Volatile var usbOutputBitDepth = 16
         private set
     @Volatile var usbInputBurstPackets = 8
         private set
@@ -97,19 +105,29 @@ class AudioEngine(private val context: Context) {
         usbInputBufferMaxMs = normalized
         if (NativeAudio.available) NativeAudio.configureUsbInputBuffer(normalized)
     }
-    fun configureAudioFormat(requestedSampleRate: Int, requestedUsbBitDepth: Int) {
+    fun configureAudioFormat(requestedSampleRate: Int, requestedOutputSampleRate: Int, requestedUsbInputBitDepth: Int, requestedUsbOutputBitDepth: Int) {
         val normalizedRate = requestedSampleRate.takeIf { it == 44_100 || it == 48_000 || it == 96_000 } ?: 48_000
-        val normalizedBitDepth = requestedUsbBitDepth.takeIf { it == 16 || it == 24 || it == 32 } ?: 16
+        val normalizeRate = { value: Int -> value.takeIf { it == 44_100 || it == 48_000 || it == 96_000 } ?: 48_000 }
+        val normalizeBits = { value: Int -> value.takeIf { it == 16 || it == 24 || it == 32 } ?: 16 }
+        val normalizedOutputRate = normalizeRate(requestedOutputSampleRate)
+        val normalizedInputBits = normalizeBits(requestedUsbInputBitDepth)
+        val normalizedOutputBits = normalizeBits(requestedUsbOutputBitDepth)
         val rateChanged = sampleRate != normalizedRate
-        val bitDepthChanged = usbBitDepth != normalizedBitDepth
+        val outputRateChanged = outputSampleRate != normalizedOutputRate
+        val usbBitDepthChanged = usbInputBitDepth != normalizedInputBits || usbOutputBitDepth != normalizedOutputBits
         sampleRate = normalizedRate
-        usbBitDepth = normalizedBitDepth
-        if (isRunning && (rateChanged || (bitDepthChanged && (inputSource == InputSource.USB || outputSource == OutputSource.USB)))) {
+        outputSampleRate = normalizedOutputRate
+        usbInputRate = normalizedRate
+        usbOutputRate = normalizedOutputRate
+        usbInputBitDepth = normalizedInputBits
+        usbOutputBitDepth = normalizedOutputBits
+        if (isRunning && (rateChanged || outputRateChanged || (usbBitDepthChanged && (inputSource == InputSource.USB || outputSource == OutputSource.USB)))) {
             routeNotice = "正在应用新的音频格式"
             routeHandler.removeCallbacks(routeRestart)
             routeHandler.post(routeRestart)
         }
     }
+    fun configureAudioFormat(requestedSampleRate: Int, requestedUsbBitDepth: Int) = configureAudioFormat(requestedSampleRate, requestedSampleRate, requestedUsbBitDepth, requestedUsbBitDepth)
     fun configureUsbBursts(inputPackets: Int, outputPackets: Int) {
         fun normalize(value: Int) = value.takeIf { it == 1 || it == 2 || it == 4 || it == 8 || it == 16 || it == 24  || it == 32  || it == 48  || it == 64  || it == 128 } ?: 8
         val normalizedInput = normalize(inputPackets)
@@ -352,16 +370,16 @@ class AudioEngine(private val context: Context) {
         val usbInputHost = requestedUsbInputHost && usbFd >= 0
         val usbOutputHost = requestedUsbOutputHost && usbFd >= 0
         val enableOutput = outputSource != OutputSource.NONE
-        var started = NativeAudio.start(sampleRate, bufferFrames, inputDeviceId, outputDeviceId, enableOutput, nativeInputChannels, inputPair, useNetworkInput, usbFd, usbInputHost, usbOutputHost, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
+        var started = NativeAudio.start(sampleRate, outputSampleRate, bufferFrames, inputDeviceId, outputDeviceId, enableOutput, nativeInputChannels, inputPair, useNetworkInput, usbFd, usbInputHost, usbOutputHost, usbInputBitDepth, usbOutputBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
         if (!started && usbFd >= 0) {
             usbConnection?.close()
             usbConnection = null
-            lastError = "USB Host 不支持 ${formatSampleRate(sampleRate)} / ${usbBitDepth}-bit，正在回退到系统 USB 音频"
-            started = NativeAudio.start(sampleRate, bufferFrames, inputDeviceId, outputDeviceId, enableOutput, nativeInputChannels, inputPair, useNetworkInput, -1, false, false, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
+            lastError = "USB Host 格式不可用，正在回退到系统 USB 音频"
+            started = NativeAudio.start(sampleRate, outputSampleRate, bufferFrames, inputDeviceId, outputDeviceId, enableOutput, nativeInputChannels, inputPair, useNetworkInput, -1, false, false, usbInputBitDepth, usbOutputBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
         }
         if (!started && inputSource == InputSource.USB && nativeInputChannels == 2) {
             // Keep USB usable on devices whose driver rejects a stereo AAudio request.
-            started = NativeAudio.start(sampleRate, bufferFrames, inputDeviceId, outputDeviceId, enableOutput, 1, inputPair, useNetworkInput, -1, false, false, usbBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
+            started = NativeAudio.start(sampleRate, outputSampleRate, bufferFrames, inputDeviceId, outputDeviceId, enableOutput, 1, inputPair, useNetworkInput, -1, false, false, usbInputBitDepth, usbOutputBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
             if (started) lastError = "USB 输入驱动拒绝立体声，已回退为单声道"
         }
         if (started) isRunning = true

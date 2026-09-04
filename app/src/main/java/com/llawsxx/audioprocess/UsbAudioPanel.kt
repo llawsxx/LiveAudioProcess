@@ -28,7 +28,8 @@ import androidx.compose.ui.unit.sp
 fun UsbAudioPanel(
     maxBuffer: String,
     inputMaxBuffer: String,
-    bitDepth: Int,
+    inputBitDepth: Int,
+    outputBitDepth: Int,
     inputBurstPackets: Int,
     outputBurstPackets: Int,
     inputEnabled: Boolean,
@@ -37,7 +38,8 @@ fun UsbAudioPanel(
     stats: LongArray,
     onMaxBuffer: (String) -> Unit,
     onInputMaxBuffer: (String) -> Unit,
-    onBitDepth: (Int) -> Unit,
+    onInputBitDepth: (Int) -> Unit,
+    onOutputBitDepth: (Int) -> Unit,
     onInputBurstPackets: (Int) -> Unit,
     onOutputBurstPackets: (Int) -> Unit
 ) {
@@ -63,13 +65,19 @@ fun UsbAudioPanel(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf(16, 24, 32).forEach { bits ->
                     FilterChip(
-                        selected = bitDepth == bits,
-                        onClick = { onBitDepth(bits) },
+                        selected = inputBitDepth == bits,
+                        onClick = { onInputBitDepth(bits) },
+                        enabled = inputEnabled,
                         label = { Text("$bits-bit", fontSize = 12.sp) }
                     )
                 }
             }
             Text("输出缓冲", color = muted, fontSize = 12.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(16, 24, 32).forEach { bits ->
+                    FilterChip(selected = outputBitDepth == bits, onClick = { onOutputBitDepth(bits) }, enabled = outputEnabled, label = { Text("$bits-bit", fontSize = 12.sp) })
+                }
+            }
             OutlinedTextField(
                 value = maxBuffer,
                 onValueChange = { if (it.length <= 3 && it.all(Char::isDigit)) onMaxBuffer(it) },
