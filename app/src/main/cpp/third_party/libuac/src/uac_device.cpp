@@ -26,7 +26,7 @@
 namespace uac {
 
     namespace {
-        bool feature_has_volume(const uac_feature_unit *feature, bool uac2);
+        bool feature_has_volume(const uac_feature_unit *feature, bool uac2, int channel);
 
         // Locate the Feature Unit on a route.  UAC topologies normally have
         // the feature unit directly below the output terminal, but mixers and
@@ -40,7 +40,9 @@ namespace uac {
                 pending.pop_back();
                 if (entity->unit && entity->unit->unitType == UAC_AC_FEATURE_UNIT) {
                     const auto *feature = static_cast<const uac_feature_unit *>(entity->unit.get());
-                    if (feature_has_volume(feature, uac2)) return feature;
+                    for (int channel = 0; channel <= feature->channelCount; ++channel) {
+                        if (feature_has_volume(feature, uac2, channel)) return feature;
+                    }
                 }
                 for (const auto *source : entity->sources)
                     pending.push_back(source);
@@ -54,23 +56,62 @@ namespace uac {
             return static_cast<int16_t>(value);
         }
 
-        bool feature_has_volume(const uac_feature_unit *feature, bool uac2) {
-            if (!feature || feature->bControlSize == 0) return false;
-            if (uac2) {
-                // UAC2 uses two capability bits per control: 00 absent,
-                // 01 read-only, 11 host-programmable. Volume is selector 2,
-                // hence the pair at D3..D2.
-                const uint32_t pair = (feature->masterControls >> ((VOLUME_CONTROL - 1) * 2)) & 0x3u;
-                return pair != 0;
-            }
-            // UAC1 uses one presence bit per control; selectors are 1-based.
-            return (feature->masterControls & (1u << (VOLUME_CONTROL - 1))) != 0;
+        uint32_t feature_controls(const uac_feature_unit *feature, int channel) {
+            if (!feature || channel < 0 ||
+                static_cast<size_t>(channel) >= feature->channelControls.size()) return 0;
+            return feature->channelControls[channel];
         }
 
-        bool feature_volume_writable(const uac_feature_unit *feature, bool uac2) {
-            if (!feature_has_volume(feature, uac2)) return false;
+        uint32_t feature_control_capability(const uac_feature_unit *feature, bool uac2,
+                                            int channel, int selector) {
+            if (!feature || feature->bControlSize == 0) return false;
+            const uint32_t controls = feature_controls(feature, channel);
+            if (uac2) {
+                // UAC2 uses two capability bits per control: 00 absent,
+                // 01 read-only, 11 host-programmable.
+                return (controls >> ((selector - 1) * 2)) & 0x3u;
+            }
+            // UAC1 uses one presence bit per control; selectors are 1-based.
+            return (controls & (1u << (selector - 1))) != 0 ? 0x3u : 0u;
+        }
+
+        bool feature_has_volume(const uac_feature_unit *feature, bool uac2, int channel) {
+            return feature_control_capability(feature, uac2, channel, VOLUME_CONTROL) != 0;
+        }
+
+        bool feature_volume_writable(const uac_feature_unit *feature, bool uac2, int channel) {
+            if (!feature_has_volume(feature, uac2, channel)) return false;
             if (!uac2) return true;
-            return ((feature->masterControls >> ((VOLUME_CONTROL - 1) * 2)) & 0x3u) == 0x3u;
+            return feature_control_capability(feature, uac2, channel, VOLUME_CONTROL) == 0x3u;
+        }
+
+        int feature_volume_channel(const uac_feature_unit *feature, bool uac2, bool writable) {
+            if (!feature) return -1;
+            for (int channel = 0; channel <= feature->channelCount; ++channel) {
+                if (writable ? feature_volume_writable(feature, uac2, channel)
+                             : feature_has_volume(feature, uac2, channel)) return channel;
+            }
+            return -1;
+        }
+
+        bool set_feature_mute(libusb_device_handle *handle, const uac_feature_unit *feature,
+                              bool uac2, uint8_t interfaceNumber, bool muted,
+                              bool *supported) {
+            if (supported) *supported = false;
+            uint8_t data = muted ? 1 : 0;
+            for (int channel = 0; feature && channel <= feature->channelCount; ++channel) {
+                if (feature_control_capability(feature, uac2, channel, MUTE_CONTROL) != 0x3u)
+                    continue;
+                if (supported) *supported = true;
+                const int result = libusb_control_transfer(
+                    handle, REQ_TYPE_IF_SET, uac2 ? REQ_CUR : REQ_SET_CUR,
+                    MUTE_CONTROL << 8 | channel,
+                    feature->bUnitID << 8 | interfaceNumber,
+                    &data, sizeof(data), 1000);
+                if (result != sizeof(data)) return false;
+                if (channel == 0) break;
+            }
+            return true;
         }
     }
 
@@ -287,12 +328,14 @@ namespace uac {
     int32_t uac_device_handle_impl::get_feature_master_volume(const uac_audio_route &route) {
         auto route_impl = static_cast<const uac_audio_route_impl&>(route);
         const int cs = VOLUME_CONTROL;
-        const int cn = 0;
         const uac_feature_unit *feature = find_feature_unit(route_impl.entry.get(), device->audiocontrol->uac2);
         if (!feature)
             throw usb_exception_impl("get_feature_master_volume", LIBUSB_ERROR_NOT_SUPPORTED);
         const int unit = feature->bUnitID;
         const bool uac2 = device->audiocontrol->uac2;
+        const int cn = feature_volume_channel(feature, uac2, false);
+        if (cn < 0)
+            throw usb_exception_impl("get_feature_master_volume", LIBUSB_ERROR_NOT_SUPPORTED);
         uint8_t data[2] = {0, 0};
 
         int errval = libusb_control_transfer(
@@ -315,18 +358,39 @@ namespace uac {
     bool uac_device_handle_impl::set_feature_master_volume(const uac_audio_route &route, int32_t volume) {
         auto route_impl = static_cast<const uac_audio_route_impl&>(route);
         const uac_feature_unit *feature = find_feature_unit(route_impl.entry.get(), device->audiocontrol->uac2);
-        if (!feature_volume_writable(feature, device->audiocontrol->uac2)) return false;
         const bool uac2 = device->audiocontrol->uac2;
+        if (feature_volume_channel(feature, uac2, true) < 0) return false;
         uint8_t data[4] = {0, 0, 0, 0};
         const int width = 2;
         const int16_t native = static_cast<int16_t>(std::max(-32768, std::min(32767, volume)));
+        const uint8_t interfaceNumber = device->audiocontrol->bInterfaceNumber;
+        bool muteSupported = false;
+        if (native == INT16_MIN) {
+            const bool muteSet = set_feature_mute(usb_handle, feature, uac2, interfaceNumber,
+                                                  true, &muteSupported);
+            if (muteSupported) return muteSet;
+        } else {
+            // A previous 0% setting may have enabled Feature Unit Mute.
+            if (!set_feature_mute(usb_handle, feature, uac2, interfaceNumber,
+                                  false, &muteSupported) && muteSupported) return false;
+        }
         data[0] = static_cast<uint8_t>(native);
         data[1] = static_cast<uint8_t>(native >> 8);
-        const int errval = libusb_control_transfer(
-            usb_handle, REQ_TYPE_IF_SET, uac2 ? REQ_CUR : REQ_SET_CUR,
-            VOLUME_CONTROL << 8, feature->bUnitID << 8 | device->audiocontrol->bInterfaceNumber,
-            data, width, 1000);
-        return errval == width;
+        bool changed = false;
+        for (int channel = 0; channel <= feature->channelCount; ++channel) {
+            // A writable master control affects every channel. Otherwise set
+            // each writable logical channel to preserve left/right balance.
+            if (!feature_volume_writable(feature, uac2, channel)) continue;
+            const int errval = libusb_control_transfer(
+                usb_handle, REQ_TYPE_IF_SET, uac2 ? REQ_CUR : REQ_SET_CUR,
+                VOLUME_CONTROL << 8 | channel,
+                feature->bUnitID << 8 | interfaceNumber,
+                data, width, 1000);
+            if (errval != width) return false;
+            changed = true;
+            if (channel == 0) break;
+        }
+        return changed;
     }
 
     bool uac_device_handle_impl::get_feature_master_volume_range(const uac_audio_route &route,
@@ -337,7 +401,10 @@ namespace uac {
         const uac_feature_unit *feature = find_feature_unit(route_impl.entry.get(), device->audiocontrol->uac2);
         if (!feature) return false;
         const bool uac2 = device->audiocontrol->uac2;
-        const uint16_t value = VOLUME_CONTROL << 8;
+        int channel = feature_volume_channel(feature, uac2, true);
+        if (channel < 0) channel = feature_volume_channel(feature, uac2, false);
+        if (channel < 0) return false;
+        const uint16_t value = VOLUME_CONTROL << 8 | channel;
         const uint16_t index = feature->bUnitID << 8 | device->audiocontrol->bInterfaceNumber;
         if (uac2) {
             // UAC2 Feature Unit RANGE returns wNumSubRanges followed by signed

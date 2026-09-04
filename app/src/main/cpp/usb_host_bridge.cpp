@@ -137,6 +137,8 @@ public:
                 return false;
             }
             volumeRangeValid_ = true;
+            USB_HOST_LOGI("USB output volume range min=%d max=%d res=%d (1/256 dB)",
+                          volumeMin_, volumeMax_, volumeRes_);
         }
         const int p = std::clamp(percent, 0, 100);
         // UAC Volume reserves 0x8000 as the mandatory digital-silence code;
@@ -148,8 +150,15 @@ public:
             if (volumeRes_ > 0) value = volumeMin_ + ((value - volumeMin_ + volumeRes_ / 2) / volumeRes_) * volumeRes_;
             value = std::clamp<int64_t>(value, volumeMin_, volumeMax_);
         }
-        const bool ok = device_->set_feature_master_volume(*outputRoute_, (int32_t)value);
+        const int32_t raw = static_cast<int32_t>(value);
+        if (volumeRawValid_ && raw == volumeRaw_) return true;
+        const bool ok = device_->set_feature_master_volume(*outputRoute_, raw);
         if (!ok) USB_HOST_LOGE("USB output volume SET_CUR failed percent=%d", p);
+        else {
+            volumeRaw_ = raw;
+            volumeRawValid_ = true;
+            USB_HOST_LOGI("USB output volume SET_CUR success percent=%d raw=%d", p, raw);
+        }
         return ok;
     }
 
@@ -298,7 +307,7 @@ private:
         return nullptr;
     }
     void updateOutputBufferFrames(){if(outputTransferFrames_<=0)return;int maxMs=std::clamp(outputMaxBufferMs_.load(),5,200);uint32_t maxFrames=std::max<uint32_t>({(uint32_t)outputTransferFrames_,(uint32_t)processingFrames_,(uint32_t)((processingRate_*maxMs+999)/1000)});maxFrames=std::min<uint32_t>(maxFrames,kRingFrames);uint32_t prefill=std::max<uint32_t>({maxFrames/2u,(uint32_t)outputTransferFrames_,(uint32_t)processingFrames_});if(prefill>maxFrames)prefill=maxFrames;outputPrerollFrames_.store(prefill);outputMaxPrerollFrames_.store(maxFrames);}
-    std::shared_ptr<uac::uac_context> context_;std::shared_ptr<uac::uac_device_handle> device_;std::shared_ptr<uac::uac_stream_handle> inputStream_,outputStream_;const uac::uac_audio_route *outputRoute_=nullptr;bool volumeRangeValid_=false;int32_t volumeMin_=0,volumeMax_=0,volumeRes_=0;std::atomic<bool> stopping_{false};int processingRate_=48000,inputRate_=48000,inputBitDepth_=16,outputRate_=48000,outputBitDepth_=16,inputBurstPackets_=8,outputBurstPackets_=8,outputTransferFrames_=0,processingFrames_=256;double inputResamplePhase_=0.0,outputResamplePhase_=0.0;std::vector<float> inputRing_,outputRing_;std::atomic<uint32_t> inputRead_{0},inputWrite_{0},outputRead_{0},outputWrite_{0};std::atomic<int> inputMaxBufferMs_{20},outputMaxBufferMs_{50};std::atomic<uint32_t> outputPrerollFrames_{1},outputMaxPrerollFrames_{1};std::atomic<bool> outputPrimed_{false},outputHasData_{false};std::atomic<uint64_t> inputRingOverruns_{0},inputBufferClears_{0},outputRingOverruns_{0},outputUnderruns_{0},outputBufferClears_{0},inputCallbackMaxUs_{0},outputCallbackMaxUs_{0};uint32_t inputSampleRate_=0,outputSampleRate_=0;uint8_t inputBitResolution_=0,inputChannels_=0,outputBitResolution_=0,outputChannels_=0;
+    std::shared_ptr<uac::uac_context> context_;std::shared_ptr<uac::uac_device_handle> device_;std::shared_ptr<uac::uac_stream_handle> inputStream_,outputStream_;const uac::uac_audio_route *outputRoute_=nullptr;bool volumeRangeValid_=false,volumeRawValid_=false;int32_t volumeMin_=0,volumeMax_=0,volumeRes_=0,volumeRaw_=0;std::atomic<bool> stopping_{false};int processingRate_=48000,inputRate_=48000,inputBitDepth_=16,outputRate_=48000,outputBitDepth_=16,inputBurstPackets_=8,outputBurstPackets_=8,outputTransferFrames_=0,processingFrames_=256;double inputResamplePhase_=0.0,outputResamplePhase_=0.0;std::vector<float> inputRing_,outputRing_;std::atomic<uint32_t> inputRead_{0},inputWrite_{0},outputRead_{0},outputWrite_{0};std::atomic<int> inputMaxBufferMs_{20},outputMaxBufferMs_{50};std::atomic<uint32_t> outputPrerollFrames_{1},outputMaxPrerollFrames_{1};std::atomic<bool> outputPrimed_{false},outputHasData_{false};std::atomic<uint64_t> inputRingOverruns_{0},inputBufferClears_{0},outputRingOverruns_{0},outputUnderruns_{0},outputBufferClears_{0},inputCallbackMaxUs_{0},outputCallbackMaxUs_{0};uint32_t inputSampleRate_=0,outputSampleRate_=0;uint8_t inputBitResolution_=0,inputChannels_=0,outputBitResolution_=0,outputChannels_=0;
 };
 }
 extern "C" usb_host_audio_t usb_host_audio_start(int fd,int processingRate,int inputRate,int inputBitDepth,int outputRate,int outputBitDepth,int in,int out,int maxMs,int processingFrames,int inputBurst,int outputBurst){try{return new UsbHostAudio(fd,processingRate,inputRate,inputBitDepth,outputRate,outputBitDepth,in!=0,out!=0,maxMs,processingFrames,inputBurst,outputBurst);}catch(const std::exception&e){USB_HOST_LOGE("USB Host audio start failed: %s",e.what());return nullptr;}catch(...){USB_HOST_LOGE("USB Host audio start failed");return nullptr;}}

@@ -15,6 +15,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <vector>
 
 /* USB Device Class Definitions for Audio Devices 1.0 */
 namespace uac {
@@ -150,7 +151,7 @@ namespace uac {
         // that a UAC1 device does not advertise.
         uint32_t masterControls = 0;
         uint8_t channelCount = 0;
-        uint8_t bmaControls[];
+        std::vector<uint32_t> channelControls;
     };
 
     /*=============================

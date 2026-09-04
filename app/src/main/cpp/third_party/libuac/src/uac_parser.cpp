@@ -358,20 +358,35 @@ namespace uac {
         // UAC2 stores four bytes per control; UAC1 carries bControlSize here.
         unit->bControlSize = uac2 ? 4 : data[5];
         if (unit->bControlSize != 0 && size > 5) {
-            const int controlsOffset = 6;
+            // UAC1 has bControlSize at offset 5, so its first bitmap starts
+            // at offset 6. UAC2 omits bControlSize and starts bmaControls(0)
+            // directly at offset 5.
+            const int controlsOffset = uac2 ? 5 : 6;
             const int available = std::max(0, size - controlsOffset);
             const int width = std::min<int>(unit->bControlSize, 4);
             if (available >= width) {
-                for (int i = 0; i < width; ++i)
-                    unit->masterControls |= static_cast<uint32_t>(data[controlsOffset + i]) << (8 * i);
                 const int stride = unit->bControlSize;
                 const int count = uac2
                         ? ((size >= 6 && stride > 0) ? (size - 6) / stride - 1 : 0)
                         : ((size >= 7 && stride > 0) ? (size - 7) / stride - 1 : 0);
                 unit->channelCount = static_cast<uint8_t>(std::max(0, count));
+                for (int channel = 0; channel <= unit->channelCount; ++channel) {
+                    const int offset = controlsOffset + channel * stride;
+                    if (offset + width > size - 1) break; // preserve trailing iFeature
+                    uint32_t controls = 0;
+                    for (int i = 0; i < width; ++i)
+                        controls |= static_cast<uint32_t>(data[offset + i]) << (8 * i);
+                    unit->channelControls.push_back(controls);
+                    LOG_DEBUG("\t FEATURE_UNIT %u channel=%d controls=0x%08x",
+                              unit->bUnitID, channel, controls);
+                }
+                if (!unit->channelControls.empty())
+                    unit->masterControls = unit->channelControls.front();
             }
         }
-        LOG_DEBUG("\t got FEATURE_UNIT %d: bSourceId=0x%x", unit->bUnitID, unit->bSourceId);
+        LOG_DEBUG("\t got FEATURE_UNIT %d: bSourceId=0x%x controlSize=%u masterControls=0x%08x channels=%u",
+                  unit->bUnitID, unit->bSourceId, unit->bControlSize,
+                  unit->masterControls, unit->channelCount);
         return unit;
     }
 

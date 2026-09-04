@@ -126,7 +126,7 @@ private fun LiveAudioProcessApp() {
     var inputLevelL by remember { mutableFloatStateOf(0.08f) }; var inputLevelR by remember { mutableFloatStateOf(0.08f) }
     var outputLevelL by remember { mutableFloatStateOf(0.05f) }; var outputLevelR by remember { mutableFloatStateOf(0.05f) }
     var systemOutputVolumePercent by remember { mutableIntStateOf(engine.systemVolumePercent()) }
-    var usbOutputVolumePercent by remember { mutableIntStateOf((prefs.getInt("usbOutputVolumePercent", prefs.getInt("outputVolumePercent", 100)) / 5).coerceIn(0, 20) * 5) }
+    var usbOutputVolumePercent by remember { mutableIntStateOf(prefs.getInt("usbOutputVolumePercent", prefs.getInt("outputVolumePercent", 100)).coerceIn(0, 100)) }
     val outputVolumePercent = if (output == OutputSource.USB) usbOutputVolumePercent else systemOutputVolumePercent
     var inputPeakL by remember { mutableFloatStateOf(0f) }; var inputPeakR by remember { mutableFloatStateOf(0f) }
     var outputPeakL by remember { mutableFloatStateOf(0f) }; var outputPeakR by remember { mutableFloatStateOf(0f) }
@@ -363,7 +363,7 @@ private fun LiveAudioProcessApp() {
     Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("输出音量", color = Color.White, fontWeight = FontWeight.SemiBold); Text("$value% · ${if (usb) "USB Host" else "AAudio 系统"}", color = Teal, fontSize = 12.sp) }
-            Slider(value = value.toFloat(), onValueChange = { onChange((it / 5f).roundToInt() * 5) }, valueRange = 0f..100f, steps = 19, enabled = enabled)
+            Slider(value = value.toFloat(), onValueChange = { onChange(it.roundToInt().coerceIn(0, 100)) }, valueRange = 0f..100f, steps = 99, enabled = enabled)
         }
     }
 }
