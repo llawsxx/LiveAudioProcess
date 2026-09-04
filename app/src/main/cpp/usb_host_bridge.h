@@ -35,6 +35,7 @@ int usb_host_audio_read(usb_host_audio_t audio, float *stereo, int frames);
 int usb_host_audio_write(usb_host_audio_t audio, const float *stereo, int frames);
 void usb_host_audio_configure_output_buffer(usb_host_audio_t audio, int max_buffer_ms);
 void usb_host_audio_configure_input_buffer(usb_host_audio_t audio, int max_buffer_ms);
+int usb_host_audio_set_volume(usb_host_audio_t audio, int percent);
 void usb_host_audio_get_stats(usb_host_audio_t audio, usb_host_audio_stats_t *stats);
 void usb_host_audio_stop(usb_host_audio_t audio);
 #ifdef __cplusplus

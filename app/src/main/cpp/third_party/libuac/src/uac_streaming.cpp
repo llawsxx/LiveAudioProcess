@@ -393,10 +393,12 @@ namespace uac {
             uac2 ? ((int)clockSourceId << 8 | dev_handle->device->audiocontrol->bInterfaceNumber) : ep,
             (uint8_t*) &data,
             uac2 ? 4 : 3,
-            0 /* timeout */);
+            1000 /* timeout ms */);
 
         if (errval < 0)
             throw usb_exception_impl("set_sampling_freq()", (libusb_error)errval);
+        if (errval != (uac2 ? 4 : 3))
+            throw usb_exception_impl("set_sampling_freq()", LIBUSB_ERROR_IO);
     }
 
     uint32_t uac_stream_handle_impl::get_sampling_freq() {
@@ -408,15 +410,17 @@ namespace uac {
         int errval = libusb_control_transfer(
             dev_handle->usb_handle,
             uac2 ? REQ_TYPE_IF_GET : REQ_TYPE_EP_GET,
-            uac2 ? REQ_SET_CUR : REQ_GET_CUR,
+            uac2 ? REQ_CUR : REQ_GET_CUR,
             cs << 8,
             uac2 ? ((int)clockSourceId << 8 | dev_handle->device->audiocontrol->bInterfaceNumber) : ep,
             (uint8_t *)&data,
             uac2 ? 4 : 3,
-            0 /* timeout */);
+            1000 /* timeout ms */);
 
         if (errval < 0)
             throw usb_exception_impl("get_sampling_freq()", (libusb_error)errval);
+        if (errval != (uac2 ? 4 : 3))
+            throw usb_exception_impl("get_sampling_freq()", LIBUSB_ERROR_IO);
 
         uint32_t samplingFreq = uac2 ? (uint32_t)TO_DWORD(data) : TO_DWORD24(data);
         LOG_DEBUG("get_sampling_freq (%d)", samplingFreq);

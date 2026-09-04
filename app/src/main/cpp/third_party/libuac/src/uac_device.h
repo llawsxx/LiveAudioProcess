@@ -70,7 +70,9 @@ namespace uac {
         std::string get_name() const override;
 
         bool is_master_muted(const uac_audio_route &route) override;
-        int16_t get_feature_master_volume(const uac_audio_route &route) override;
+        int32_t get_feature_master_volume(const uac_audio_route &route) override;
+        bool set_feature_master_volume(const uac_audio_route &route, int32_t volume) override;
+        bool get_feature_master_volume_range(const uac_audio_route &route, int32_t *min, int32_t *max, int32_t *res) override;
 
         void dump(FILE *f) const override;
 

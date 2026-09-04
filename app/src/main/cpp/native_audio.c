@@ -1861,6 +1861,7 @@ JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureUsbOut
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureOutputBufferMaxMs(JNIEnv*e,jobject o,jint maxMs){(void)e;(void)o;int normalized=maxMs<5?5:(maxMs>200?200:maxMs);atomic_store(&g.output_buffer_max_ms,normalized);output_ring_update_limits(g.rate,g.frames);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureInputBufferMaxMs(JNIEnv*e,jobject o,jint maxMs){(void)e;(void)o;int normalized=maxMs<5?5:(maxMs>200?200:maxMs);atomic_store(&g.input_buffer_max_ms,normalized);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureUsbInputBuffer(JNIEnv*e,jobject o,jint maxMs){(void)e;(void)o;int normalized=maxMs<5?5:(maxMs>200?200:maxMs);atomic_store(&g.usb_input_buffer_max_ms,normalized);usb_host_audio_configure_input_buffer(g.usb_audio,normalized);}
+JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_setUsbVolume(JNIEnv*e,jobject o,jint percent){(void)e;(void)o;return usb_host_audio_set_volume(g.usb_audio,percent)?JNI_TRUE:JNI_FALSE;}
 JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkInputTimedOut(JNIEnv*e,jobject o,jint timeoutMs){
     (void)e;(void)o;
     if(atomic_load(&g.net_role)!=2||timeoutMs<=0)return JNI_FALSE;

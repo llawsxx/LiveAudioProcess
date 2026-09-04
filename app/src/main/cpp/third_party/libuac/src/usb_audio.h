@@ -145,6 +145,11 @@ namespace uac {
     struct uac_feature_unit : uac_unit {
         uint8_t bSourceId;
         uint8_t bControlSize;
+        // Master-channel control bitmap (bit 1 is VOLUME_CONTROL).  Keeping
+        // this parsed value lets callers avoid issuing requests for controls
+        // that a UAC1 device does not advertise.
+        uint32_t masterControls = 0;
+        uint8_t channelCount = 0;
         uint8_t bmaControls[];
     };
 
@@ -252,7 +257,9 @@ namespace uac {
      */
     enum usb_request_get {
         REQ_SET_CUR = 0x01,
+        REQ_CUR = 0x01,
         REQ_SET_MIN = 0x02,
+        REQ_RANGE = 0x02,
         REQ_SET_MAX = 0x03,
         REQ_SET_RES = 0x04,
         REQ_GET_CUR = 0x81,

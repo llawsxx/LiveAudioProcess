@@ -277,7 +277,15 @@ namespace uac {
         virtual std::string get_name() const = 0;
 
         virtual bool is_master_muted(const uac_audio_route &route) = 0;
-        virtual int16_t get_feature_master_volume(const uac_audio_route &route) = 0;
+        virtual int32_t get_feature_master_volume(const uac_audio_route &route) = 0;
+        /** Set the master Feature Unit volume in signed 8.8 dB units.
+         * Feature Unit volume data is 2 bytes for both UAC1 and UAC2. */
+        virtual bool set_feature_master_volume(const uac_audio_route &route, int32_t volume) = 0;
+        /** Query the native volume range. Returns false when the route has no
+         * usable Feature Unit volume control. */
+        virtual bool get_feature_master_volume_range(const uac_audio_route &route,
+                                                      int32_t *min, int32_t *max,
+                                                      int32_t *res) = 0;
 
         virtual void dump(FILE *f) const = 0;
     };

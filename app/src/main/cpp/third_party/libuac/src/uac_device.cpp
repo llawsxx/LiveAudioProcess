@@ -25,6 +25,37 @@
 
 namespace uac {
 
+    namespace {
+        // Locate the Feature Unit on a route.  UAC topologies normally have
+        // the feature unit directly below the output terminal, but mixers and
+        // selector units may insert additional nodes, so do not assume
+        // sources[0] is the volume unit.
+        const uac_feature_unit *find_feature_unit(const uac_topology_entity *root) {
+            if (!root) return nullptr;
+            std::vector<const uac_topology_entity *> pending{root};
+            while (!pending.empty()) {
+                const auto *entity = pending.back();
+                pending.pop_back();
+                if (entity->unit && entity->unit->unitType == UAC_AC_FEATURE_UNIT)
+                    return static_cast<const uac_feature_unit *>(entity->unit.get());
+                for (const auto *source : entity->sources)
+                    pending.push_back(source);
+            }
+            return nullptr;
+        }
+
+        int16_t read_le16(const uint8_t *data) {
+            const uint16_t value = static_cast<uint16_t>(data[0]) |
+                                   (static_cast<uint16_t>(data[1]) << 8);
+            return static_cast<int16_t>(value);
+        }
+
+        bool feature_has_volume(const uac_feature_unit *feature) {
+            return feature && feature->bControlSize != 0 &&
+                   (feature->masterControls & (1u << VOLUME_CONTROL)) != 0;
+        }
+    }
+
     uac_device_impl::uac_device_impl(std::shared_ptr<uac_context> context, libusb_device *usb_device) : context(std::move(context)), usb_device(usb_device) {
         libusb_device_descriptor desc{};
         libusb_get_device_descriptor(usb_device, &desc);
@@ -221,40 +252,102 @@ namespace uac {
         int errval = libusb_control_transfer(
             usb_handle,
             REQ_TYPE_IF_GET,
-            REQ_GET_CUR,
+            device->audiocontrol->uac2 ? REQ_CUR : REQ_GET_CUR,
             cs << 8 | cn,
             unit << 8 | device->audiocontrol->bInterfaceNumber,
             &data,
             sizeof(data),
-            0 /* timeout */);
+            1000 /* timeout ms */);
 
         if (errval < 0)
             throw usb_exception_impl("is_master_muted()", (libusb_error)errval);
-        else
-            return data;
+        if (errval != sizeof(data))
+            throw usb_exception_impl("is_master_muted()", LIBUSB_ERROR_IO);
+        return data != 0;
     }
 
-    int16_t uac_device_handle_impl::get_feature_master_volume(const uac_audio_route &route) {
+    int32_t uac_device_handle_impl::get_feature_master_volume(const uac_audio_route &route) {
         auto route_impl = static_cast<const uac_audio_route_impl&>(route);
         const int cs = VOLUME_CONTROL;
         const int cn = 0;
-        const int unit = route_impl.entry->sources[0]->unit->bUnitID;
-        int16_t data = 0;
+        const uac_feature_unit *feature = find_feature_unit(route_impl.entry.get());
+        if (!feature_has_volume(feature))
+            throw usb_exception_impl("get_feature_master_volume", LIBUSB_ERROR_NOT_SUPPORTED);
+        const int unit = feature->bUnitID;
+        const bool uac2 = device->audiocontrol->uac2;
+        uint8_t data[2] = {0, 0};
 
         int errval = libusb_control_transfer(
             usb_handle,
             REQ_TYPE_IF_GET,
-            REQ_GET_CUR,
+            uac2 ? REQ_CUR : REQ_GET_CUR,
             cs << 8 | cn,
             unit << 8 | device->audiocontrol->bInterfaceNumber,
-            (uint8_t*) &data,
+            data,
             sizeof(data),
-            0 /* timeout */);
+            1000 /* timeout ms */);
 
         if (errval < 0)
             throw usb_exception_impl("get_feature_master_volume", (libusb_error)errval);
-        else
-            return data;
+        if (errval != sizeof(data))
+            throw usb_exception_impl("get_feature_master_volume", LIBUSB_ERROR_IO);
+        return read_le16(data);
+    }
+
+    bool uac_device_handle_impl::set_feature_master_volume(const uac_audio_route &route, int32_t volume) {
+        auto route_impl = static_cast<const uac_audio_route_impl&>(route);
+        const uac_feature_unit *feature = find_feature_unit(route_impl.entry.get());
+        if (!feature_has_volume(feature)) return false;
+        const bool uac2 = device->audiocontrol->uac2;
+        uint8_t data[4] = {0, 0, 0, 0};
+        const int width = 2;
+        const int16_t native = static_cast<int16_t>(std::max(-32768, std::min(32767, volume)));
+        data[0] = static_cast<uint8_t>(native);
+        data[1] = static_cast<uint8_t>(native >> 8);
+        const int errval = libusb_control_transfer(
+            usb_handle, REQ_TYPE_IF_SET, uac2 ? REQ_CUR : REQ_SET_CUR,
+            VOLUME_CONTROL << 8, feature->bUnitID << 8 | device->audiocontrol->bInterfaceNumber,
+            data, width, 1000);
+        return errval == width;
+    }
+
+    bool uac_device_handle_impl::get_feature_master_volume_range(const uac_audio_route &route,
+                                                                  int32_t *min, int32_t *max,
+                                                                  int32_t *res) {
+        if (!min || !max || !res) return false;
+        auto route_impl = static_cast<const uac_audio_route_impl&>(route);
+        const uac_feature_unit *feature = find_feature_unit(route_impl.entry.get());
+        if (!feature_has_volume(feature)) return false;
+        const bool uac2 = device->audiocontrol->uac2;
+        const uint16_t value = VOLUME_CONTROL << 8;
+        const uint16_t index = feature->bUnitID << 8 | device->audiocontrol->bInterfaceNumber;
+        if (uac2) {
+            // UAC2 Feature Unit RANGE returns wNumSubRanges followed by signed
+            // 8.8 dB min/max/res values (2 bytes each). Clock Source sample
+            // frequency RANGE is the separate UAC2 control that uses 4-byte
+            // values.
+            // min/max/res values for each subrange.
+            uint8_t data[8] = {0};
+            const int n = libusb_control_transfer(usb_handle, REQ_TYPE_IF_GET, REQ_RANGE,
+                                                   value, index, data, sizeof(data), 1000);
+            if (n < 8 || (data[0] == 0 && data[1] == 0)) return false;
+            auto read16 = [](const uint8_t *p) -> int32_t {
+                return static_cast<int16_t>(static_cast<uint16_t>(p[0]) |
+                                            (static_cast<uint16_t>(p[1]) << 8));
+            };
+            *min = read16(data + 2); *max = read16(data + 4); *res = read16(data + 6);
+            return *max >= *min;
+        }
+        auto read16 = [&](uint8_t request, int32_t *out) -> bool {
+            uint8_t data[2] = {0};
+            const int n = libusb_control_transfer(usb_handle, REQ_TYPE_IF_GET, request,
+                                                   value, index, data, sizeof(data), 1000);
+            if (n != 2) return false;
+            *out = static_cast<int16_t>(static_cast<uint16_t>(data[0]) |
+                                        (static_cast<uint16_t>(data[1]) << 8));
+            return true;
+        };
+        return read16(REQ_GET_MIN, min) && read16(REQ_GET_MAX, max) && read16(REQ_GET_RES, res) && *max >= *min;
     }
 
     std::string uac_device_handle_impl::getString(uint8_t index) const {

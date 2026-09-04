@@ -129,6 +129,25 @@ public:
         inputMaxBufferMs_.store(std::clamp(maxBufferMs, 5, 200), std::memory_order_relaxed);
     }
 
+    bool setVolumePercent(int percent) {
+        if (!outputRoute_) return false;
+        if (!volumeRangeValid_) {
+            if (!device_->get_feature_master_volume_range(*outputRoute_, &volumeMin_, &volumeMax_, &volumeRes_)) {
+                USB_HOST_LOGE("USB output volume control is not available");
+                return false;
+            }
+            volumeRangeValid_ = true;
+        }
+        const int p = std::clamp(percent, 0, 100);
+        const int64_t span = (int64_t)volumeMax_ - (int64_t)volumeMin_;
+        int64_t value = (int64_t)volumeMin_ + (span * p) / 100;
+        if (volumeRes_ > 0) value = volumeMin_ + ((value - volumeMin_ + volumeRes_ / 2) / volumeRes_) * volumeRes_;
+        value = std::clamp<int64_t>(value, volumeMin_, volumeMax_);
+        const bool ok = device_->set_feature_master_volume(*outputRoute_, (int32_t)value);
+        if (!ok) USB_HOST_LOGE("USB output volume SET_CUR failed percent=%d", p);
+        return ok;
+    }
+
     usb_host_audio_stats_t stats() const {
         usb_host_audio_stats_t result{};
         if (inputStream_) { auto s = inputStream_->get_streaming_stats(); result.input_packet_errors=s.packet_errors; result.input_empty_packets=s.empty_packets; result.input_transfer_errors=s.transfer_errors; }
@@ -209,6 +228,7 @@ private:
     void startOutput(int rate){
         auto routes=device_->get_device()->query_audio_routes(uac::UAC_TERMINAL_USB_STREAMING,uac::UAC_TERMINAL_ANY);
         if(routes.empty()){ USB_HOST_LOGE("USB output: no audio route found"); return; }
+        outputRoute_ = &routes.front().get();
         const auto&si=device_->get_device()->get_stream_interface(routes.front().get());
         auto cfg=findCompatibleConfig(si, 2, rate, outputBitDepth_);
         if(!cfg) cfg=findCompatibleConfig(si, 1, rate, outputBitDepth_);
@@ -273,7 +293,7 @@ private:
         return nullptr;
     }
     void updateOutputBufferFrames(){if(outputTransferFrames_<=0)return;int maxMs=std::clamp(outputMaxBufferMs_.load(),5,200);uint32_t maxFrames=std::max<uint32_t>({(uint32_t)outputTransferFrames_,(uint32_t)processingFrames_,(uint32_t)((processingRate_*maxMs+999)/1000)});maxFrames=std::min<uint32_t>(maxFrames,kRingFrames);uint32_t prefill=std::max<uint32_t>({maxFrames/2u,(uint32_t)outputTransferFrames_,(uint32_t)processingFrames_});if(prefill>maxFrames)prefill=maxFrames;outputPrerollFrames_.store(prefill);outputMaxPrerollFrames_.store(maxFrames);}
-    std::shared_ptr<uac::uac_context> context_;std::shared_ptr<uac::uac_device_handle> device_;std::shared_ptr<uac::uac_stream_handle> inputStream_,outputStream_;std::atomic<bool> stopping_{false};int processingRate_=48000,inputRate_=48000,inputBitDepth_=16,outputRate_=48000,outputBitDepth_=16,inputBurstPackets_=8,outputBurstPackets_=8,outputTransferFrames_=0,processingFrames_=256;double inputResamplePhase_=0.0,outputResamplePhase_=0.0;std::vector<float> inputRing_,outputRing_;std::atomic<uint32_t> inputRead_{0},inputWrite_{0},outputRead_{0},outputWrite_{0};std::atomic<int> inputMaxBufferMs_{20},outputMaxBufferMs_{50};std::atomic<uint32_t> outputPrerollFrames_{1},outputMaxPrerollFrames_{1};std::atomic<bool> outputPrimed_{false},outputHasData_{false};std::atomic<uint64_t> inputRingOverruns_{0},inputBufferClears_{0},outputRingOverruns_{0},outputUnderruns_{0},outputBufferClears_{0},inputCallbackMaxUs_{0},outputCallbackMaxUs_{0};uint32_t inputSampleRate_=0,outputSampleRate_=0;uint8_t inputBitResolution_=0,inputChannels_=0,outputBitResolution_=0,outputChannels_=0;
+    std::shared_ptr<uac::uac_context> context_;std::shared_ptr<uac::uac_device_handle> device_;std::shared_ptr<uac::uac_stream_handle> inputStream_,outputStream_;const uac::uac_audio_route *outputRoute_=nullptr;bool volumeRangeValid_=false;int32_t volumeMin_=0,volumeMax_=0,volumeRes_=0;std::atomic<bool> stopping_{false};int processingRate_=48000,inputRate_=48000,inputBitDepth_=16,outputRate_=48000,outputBitDepth_=16,inputBurstPackets_=8,outputBurstPackets_=8,outputTransferFrames_=0,processingFrames_=256;double inputResamplePhase_=0.0,outputResamplePhase_=0.0;std::vector<float> inputRing_,outputRing_;std::atomic<uint32_t> inputRead_{0},inputWrite_{0},outputRead_{0},outputWrite_{0};std::atomic<int> inputMaxBufferMs_{20},outputMaxBufferMs_{50};std::atomic<uint32_t> outputPrerollFrames_{1},outputMaxPrerollFrames_{1};std::atomic<bool> outputPrimed_{false},outputHasData_{false};std::atomic<uint64_t> inputRingOverruns_{0},inputBufferClears_{0},outputRingOverruns_{0},outputUnderruns_{0},outputBufferClears_{0},inputCallbackMaxUs_{0},outputCallbackMaxUs_{0};uint32_t inputSampleRate_=0,outputSampleRate_=0;uint8_t inputBitResolution_=0,inputChannels_=0,outputBitResolution_=0,outputChannels_=0;
 };
 }
 extern "C" usb_host_audio_t usb_host_audio_start(int fd,int processingRate,int inputRate,int inputBitDepth,int outputRate,int outputBitDepth,int in,int out,int maxMs,int processingFrames,int inputBurst,int outputBurst){try{return new UsbHostAudio(fd,processingRate,inputRate,inputBitDepth,outputRate,outputBitDepth,in!=0,out!=0,maxMs,processingFrames,inputBurst,outputBurst);}catch(const std::exception&e){USB_HOST_LOGE("USB Host audio start failed: %s",e.what());return nullptr;}catch(...){USB_HOST_LOGE("USB Host audio start failed");return nullptr;}}
@@ -281,5 +301,6 @@ extern "C" int usb_host_audio_read(usb_host_audio_t a,float*d,int n){return a?st
 extern "C" int usb_host_audio_write(usb_host_audio_t a,const float*d,int n){return a?static_cast<UsbHostAudio*>(a)->write(d,n):0;}
 extern "C" void usb_host_audio_configure_output_buffer(usb_host_audio_t a,int maxMs){if(a)static_cast<UsbHostAudio*>(a)->configureOutputBuffer(maxMs);}
 extern "C" void usb_host_audio_configure_input_buffer(usb_host_audio_t a,int maxMs){if(a)static_cast<UsbHostAudio*>(a)->configureInputBuffer(maxMs);}
+extern "C" int usb_host_audio_set_volume(usb_host_audio_t a,int percent){return a&&static_cast<UsbHostAudio*>(a)->setVolumePercent(percent)?1:0;}
 extern "C" void usb_host_audio_get_stats(usb_host_audio_t a,usb_host_audio_stats_t*stats){if(!stats)return;*stats=a?static_cast<UsbHostAudio*>(a)->stats():usb_host_audio_stats_t{};}
 extern "C" void usb_host_audio_stop(usb_host_audio_t a){delete static_cast<UsbHostAudio*>(a);}

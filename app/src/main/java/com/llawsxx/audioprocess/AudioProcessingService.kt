@@ -132,6 +132,9 @@ class AudioProcessingService : Service() {
         engine.inputPair = p.getInt("channelPair", 0)
         engine.inputSource = runCatching { InputSource.valueOf(p.getString("input", InputSource.BUILT_IN.name)!!) }.getOrDefault(InputSource.BUILT_IN)
         engine.outputSource = runCatching { OutputSource.valueOf(p.getString("output", OutputSource.SPEAKER.name)!!) }.getOrDefault(OutputSource.SPEAKER)
+        engine.outputVolumePercent = if (engine.outputSource == OutputSource.USB) {
+            (p.getInt("usbOutputVolumePercent", p.getInt("outputVolumePercent", 100)) / 10).coerceIn(0, 10) * 10
+        } else engine.systemVolumePercent()
         val wifiOutputEnabled = p.getBoolean("wifiOutputEnabled", false)
         val wifiRole = if (engine.inputSource == InputSource.WIFI) 2 else if (wifiOutputEnabled) 1 else 0
         if (wifiRole != 0) {

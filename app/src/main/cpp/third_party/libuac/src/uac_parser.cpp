@@ -141,7 +141,8 @@ namespace uac {
                 audiocontrol->units.push_back(parse_mixer_unit(data, descSize));
                 break;
             case UAC_AC_FEATURE_UNIT:
-                if (descSize >= 6)
+                if (descSize >= (audiocontrol->uac2 ? 10 : 7) &&
+                    (audiocontrol->uac2 || data[5] != 0))
                     audiocontrol->units.push_back(parse_feature_unit(data, descSize, audiocontrol->uac2));
                 else
                     LOG_WARN("Feature unit descriptor too short: %d", descSize);
@@ -356,6 +357,20 @@ namespace uac {
         unit->bSourceId = data[4];
         // UAC2 stores four bytes per control; UAC1 carries bControlSize here.
         unit->bControlSize = uac2 ? 4 : data[5];
+        if (unit->bControlSize != 0 && size > 5) {
+            const int controlsOffset = 6;
+            const int available = std::max(0, size - controlsOffset);
+            const int width = std::min<int>(unit->bControlSize, 4);
+            if (available >= width) {
+                for (int i = 0; i < width; ++i)
+                    unit->masterControls |= static_cast<uint32_t>(data[controlsOffset + i]) << (8 * i);
+                const int stride = unit->bControlSize;
+                const int count = uac2
+                        ? ((size >= 6 && stride > 0) ? (size - 6) / stride - 1 : 0)
+                        : ((size >= 7 && stride > 0) ? (size - 7) / stride - 1 : 0);
+                unit->channelCount = static_cast<uint8_t>(std::max(0, count));
+            }
+        }
         LOG_DEBUG("\t got FEATURE_UNIT %d: bSourceId=0x%x", unit->bUnitID, unit->bSourceId);
         return unit;
     }

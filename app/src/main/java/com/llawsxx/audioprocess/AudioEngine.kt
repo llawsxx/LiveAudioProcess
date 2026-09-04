@@ -16,6 +16,7 @@ import android.os.Looper
 import android.os.SystemClock
 import java.io.File
 import android.os.ParcelFileDescriptor
+import kotlin.math.roundToInt
 
 class AudioEngine(private val context: Context) {
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -50,6 +51,7 @@ class AudioEngine(private val context: Context) {
     @Volatile var toneLevel = .25f
     @Volatile var outputSource = OutputSource.SPEAKER
         internal set
+    @Volatile var outputVolumePercent = 100
     @Volatile var sampleRate = 48_000; @Volatile var bufferFrames = 256; @Volatile var inputPair = 0
     @Volatile var outputSampleRate = 48_000
         private set
@@ -152,6 +154,31 @@ class AudioEngine(private val context: Context) {
         systemInputBufferMaxMs = normalized
         if (NativeAudio.available) NativeAudio.configureInputBufferMaxMs(normalized)
     }
+    fun setOutputVolumePercent(percent: Int): Boolean {
+        val normalized = (percent / 10).coerceIn(0, 10) * 10
+        val applied = if (outputSource == OutputSource.USB) {
+            NativeAudio.available && NativeAudio.setUsbVolume(normalized)
+        } else {
+            runCatching {
+                val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                val level = (max * normalized / 100f).roundToInt().coerceIn(0, max)
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, level, 0)
+                true
+            }.getOrDefault(false)
+        }
+        if (!applied) {
+            routeNotice = if (outputSource == OutputSource.USB) {
+                "USB 音频设备不支持主音量控制，或音量命令发送失败"
+            } else {
+                "系统媒体音量调节失败"
+            }
+        }
+        return applied
+    }
+    fun systemVolumePercent(): Int = runCatching {
+        val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        if (max <= 0) 0 else ((audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) * 10f / max).roundToInt() * 10).coerceIn(0, 100)
+    }.getOrDefault(0)
     private fun usbInputDevice(): AudioDeviceInfo? {
         return audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.type == AudioDeviceInfo.TYPE_USB_DEVICE || it.type == AudioDeviceInfo.TYPE_USB_HEADSET }
     }
@@ -391,6 +418,7 @@ class AudioEngine(private val context: Context) {
             activeInputDeviceId = inputDeviceId
             activeOutputDeviceId = outputDeviceId
             refreshRouteNotice()
+            if (outputSource == OutputSource.USB) setOutputVolumePercent(outputVolumePercent)
             routeHandler.removeCallbacks(wifiHealthMonitor)
             routeHandler.postDelayed(wifiHealthMonitor, 100)
             routeHandler.removeCallbacks(bluetoothRouteMonitor)
