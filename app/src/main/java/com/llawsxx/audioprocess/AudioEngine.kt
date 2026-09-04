@@ -155,7 +155,7 @@ class AudioEngine(private val context: Context) {
         if (NativeAudio.available) NativeAudio.configureInputBufferMaxMs(normalized)
     }
     fun setOutputVolumePercent(percent: Int): Boolean {
-        val normalized = (percent / 10).coerceIn(0, 10) * 10
+        val normalized = (percent / 5).coerceIn(0, 20) * 5
         val applied = if (outputSource == OutputSource.USB) {
             NativeAudio.available && NativeAudio.setUsbVolume(normalized)
         } else {
@@ -177,7 +177,7 @@ class AudioEngine(private val context: Context) {
     }
     fun systemVolumePercent(): Int = runCatching {
         val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-        if (max <= 0) 0 else ((audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) * 10f / max).roundToInt() * 10).coerceIn(0, 100)
+        if (max <= 0) 0 else ((audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) * 20f / max).roundToInt() * 5).coerceIn(0, 100)
     }.getOrDefault(0)
     private fun usbInputDevice(): AudioDeviceInfo? {
         return audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.type == AudioDeviceInfo.TYPE_USB_DEVICE || it.type == AudioDeviceInfo.TYPE_USB_HEADSET }

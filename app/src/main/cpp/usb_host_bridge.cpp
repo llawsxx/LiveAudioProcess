@@ -139,10 +139,15 @@ public:
             volumeRangeValid_ = true;
         }
         const int p = std::clamp(percent, 0, 100);
-        const int64_t span = (int64_t)volumeMax_ - (int64_t)volumeMin_;
-        int64_t value = (int64_t)volumeMin_ + (span * p) / 100;
-        if (volumeRes_ > 0) value = volumeMin_ + ((value - volumeMin_ + volumeRes_ / 2) / volumeRes_) * volumeRes_;
-        value = std::clamp<int64_t>(value, volumeMin_, volumeMax_);
+        // UAC Volume reserves 0x8000 as the mandatory digital-silence code;
+        // it must not be confused with the reported MIN attribute.
+        int64_t value = -32768;
+        if (p > 0) {
+            const int64_t span = (int64_t)volumeMax_ - (int64_t)volumeMin_;
+            value = (int64_t)volumeMin_ + (span * p) / 100;
+            if (volumeRes_ > 0) value = volumeMin_ + ((value - volumeMin_ + volumeRes_ / 2) / volumeRes_) * volumeRes_;
+            value = std::clamp<int64_t>(value, volumeMin_, volumeMax_);
+        }
         const bool ok = device_->set_feature_master_volume(*outputRoute_, (int32_t)value);
         if (!ok) USB_HOST_LOGE("USB output volume SET_CUR failed percent=%d", p);
         return ok;

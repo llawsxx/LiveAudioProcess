@@ -26,18 +26,22 @@
 namespace uac {
 
     namespace {
+        bool feature_has_volume(const uac_feature_unit *feature, bool uac2);
+
         // Locate the Feature Unit on a route.  UAC topologies normally have
         // the feature unit directly below the output terminal, but mixers and
         // selector units may insert additional nodes, so do not assume
         // sources[0] is the volume unit.
-        const uac_feature_unit *find_feature_unit(const uac_topology_entity *root) {
+        const uac_feature_unit *find_feature_unit(const uac_topology_entity *root, bool uac2) {
             if (!root) return nullptr;
             std::vector<const uac_topology_entity *> pending{root};
             while (!pending.empty()) {
                 const auto *entity = pending.back();
                 pending.pop_back();
-                if (entity->unit && entity->unit->unitType == UAC_AC_FEATURE_UNIT)
-                    return static_cast<const uac_feature_unit *>(entity->unit.get());
+                if (entity->unit && entity->unit->unitType == UAC_AC_FEATURE_UNIT) {
+                    const auto *feature = static_cast<const uac_feature_unit *>(entity->unit.get());
+                    if (feature_has_volume(feature, uac2)) return feature;
+                }
                 for (const auto *source : entity->sources)
                     pending.push_back(source);
             }
@@ -50,9 +54,23 @@ namespace uac {
             return static_cast<int16_t>(value);
         }
 
-        bool feature_has_volume(const uac_feature_unit *feature) {
-            return feature && feature->bControlSize != 0 &&
-                   (feature->masterControls & (1u << VOLUME_CONTROL)) != 0;
+        bool feature_has_volume(const uac_feature_unit *feature, bool uac2) {
+            if (!feature || feature->bControlSize == 0) return false;
+            if (uac2) {
+                // UAC2 uses two capability bits per control: 00 absent,
+                // 01 read-only, 11 host-programmable. Volume is selector 2,
+                // hence the pair at D3..D2.
+                const uint32_t pair = (feature->masterControls >> ((VOLUME_CONTROL - 1) * 2)) & 0x3u;
+                return pair != 0;
+            }
+            // UAC1 uses one presence bit per control; selectors are 1-based.
+            return (feature->masterControls & (1u << (VOLUME_CONTROL - 1))) != 0;
+        }
+
+        bool feature_volume_writable(const uac_feature_unit *feature, bool uac2) {
+            if (!feature_has_volume(feature, uac2)) return false;
+            if (!uac2) return true;
+            return ((feature->masterControls >> ((VOLUME_CONTROL - 1) * 2)) & 0x3u) == 0x3u;
         }
     }
 
@@ -270,8 +288,8 @@ namespace uac {
         auto route_impl = static_cast<const uac_audio_route_impl&>(route);
         const int cs = VOLUME_CONTROL;
         const int cn = 0;
-        const uac_feature_unit *feature = find_feature_unit(route_impl.entry.get());
-        if (!feature_has_volume(feature))
+        const uac_feature_unit *feature = find_feature_unit(route_impl.entry.get(), device->audiocontrol->uac2);
+        if (!feature)
             throw usb_exception_impl("get_feature_master_volume", LIBUSB_ERROR_NOT_SUPPORTED);
         const int unit = feature->bUnitID;
         const bool uac2 = device->audiocontrol->uac2;
@@ -296,8 +314,8 @@ namespace uac {
 
     bool uac_device_handle_impl::set_feature_master_volume(const uac_audio_route &route, int32_t volume) {
         auto route_impl = static_cast<const uac_audio_route_impl&>(route);
-        const uac_feature_unit *feature = find_feature_unit(route_impl.entry.get());
-        if (!feature_has_volume(feature)) return false;
+        const uac_feature_unit *feature = find_feature_unit(route_impl.entry.get(), device->audiocontrol->uac2);
+        if (!feature_volume_writable(feature, device->audiocontrol->uac2)) return false;
         const bool uac2 = device->audiocontrol->uac2;
         uint8_t data[4] = {0, 0, 0, 0};
         const int width = 2;
@@ -316,8 +334,8 @@ namespace uac {
                                                                   int32_t *res) {
         if (!min || !max || !res) return false;
         auto route_impl = static_cast<const uac_audio_route_impl&>(route);
-        const uac_feature_unit *feature = find_feature_unit(route_impl.entry.get());
-        if (!feature_has_volume(feature)) return false;
+        const uac_feature_unit *feature = find_feature_unit(route_impl.entry.get(), device->audiocontrol->uac2);
+        if (!feature) return false;
         const bool uac2 = device->audiocontrol->uac2;
         const uint16_t value = VOLUME_CONTROL << 8;
         const uint16_t index = feature->bUnitID << 8 | device->audiocontrol->bInterfaceNumber;
