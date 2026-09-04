@@ -98,6 +98,13 @@ class AudioProcessingService : Service() {
         engine.reverbRoom = effects.reverbRoom; engine.reverbDecay = effects.reverbDecay; engine.reverbDamping = effects.reverbDamping; engine.reverbMix = effects.reverbMix / 100f
         engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease
         engine.loudnessTarget = effects.loudnessTarget; engine.loudnessLra = effects.loudnessLra; engine.loudnessTruePeak = effects.loudnessTruePeak; engine.loudnessEnabled = effects.loudnessEnabled
+        engine.toneWaveform = p.getInt("toneWaveform", 0).coerceIn(0, 6)
+        engine.toneChannels = p.getInt("toneChannels", 0).coerceIn(0, 2)
+        engine.toneFrequency = p.getFloat("toneFrequency", 1000f).coerceIn(1f, 20_000f)
+        engine.toneFrequency2 = p.getFloat("toneFrequency2", 20_000f).coerceIn(1f, 20_000f)
+        engine.toneDurationSeconds = p.getFloat("toneDurationSeconds", 10f).coerceIn(1f, 60f)
+        engine.toneClickIntervalMs = p.getFloat("toneClickIntervalMs", 1000f).coerceIn(50f, 5000f)
+        engine.toneLevel = Math.pow(10.0, p.getInt("toneLevelDb", -12).coerceIn(-60, 0).toDouble() / 20.0).toFloat()
         val legacyRate = p.getInt("rate", 48_000)
         val legacyBits = p.getInt("usbBitDepth", 16)
         engine.configureAudioFormat(

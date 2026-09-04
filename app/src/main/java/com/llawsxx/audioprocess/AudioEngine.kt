@@ -44,6 +44,9 @@ class AudioEngine(private val context: Context) {
     @Volatile var toneWaveform = 0
     @Volatile var toneChannels = 0
     @Volatile var toneFrequency = 1000f
+    @Volatile var toneFrequency2 = 20000f
+    @Volatile var toneDurationSeconds = 10f
+    @Volatile var toneClickIntervalMs = 1000f
     @Volatile var toneLevel = .25f
     @Volatile var outputSource = OutputSource.SPEAKER
         internal set
@@ -471,7 +474,7 @@ class AudioEngine(private val context: Context) {
     fun stop() { if (isRecording) setRecording(false); routeHandler.removeCallbacks(routeRestart); routeHandler.removeCallbacks(routeRefresh); routeHandler.removeCallbacks(wifiHealthMonitor); routeHandler.removeCallbacks(bluetoothRouteMonitor); NativeAudio.stop(); usbConnection?.close(); usbConnection = null; clearBluetoothRoute(); activeInputDeviceId = -1; activeOutputDeviceId = -1; observedBluetoothDeviceId = Int.MIN_VALUE; bluetoothRetryCount = 0; nextBluetoothRetryAtMs = 0L; isRecording = false; isRunning = false }
     fun refreshNativeParameters() { pushNativeParameters() }
     fun configureTone(enabled: Boolean) {
-        if (NativeAudio.available) NativeAudio.configureTone(enabled, toneWaveform, toneChannels, toneFrequency, toneLevel)
+        if (NativeAudio.available) NativeAudio.configureTone(enabled, toneWaveform, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevel)
     }
     private fun pushNativeParameters() {
         if (!NativeAudio.available) return
@@ -488,7 +491,7 @@ class AudioEngine(private val context: Context) {
             limiterLookAhead, if (limiterAdaptiveRelease) 1f else 0f,
             loudnessTarget, loudnessLra, loudnessTruePeak
         ))
-        NativeAudio.configureTone(inputSource == InputSource.TEST_TONE, toneWaveform, toneChannels, toneFrequency, toneLevel)
+        NativeAudio.configureTone(inputSource == InputSource.TEST_TONE, toneWaveform, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevel)
     }
 
     companion object {

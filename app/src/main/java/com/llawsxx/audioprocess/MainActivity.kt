@@ -127,10 +127,13 @@ private fun LiveAudioProcessApp() {
     var inputPeakL by remember { mutableFloatStateOf(0f) }; var inputPeakR by remember { mutableFloatStateOf(0f) }
     var outputPeakL by remember { mutableFloatStateOf(0f) }; var outputPeakR by remember { mutableFloatStateOf(0f) }
     var waveformData by remember { mutableStateOf(FloatArray(1024)) }
-    var toneWaveform by remember { mutableIntStateOf(prefs.getInt("toneWaveform", 0).coerceIn(0, 3)) }
+    var toneWaveform by remember { mutableIntStateOf(prefs.getInt("toneWaveform", 0).coerceIn(0, 6)) }
     var showWaveforms by remember { mutableStateOf(prefs.getBoolean("showWaveforms", false)) }
     var toneChannels by remember { mutableIntStateOf(prefs.getInt("toneChannels", 0).coerceIn(0, 2)) }
     var toneFrequency by remember { mutableFloatStateOf(prefs.getFloat("toneFrequency", 1000f).coerceIn(1f, 20000f)) }
+    var toneFrequency2 by remember { mutableFloatStateOf(prefs.getFloat("toneFrequency2", 20000f).coerceIn(1f, 20000f)) }
+    var toneDurationSeconds by remember { mutableFloatStateOf(prefs.getFloat("toneDurationSeconds", 10f).coerceIn(1f, 60f)) }
+    var toneClickIntervalMs by remember { mutableFloatStateOf(prefs.getFloat("toneClickIntervalMs", 1000f).coerceIn(50f, 5000f)) }
     var toneLevelDb by remember { mutableIntStateOf(prefs.getInt("toneLevelDb", -12).coerceIn(-60, 0)) }
     var effects by remember { mutableStateOf(EffectSettings.load(prefs)) }
     var limiterGain by remember { mutableFloatStateOf(1f) }
@@ -236,11 +239,14 @@ private fun LiveAudioProcessApp() {
         prefs.edit().putString("wifiReceiveHost", wifiReceiveHost).putString("wifiReceivePort", wifiReceivePort).putString("wifiMinBuffer", wifiMinBuffer).putString("wifiMaxBuffer", wifiMaxBuffer).putString("wifiInputTimeout", wifiInputTimeout).apply()
         if (input == InputSource.WIFI) wifiActive = configureWifiForCurrentRoute()
     }
-    LaunchedEffect(toneWaveform, toneChannels, toneFrequency, toneLevelDb, input) {
-        prefs.edit().putInt("toneWaveform", toneWaveform).putInt("toneChannels", toneChannels).putFloat("toneFrequency", toneFrequency).putInt("toneLevelDb", toneLevelDb).apply()
+    LaunchedEffect(toneWaveform, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevelDb, input) {
+        prefs.edit().putInt("toneWaveform", toneWaveform).putInt("toneChannels", toneChannels).putFloat("toneFrequency", toneFrequency).putFloat("toneFrequency2", toneFrequency2).putFloat("toneDurationSeconds", toneDurationSeconds).putFloat("toneClickIntervalMs", toneClickIntervalMs).putInt("toneLevelDb", toneLevelDb).apply()
         engine.toneWaveform = toneWaveform
         engine.toneChannels = toneChannels
         engine.toneFrequency = toneFrequency
+        engine.toneFrequency2 = toneFrequency2
+        engine.toneDurationSeconds = toneDurationSeconds
+        engine.toneClickIntervalMs = toneClickIntervalMs
         engine.toneLevel = Math.pow(10.0, toneLevelDb.toDouble() / 20.0).toFloat()
         engine.configureTone(input == InputSource.TEST_TONE)
         if (input == InputSource.TEST_TONE) engine.refreshNativeParameters()
@@ -300,7 +306,7 @@ private fun LiveAudioProcessApp() {
             }
             LevelPanel(inputLevelL, inputLevelR, outputLevelL, outputLevelR, inputPeakL, inputPeakR, outputPeakL, outputPeakR, limiterGain, limiterReleaseMs, running, running && effects.dspEnabled && effects.limiterEnabled, waveformData, showWaveforms) { showWaveforms = it; prefs.edit().putBoolean("showWaveforms", it).apply() }
             RoutingPanel2(input, { selected -> input = selected; channelPair = 0; if (selected == InputSource.TEST_TONE && output == OutputSource.NONE) { output = OutputSource.SPEAKER; routeNotice = "测试 Tone 需要本地输出，已切换到扬声器" }; if (selected == InputSource.WIFI) wifiOutputEnabled = false; wifiActive = configureWifiForCurrentRoute(); syncEngine() }, output, { selected -> val applied = if (selected == OutputSource.NONE && input == InputSource.TEST_TONE) { routeNotice = "测试 Tone 需要本地输出，已保持扬声器输出"; OutputSource.SPEAKER } else selected; if (applied == OutputSource.BLUETOOTH && Build.VERSION.SDK_INT >= 31 && ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) { pendingBluetoothOutput = applied; bluetoothPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT) } else { output = applied; syncEngine() } }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
-            if (input == InputSource.TEST_TONE) TonePanel(toneWaveform, toneChannels, toneFrequency, toneLevelDb, { toneWaveform = it }, { toneChannels = it }, { toneFrequency = it }, { toneLevelDb = it })
+            if (input == InputSource.TEST_TONE) TonePanel(toneWaveform, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevelDb, { selected -> toneWaveform = selected; when (selected) { 4 -> { toneFrequency = 20f; toneFrequency2 = 20_000f }; 6 -> { toneFrequency = 19_000f; toneFrequency2 = 20_000f }; else -> Unit } }, { toneChannels = it }, { toneFrequency = it }, { toneFrequency2 = it }, { toneDurationSeconds = it }, { toneClickIntervalMs = it }, { toneLevelDb = it })
             EnginePanelWithIoRates(rate, { rate = it; syncEngine() }, outputRate, { outputRate = it; syncEngine() }, buffer, { buffer = it; syncEngine() }, running)
             SystemInputPanel(inputInfo, input != InputSource.USB && input != InputSource.WIFI, systemInputBufferMaxMs) { systemInputBufferMaxMs = it }
             SystemOutputPanel(outputInfo, output != OutputSource.USB && output != OutputSource.NONE, systemOutputBufferMaxMs) { systemOutputBufferMaxMs = it }
@@ -362,17 +368,37 @@ private fun LiveAudioProcessApp() {
 }
 @Composable private fun LevelPanel(inputL: Float, inputR: Float, outputL: Float, outputR: Float, limiterGain: Float, limiterReleaseMs: Float, active: Boolean, limiterActive: Boolean) { Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) { Column(Modifier.padding(16.dp)) { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("信号电平", color = Color.White, fontWeight = FontWeight.SemiBold); Text("峰值监视 · ${if (active) "实时" else "待机"}", color = Muted, fontSize = 12.sp) }; Spacer(Modifier.height(13.dp)); MeterRow("INPUT L / DRY", inputL, Teal); Spacer(Modifier.height(6.dp)); MeterRow("INPUT R / DRY", inputR, Teal); Spacer(Modifier.height(8.dp)); MeterRow("OUTPUT L / WET", outputL, Amber); Spacer(Modifier.height(6.dp)); MeterRow("OUTPUT R / WET", outputR, Amber); Spacer(Modifier.height(12.dp)); HorizontalDivider(color = Color(0xFF344248)); Spacer(Modifier.height(9.dp)); Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("LIMITER", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold); Text(if (limiterActive) "ACTIVE" else "BYPASS", color = if (limiterActive) Teal else Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold) }; Spacer(Modifier.height(5.dp)); Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("GAIN", color = Muted, fontSize = 10.sp); Text("%.6f".format(limiterGain), color = Color.White, fontSize = 11.sp); Text("RELEASE", color = Muted, fontSize = 10.sp); Text(limiterReleaseStatus(limiterReleaseMs), color = Color.White, fontSize = 11.sp) } } } }
 @Composable private fun MeterRow(label: String, level: Float, tint: Color) { Row(verticalAlignment = Alignment.CenterVertically) { Text(label, color = Muted, fontSize = 10.sp, modifier = Modifier.width(86.dp)); LinearProgressIndicator(progress = { level.coerceIn(0f, 1f) }, modifier = Modifier.weight(1f).height(7.dp).clip(RoundedCornerShape(4.dp)), color = tint, trackColor = Color(0xFF2C3B40)); Text("${(-60 + level * 60).toInt()} dB", color = Color.White, fontSize = 11.sp, modifier = Modifier.width(52.dp).padding(start = 8.dp)) } }
-@Composable private fun TonePanel(waveform: Int, channels: Int, frequency: Float, levelDb: Int, onWaveform: (Int) -> Unit, onChannels: (Int) -> Unit, onFrequency: (Float) -> Unit, onLevelDb: (Int) -> Unit) {
+@Composable private fun TonePanel(waveform: Int, channels: Int, frequency: Float, frequency2: Float, durationSeconds: Float, clickIntervalMs: Float, levelDb: Int, onWaveform: (Int) -> Unit, onChannels: (Int) -> Unit, onFrequency: (Float) -> Unit, onFrequency2: (Float) -> Unit, onDurationSeconds: (Float) -> Unit, onClickIntervalMs: (Float) -> Unit, onLevelDb: (Int) -> Unit) {
     Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             SectionTitle("测试 Tone", "SIGNAL GENERATOR")
             Text("波形", color = Muted, fontSize = 12.sp)
-            ToneChoiceRow(listOf("正弦波", "方波", "三角波", "噪声"), waveform, onWaveform)
+            ToneChoiceRow(listOf("正弦波", "方波", "三角波", "噪声", "对数扫频", "脉冲", "双音 IMD"), waveform, onWaveform)
             Text("声道", color = Muted, fontSize = 12.sp)
             ToneChoiceRow(listOf("双声道", "仅左声道", "仅右声道"), channels, onChannels)
-            EffectSlider("频率", "1 Hz – 20 kHz", frequency, 1f..20000f, { onFrequency(it) }, "${frequency.toInt()} Hz")
-            Text("常用频率", color = Muted, fontSize = 12.sp)
-            FrequencyChoiceRow(frequency, onFrequency)
+            when (waveform) {
+                4 -> {
+                    EffectSlider("起始频率", "1 Hz - 20 kHz", frequency, 1f..20000f, onFrequency, "${frequency.toInt()} Hz")
+                    EffectSlider("结束频率", "1 Hz - 20 kHz", frequency2, 1f..20000f, onFrequency2, "${frequency2.toInt()} Hz")
+                    EffectSlider("扫频时长", "循环对数扫频", durationSeconds, 1f..60f, onDurationSeconds, "${"%.1f".format(durationSeconds)} s")
+                }
+                5 -> EffectSlider("脉冲间隔", "单样本脉冲", clickIntervalMs, 50f..5000f, onClickIntervalMs, "${clickIntervalMs.toInt()} ms")
+                6 -> {
+                    Text("常用 IMD 预设", color = Muted, fontSize = 12.sp)
+                    ImdPresetRow(frequency, frequency2) { first, second ->
+                        onFrequency(first)
+                        onFrequency2(second)
+                    }
+                    EffectSlider("频率 1", "双音等幅混合", frequency, 1f..20000f, onFrequency, "${frequency.toInt()} Hz")
+                    EffectSlider("频率 2", "双音等幅混合", frequency2, 1f..20000f, onFrequency2, "${frequency2.toInt()} Hz")
+                }
+                3 -> Unit
+                else -> {
+                    EffectSlider("频率", "1 Hz - 20 kHz", frequency, 1f..20000f, onFrequency, "${frequency.toInt()} Hz")
+                    Text("常用频率", color = Muted, fontSize = 12.sp)
+                    FrequencyChoiceRow(frequency, onFrequency)
+                }
+            }
             Text("音量", color = Muted, fontSize = 12.sp)
             ToneLevelChoiceRow(levelDb, onLevelDb)
         }
@@ -386,6 +412,23 @@ private fun LiveAudioProcessApp() {
             FilterChip(
                 selected = kotlin.math.abs(frequency - value) < 0.5f,
                 onClick = { onFrequency(value) },
+                label = { Text(label, fontSize = 12.sp) }
+            )
+        }
+    }
+}
+@Composable private fun ImdPresetRow(frequency: Float, frequency2: Float, onPreset: (Float, Float) -> Unit) {
+    val presets = listOf(
+        Triple(19_000f, 20_000f, "CCIF 19+20 kHz"),
+        Triple(60f, 7_000f, "60 Hz + 7 kHz"),
+        Triple(250f, 8_000f, "250 Hz + 8 kHz"),
+        Triple(1_000f, 1_100f, "1 kHz + 1.1 kHz")
+    )
+    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        presets.forEach { (first, second, label) ->
+            FilterChip(
+                selected = kotlin.math.abs(frequency - first) < 0.5f && kotlin.math.abs(frequency2 - second) < 0.5f,
+                onClick = { onPreset(first, second) },
                 label = { Text(label, fontSize = 12.sp) }
             )
         }

@@ -158,8 +158,9 @@ typedef struct {
     atomic_int tone_enabled;
     int tone_waveform;
     int tone_channels;
-    float tone_frequency, tone_level;
-    double tone_phase;
+    float tone_frequency, tone_frequency2, tone_duration_seconds, tone_click_interval_ms, tone_level;
+    double tone_phase, tone_phase2;
+    uint64_t tone_frame_counter;
     uint32_t tone_noise_state;
     float net_send_buffer[NET_AAC_FRAMES * 2];
 } Engine;
@@ -1435,12 +1436,15 @@ static void *audio_thread(void *unused) {
         else { memset(input,0,(size_t)want*MAX_INPUT_CHANNELS*sizeof(float)); got=want; }
         if(got<=0){usleep(1000);continue;}
         int tone_waveform, tone_channels;
-        float tone_frequency, tone_level;
+        float tone_frequency, tone_frequency2, tone_duration_seconds, tone_click_interval_ms, tone_level;
         pthread_mutex_lock(&g.param_lock);
         memcpy(p,g.values,sizeof(p));
         tone_waveform=g.tone_waveform;
         tone_channels=g.tone_channels;
         tone_frequency=g.tone_frequency;
+        tone_frequency2=g.tone_frequency2;
+        tone_duration_seconds=g.tone_duration_seconds;
+        tone_click_interval_ms=g.tone_click_interval_ms;
         tone_level=g.tone_level;
         pthread_mutex_unlock(&g.param_lock);
         int flags=atomic_load(&g.flags); float peaks[4]={0.f,0.f,0.f,0.f};
@@ -1470,14 +1474,38 @@ static void *audio_thread(void *unused) {
                         g.tone_noise_state = g.tone_noise_state * 1664525u + 1013904223u;
                         value = ((double)(g.tone_noise_state >> 8) / 16777216.0) * 2.0 - 1.0;
                         break;
+                    case 4: {
+                        uint64_t sweep_frames=(uint64_t)fmax(1.0,(double)tone_duration_seconds*(double)g.rate);
+                        double progress=(double)(g.tone_frame_counter%sweep_frames)/(double)sweep_frames;
+                        double start=fmax(1.0,(double)tone_frequency);
+                        double end=fmax(start,(double)tone_frequency2);
+                        double sweep_frequency=start*pow(end/start,progress);
+                        value=sin(phase*6.283185307179586);
+                        phase+=sweep_frequency/(double)g.rate;
+                        break;
+                    }
+                    case 5: {
+                        uint64_t interval=(uint64_t)fmax(1.0,(double)tone_click_interval_ms*(double)g.rate/1000.0);
+                        value=(g.tone_frame_counter%interval)==0?1.0:0.0;
+                        break;
+                    }
+                    case 6: {
+                        double phase2=g.tone_phase2;
+                        value=0.5*(sin(phase*6.283185307179586)+sin(phase2*6.283185307179586));
+                        phase2+=(double)tone_frequency2/(double)g.rate;
+                        phase2-=floor(phase2);
+                        g.tone_phase2=phase2;
+                        break;
+                    }
                     default: value=sin(phase*6.283185307179586); break;
                 }
                 value*=clampf(tone_level,0.f,1.f);
                 l=(tone_channels==2)?0.f:(float)value;
                 r=(tone_channels==1)?0.f:(float)value;
-                phase += (double)tone_frequency/(double)g.rate;
+                if(tone_waveform!=4&&tone_waveform!=5)phase += (double)tone_frequency/(double)g.rate;
                 phase -= floor(phase);
                 g.tone_phase=phase;
+                g.tone_frame_counter++;
             } else { l=g.usb_input_host ? input[i*2] : input[i*g.in_channels+first]; r=g.usb_input_host ? input[i*2+1] : input[i*g.in_channels+second]; }
             dry[i*2]=l;dry[i*2+1]=r;
             peaks[0]=fmaxf(peaks[0],fabsf(l)); peaks[1]=fmaxf(peaks[1],fabsf(r));
@@ -1720,13 +1748,18 @@ static void native_stop_internal(int finalize_recording, int preserve_network) {
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stop(JNIEnv*e,jobject o){(void)e;(void)o;native_stop_internal(1,0);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stopForRouteChange(JNIEnv*e,jobject o){(void)e;(void)o;native_stop_internal(0,1);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_update(JNIEnv*e,jobject o,jint flags,jfloatArray values){(void)o;float incoming[28]={0};jsize n=(*e)->GetArrayLength(e,values);if(n>28)n=28;(*e)->GetFloatArrayRegion(e,values,0,n,incoming);pthread_mutex_lock(&g.param_lock);int reverb_changed=n>P_DAMP&&(g.values[P_ROOM]!=incoming[P_ROOM]||g.values[P_DECAY]!=incoming[P_DECAY]||g.values[P_DAMP]!=incoming[P_DAMP]);memcpy(g.values,incoming,(size_t)n*sizeof(float));pthread_mutex_unlock(&g.param_lock);if(reverb_changed)atomic_fetch_add(&g.reverb_generation,1);atomic_store(&g.flags,flags);}
-JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureTone(JNIEnv*e,jobject o,jboolean enabled,jint waveform,jint channels,jfloat frequency,jfloat level){
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureTone(JNIEnv*e,jobject o,jboolean enabled,jint waveform,jint channels,jfloat frequency,jfloat frequency2,jfloat durationSeconds,jfloat clickIntervalMs,jfloat level){
     (void)e;(void)o;
     float max_frequency=g.rate>0?(float)g.rate*.45f:20000.f;
     pthread_mutex_lock(&g.param_lock);
-    g.tone_waveform=waveform<0?0:(waveform>3?3:waveform);
+    int normalized_waveform=waveform<0?0:(waveform>6?6:waveform);
+    if(g.tone_waveform!=normalized_waveform){g.tone_phase=0.0;g.tone_phase2=0.0;g.tone_frame_counter=0;}
+    g.tone_waveform=normalized_waveform;
     g.tone_channels=channels<0?0:(channels>2?2:channels);
     g.tone_frequency=frequency<1.f?1.f:(frequency>max_frequency?max_frequency:frequency);
+    g.tone_frequency2=frequency2<1.f?1.f:(frequency2>max_frequency?max_frequency:frequency2);
+    g.tone_duration_seconds=durationSeconds<1.f?1.f:(durationSeconds>60.f?60.f:durationSeconds);
+    g.tone_click_interval_ms=clickIntervalMs<50.f?50.f:(clickIntervalMs>5000.f?5000.f:clickIntervalMs);
     g.tone_level=level<0.f?0.f:(level>1.f?1.f:level);
     pthread_mutex_unlock(&g.param_lock);
     atomic_store(&g.tone_enabled,enabled?1:0);
