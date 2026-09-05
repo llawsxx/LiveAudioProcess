@@ -216,6 +216,15 @@ static Engine g = {
     .tone_noise_state = 0x13579BDFu
 };
 
+/* shutdown() makes a TCP peer and any in-flight operation observe a
+ * transport switch immediately; close() then releases the descriptor/port. */
+static void network_close_socket(int *fd) {
+    if (!fd || *fd < 0) return;
+    shutdown(*fd, SHUT_RDWR);
+    close(*fd);
+    *fd = -1;
+}
+
 #define NET_MAGIC 0x50464C58u
 
 enum { DSP_ON=1, EQ_ON=2, REVERB_ON=4, LIMITER_ON=8, LOUDNESS_ON=16 };
@@ -1814,9 +1823,8 @@ static void native_stop_internal(int finalize_recording, int preserve_network) {
     pthread_mutex_lock(&g.reverb_lock);ConvolutionReverb *reverb=g.reverb;g.reverb=NULL;pthread_mutex_unlock(&g.reverb_lock);
     convolution_reverb_destroy(reverb);free(g.lookahead);g.lookahead=NULL;free(g.limiter_next_pos);g.limiter_next_pos=NULL;free(g.limiter_next_delta);g.limiter_next_delta=NULL;free(g.net_jitter);g.net_jitter=NULL;free(g.net_aac_jitter);g.net_aac_jitter=NULL;input_ring_destroy();output_ring_destroy();network_clear_jitter_state();
     if (!preserve_network) {
-        if(g.net_sock>=0)close(g.net_sock);
-        if(g.net_listen_sock>=0)close(g.net_listen_sock);
-        g.net_sock=g.net_listen_sock=-1;
+        network_close_socket(&g.net_sock);
+        network_close_socket(&g.net_listen_sock);
         g.net_tcp_connecting=0;
         g.net_tcp_next_connect_ns=0;
         g.net_rx_used=g.net_tx_used=g.net_tx_offset=0;
@@ -1918,10 +1926,8 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
     wifi_aac_destroy(g.net_aac);g.net_aac=next_aac;
     pthread_mutex_unlock(&g.net_codec_lock);
     atomic_store(&g.net_role,0);
-    if(g.net_sock>=0)close(g.net_sock);
-    if(g.net_listen_sock>=0)close(g.net_listen_sock);
-    g.net_sock=-1;
-    g.net_listen_sock=-1;
+    network_close_socket(&g.net_sock);
+    network_close_socket(&g.net_listen_sock);
     g.net_transport=transport;g.net_codec=codec;g.net_bitrate=normalized_bitrate;g.net_port=port;
     g.net_tcp_connecting=0;g.net_tcp_next_connect_ns=0;
     atomic_store(&g.net_tcp_connect_attempts,0);
@@ -1961,20 +1967,20 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
             int error=errno;
             network_set_error(error==EADDRINUSE?NET_ERROR_ADDRESS_IN_USE:NET_ERROR_BIND,port,error);
             LOGE("Wi-Fi bind failed host=%s port=%d errno=%d",h,port,error);
-            if(g.net_sock>=0)close(g.net_sock);if(g.net_listen_sock>=0)close(g.net_listen_sock);g.net_sock=g.net_listen_sock=-1;atomic_store(&g.net_role,0);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;
+            network_close_socket(&g.net_sock);network_close_socket(&g.net_listen_sock);atomic_store(&g.net_role,0);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;
         }
         if(transport==NET_TRANSPORT_TCP&&listen(g.net_listen_sock,1)<0) {
             int error=errno;
             network_set_error(NET_ERROR_LISTEN,port,error);
             LOGE("Wi-Fi listen failed port=%d errno=%d",port,error);
-            close(g.net_listen_sock);g.net_listen_sock=-1;atomic_store(&g.net_role,0);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;
+            network_close_socket(&g.net_listen_sock);atomic_store(&g.net_role,0);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;
         }
         if(transport==NET_TRANSPORT_TCP) LOGI("Wi-Fi TCP server listening on port=%d",port);
         else LOGI("Wi-Fi UDP receiver bound to port=%d",port);
     }
     atomic_store(&g.net_role,role);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_TRUE;
 }
-JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearNetwork(JNIEnv*e,jobject o){(void)e;(void)o;if(g.net_sock>=0)close(g.net_sock);if(g.net_listen_sock>=0)close(g.net_listen_sock);g.net_sock=g.net_listen_sock=-1;g.net_tcp_connecting=0;g.net_tcp_next_connect_ns=0;g.net_rx_used=g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);atomic_store(&g.net_role,0);g.net_send_count=0;network_clear_jitter_state();network_set_error(NET_ERROR_NONE,0,0);pthread_mutex_lock(&g.net_codec_lock);wifi_aac_destroy(g.net_aac);g.net_aac=NULL;pthread_mutex_unlock(&g.net_codec_lock);}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearNetwork(JNIEnv*e,jobject o){(void)e;(void)o;atomic_store(&g.net_role,0);network_close_socket(&g.net_sock);network_close_socket(&g.net_listen_sock);g.net_tcp_connecting=0;g.net_tcp_next_connect_ns=0;g.net_rx_used=g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);g.net_send_count=0;network_clear_jitter_state();network_set_error(NET_ERROR_NONE,0,0);pthread_mutex_lock(&g.net_codec_lock);wifi_aac_destroy(g.net_aac);g.net_aac=NULL;pthread_mutex_unlock(&g.net_codec_lock);}
 JNIEXPORT jintArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkErrorInfo(JNIEnv*e,jobject o){
     (void)o;
     jint values[3];
