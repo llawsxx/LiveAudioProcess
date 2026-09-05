@@ -159,6 +159,7 @@ private fun LiveAudioProcessApp() {
     var toneWaveform by remember { mutableIntStateOf(prefs.getInt("toneWaveform", 0).coerceIn(0, 7)) }
     var toneMusic by remember { mutableIntStateOf(prefs.getInt("toneMusic", 0).coerceIn(ToneMusicNames.indices)) }
     var showWaveforms by remember { mutableStateOf(prefs.getBoolean("showWaveforms", false)) }
+    var showLevelMeters by remember { mutableStateOf(prefs.getBoolean("showLevelMeters", true)) }
     var toneChannels by remember { mutableIntStateOf(prefs.getInt("toneChannels", 0).coerceIn(0, 2)) }
     var toneFrequency by remember { mutableFloatStateOf(prefs.getFloat("toneFrequency", 1000f).coerceIn(1f, 20000f)) }
     var toneFrequency2 by remember { mutableFloatStateOf(prefs.getFloat("toneFrequency2", 20000f).coerceIn(1f, 20000f)) }
@@ -417,7 +418,7 @@ private fun LiveAudioProcessApp() {
                 prefs.edit().putBoolean("screenAlwaysOn", enabled).apply()
             }
             VolumeControlPanel(outputVolumePercent, usesUsbHostVolume, output != OutputSource.NONE && (output != OutputSource.USB || running)) { value -> if (usesUsbHostVolume) usbOutputVolumePercent = value else { systemOutputVolumePercent = value; if (output != OutputSource.USB) engine.outputVolumePercent = value; engine.setOutputVolumePercent(value) } }
-            LevelPanel(inputLevelL, inputLevelR, outputLevelL, outputLevelR, inputPeakL, inputPeakR, outputPeakL, outputPeakR, limiterGain, limiterReleaseMs, running, running && effects.dspEnabled && effects.limiterEnabled, running && input == InputSource.WIFI && wifiActive, wifiReceiveStats, waveformData, showWaveforms) { showWaveforms = it; prefs.edit().putBoolean("showWaveforms", it).apply() }
+            LevelPanel(inputLevelL, inputLevelR, outputLevelL, outputLevelR, inputPeakL, inputPeakR, outputPeakL, outputPeakR, limiterGain, limiterReleaseMs, running, running && effects.dspEnabled && effects.limiterEnabled, running && input == InputSource.WIFI && wifiActive, wifiReceiveStats, waveformData, showWaveforms, showLevelMeters, { showWaveforms = it; prefs.edit().putBoolean("showWaveforms", it).apply() }, { showLevelMeters = it; prefs.edit().putBoolean("showLevelMeters", it).apply() })
             RoutingPanel2(input, { selectInput(it) }, output, { selectOutput(it) }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
             if (input == InputSource.TEST_TONE) TonePanel(toneWaveform, toneMusic, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevelDb, { selected -> toneWaveform = selected; when (selected) { 4 -> { toneFrequency = 20f; toneFrequency2 = 20_000f }; 6 -> { toneFrequency = 19_000f; toneFrequency2 = 20_000f }; else -> Unit } }, { toneMusic = it }, { toneChannels = it }, { toneFrequency = it }, { toneFrequency2 = it }, { toneDurationSeconds = it }, { toneClickIntervalMs = it }, { toneLevelDb = it })
             EnginePanelWithIoRates(rate, { rate = it; syncEngine() }, outputRate, { outputRate = it; syncEngine() }, buffer, { buffer = it; syncEngine() }, running)
@@ -592,27 +593,48 @@ private fun LiveAudioProcessApp() {
 }
 @Composable private fun LevelPanel(inputL: Float, inputR: Float, outputL: Float, outputR: Float, inputPeakL: Float, inputPeakR: Float, outputPeakL: Float, outputPeakR: Float, limiterGain: Float, limiterReleaseMs: Float, active: Boolean, limiterActive: Boolean) { Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) { Column(Modifier.padding(16.dp)) { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("信号电平", color = Color.White, fontWeight = FontWeight.SemiBold); Text("峰值监视 · ${if (active) "实时" else "待机"}", color = Muted, fontSize = 12.sp) }; Spacer(Modifier.height(13.dp)); MeterRowPeak("INPUT L / DRY", inputL, inputPeakL, Teal); Spacer(Modifier.height(6.dp)); MeterRowPeak("INPUT R / DRY", inputR, inputPeakR, Teal); Spacer(Modifier.height(8.dp)); MeterRowPeak("OUTPUT L / WET", outputL, outputPeakL, Amber); Spacer(Modifier.height(6.dp)); MeterRowPeak("OUTPUT R / WET", outputR, outputPeakR, Amber); Spacer(Modifier.height(12.dp)); HorizontalDivider(color = Color(0xFF344248)); Spacer(Modifier.height(9.dp)); Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("LIMITER", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold); Text(if (limiterActive) "ACTIVE" else "BYPASS", color = if (limiterActive) Teal else Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold) }; Spacer(Modifier.height(5.dp)); Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("GAIN", color = Muted, fontSize = 10.sp); Text("%.6f".format(limiterGain), color = Color.White, fontSize = 11.sp); Text("RELEASE", color = Muted, fontSize = 10.sp); Text(limiterReleaseStatus(limiterReleaseMs), color = Color.White, fontSize = 11.sp) } } } }
 @Composable private fun MeterRowPeak(label: String, level: Float, peak: Float, tint: Color) { Row(verticalAlignment = Alignment.CenterVertically) { Text(label, color = Muted, fontSize = 10.sp, modifier = Modifier.width(86.dp)); Box(Modifier.weight(1f).height(12.dp)) { LinearProgressIndicator(progress = { level.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().height(7.dp).align(Alignment.Center).clip(RoundedCornerShape(4.dp)), color = tint, trackColor = Color(0xFF2C3B40)); Canvas(Modifier.fillMaxWidth().height(12.dp)) { val x = size.width * peak.coerceIn(0f, 1f); drawCircle(Color.White, 4.dp.toPx(), androidx.compose.ui.geometry.Offset(x, size.height / 2f)) } }; Column(Modifier.width(76.dp).padding(start = 8.dp)) { Text(dbText(level), color = Color.White, fontSize = 11.sp); Text("P ${dbText(peak)}", color = Amber, fontSize = 9.sp) } } }
+@Composable private fun MeterNumberRow(label: String, level: Float, peak: Float) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = Muted, fontSize = 10.sp)
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text(dbText(level), color = Color.White, fontSize = 11.sp)
+            Text("P ${dbText(peak)}", color = Amber, fontSize = 9.sp)
+        }
+    }
+}
+
 @Composable private fun LevelPanel(
     inputL: Float, inputR: Float, outputL: Float, outputR: Float,
     inputPeakL: Float, inputPeakR: Float, outputPeakL: Float, outputPeakR: Float,
     limiterGain: Float, limiterReleaseMs: Float, active: Boolean, limiterActive: Boolean,
     wifiReceiveActive: Boolean, wifiStats: LongArray,
-    waveformData: FloatArray, showWaveforms: Boolean, onShowWaveforms: (Boolean) -> Unit
+    waveformData: FloatArray, showWaveforms: Boolean, showLevelMeters: Boolean,
+    onShowWaveforms: (Boolean) -> Unit, onShowLevelMeters: (Boolean) -> Unit
 ) {
     Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text("信号电平", color = Color.White, fontWeight = FontWeight.SemiBold)
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("电平条", color = Muted, fontSize = 11.sp)
+                    Switch(checked = showLevelMeters, onCheckedChange = onShowLevelMeters)
+                    Spacer(Modifier.width(8.dp))
                     Text("波形", color = Muted, fontSize = 11.sp)
                     Switch(checked = showWaveforms, onCheckedChange = onShowWaveforms)
                 }
             }
             Spacer(Modifier.height(13.dp))
-            MeterRowPeak("INPUT L / DRY", inputL, inputPeakL, Teal)
-            Spacer(Modifier.height(6.dp)); MeterRowPeak("INPUT R / DRY", inputR, inputPeakR, Teal)
-            Spacer(Modifier.height(8.dp)); MeterRowPeak("OUTPUT L / WET", outputL, outputPeakL, Amber)
-            Spacer(Modifier.height(6.dp)); MeterRowPeak("OUTPUT R / WET", outputR, outputPeakR, Amber)
+            if (showLevelMeters) {
+                MeterRowPeak("INPUT L / DRY", inputL, inputPeakL, Teal)
+                Spacer(Modifier.height(6.dp)); MeterRowPeak("INPUT R / DRY", inputR, inputPeakR, Teal)
+                Spacer(Modifier.height(8.dp)); MeterRowPeak("OUTPUT L / WET", outputL, outputPeakL, Amber)
+                Spacer(Modifier.height(6.dp)); MeterRowPeak("OUTPUT R / WET", outputR, outputPeakR, Amber)
+            } else {
+                MeterNumberRow("INPUT L / DRY", inputL, inputPeakL)
+                Spacer(Modifier.height(6.dp)); MeterNumberRow("INPUT R / DRY", inputR, inputPeakR)
+                Spacer(Modifier.height(8.dp)); MeterNumberRow("OUTPUT L / WET", outputL, outputPeakL)
+                Spacer(Modifier.height(6.dp)); MeterNumberRow("OUTPUT R / WET", outputR, outputPeakR)
+            }
             if (showWaveforms) {
                 Spacer(Modifier.height(10.dp)); WaveformView("DRY", waveformData, 0, Teal)
                 Spacer(Modifier.height(6.dp)); WaveformView("WET", waveformData, 512, Amber)
