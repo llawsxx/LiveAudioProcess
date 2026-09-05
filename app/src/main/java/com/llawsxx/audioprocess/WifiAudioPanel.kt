@@ -46,12 +46,14 @@ fun WifiAudioPanel(
     receivePort: String,
     minBuffer: String,
     maxBuffer: String,
+    maxHold: String,
     inputTimeout: String,
     receiveActive: Boolean,
     onReceiveHost: (String) -> Unit,
     onReceivePort: (String) -> Unit,
     onMinBuffer: (String) -> Unit,
     onMaxBuffer: (String) -> Unit,
+    onMaxHold: (String) -> Unit,
     onInputTimeout: (String) -> Unit
 ) {
     val fieldColors = OutlinedTextFieldDefaults.colors(
@@ -161,6 +163,7 @@ fun WifiAudioPanel(
                     modifier = Modifier.weight(1f)
                 )
             }
+            OutlinedTextField(maxHold, onMaxHold, label = { Text("超过最大持续 ms") }, singleLine = true, colors = fieldColors, modifier = Modifier.fillMaxWidth())
             OutlinedTextField(
                 inputTimeout,
                 onInputTimeout,

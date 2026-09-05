@@ -147,6 +147,8 @@ typedef struct {
     int record_rate;
     atomic_ullong dsp_last_us, dsp_max_us;
     int net_sock, net_listen_sock, net_transport, net_codec, net_bitrate, net_port, net_min_ms, net_max_ms;
+    int net_max_hold_ms;
+    uint64_t net_max_since_ns;
     int net_tcp_connecting;
     wifi_aac_t net_aac;
     pthread_mutex_t net_codec_lock;
@@ -208,6 +210,7 @@ static Engine g = {
     .output_buffer_max_ms = ATOMIC_VAR_INIT(40),
     .usb_input_buffer_max_ms = ATOMIC_VAR_INIT(20),
     .input_buffer_max_ms = ATOMIC_VAR_INIT(20),
+    .net_max_hold_ms = 1000,
     .param_lock = PTHREAD_MUTEX_INITIALIZER,
     .file_lock = PTHREAD_MUTEX_INITIALIZER,
     .stream_lock = PTHREAD_MUTEX_INITIALIZER,
@@ -1190,6 +1193,7 @@ static void network_clear_jitter_state(void) {
     g.net_buffer_monitor_started=0;
     g.net_min_boundary_latched=0;
     g.net_max_boundary_latched=0;
+    g.net_max_since_ns=0;
     atomic_store(&g.net_buffer_ms,0);
 }
 
@@ -1217,6 +1221,16 @@ static int network_span_frames(void) {
     return frames>INT32_MAX?INT32_MAX:(frames>0?(int)frames:0);
 }
 
+static int network_violation_sustained(uint64_t *since_ns, int hold_ms, int violated, uint64_t now) {
+    if (!violated) {
+        *since_ns = 0;
+        return 0;
+    }
+    if (*since_ns == 0) *since_ns = now;
+    if (hold_ms <= 0) return 1;
+    return now >= *since_ns && now - *since_ns >= (uint64_t)hold_ms * 1000000ull;
+}
+
 static void network_update_buffer_monitor(int allow_events) {
     int valid_frames=network_valid_frames();
     int span_frames=network_span_frames();
@@ -1226,8 +1240,9 @@ static void network_update_buffer_monitor(int allow_events) {
     if(!allow_events||!g.net_buffer_monitor_started)return;
     int min_frames=(rate*g.net_min_ms)/1000;
     int max_frames=(rate*g.net_max_ms)/1000;
+    uint64_t now=now_ns();
+    int at_max=network_violation_sustained(&g.net_max_since_ns,g.net_max_hold_ms,max_frames>0&&span_frames>=max_frames,now);
     int at_min=valid_frames<=min_frames;
-    int at_max=max_frames>0&&span_frames>=max_frames;
     if(at_min&&!g.net_min_boundary_latched)atomic_fetch_add(&g.net_min_buffer_events,1);
     if(at_max&&!g.net_max_boundary_latched)atomic_fetch_add(&g.net_max_buffer_events,1);
     g.net_min_boundary_latched=at_min;
@@ -1480,7 +1495,10 @@ static int network_receive(float *data, int frames) {
         }
     }
     network_update_buffer_monitor(1);
-    if(network_span_frames()>=max_frames) {
+    uint64_t violation_now=now_ns();
+    int max_sustained=network_violation_sustained(&g.net_max_since_ns,g.net_max_hold_ms,
+                                                  network_span_frames()>=max_frames,violation_now);
+    if(max_sustained) {
         int keep_packets=(target_frames+NET_PACKET_FRAMES-1)/NET_PACKET_FRAMES;
         uint32_t new_play_seq=g.net_high_seq-(uint32_t)(keep_packets-1);
         network_drop_until(new_play_seq);
@@ -1909,7 +1927,7 @@ JNIEXPORT jfloatArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_waveform
     pthread_mutex_unlock(&g.waveform_lock);
     jfloatArray a=(*e)->NewFloatArray(e,1024); (*e)->SetFloatArrayRegion(e,a,0,1024,v); return a;
 }
-JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetwork(JNIEnv*e,jobject o,jint role,jint transport,jint codec,jint sampleRate,jint bitrate,jstring host,jint port,jint minMs,jint maxMs){
+JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetwork(JNIEnv*e,jobject o,jint role,jint transport,jint codec,jint sampleRate,jint bitrate,jstring host,jint port,jint minMs,jint maxMs,jint maxHoldMs){
     (void)o;
     if(role!=1&&role!=2){network_set_error(NET_ERROR_INVALID_ROLE,role,0);return JNI_FALSE;}
     if(transport!=NET_TRANSPORT_UDP&&transport!=NET_TRANSPORT_TCP){network_set_error(NET_ERROR_INVALID_TRANSPORT,transport,0);return JNI_FALSE;}
@@ -1936,6 +1954,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
             g.net_addr.sin_addr.s_addr==requested_addr.s_addr;
     int normalized_min=minMs<0?0:(minMs>200?200:minMs);
     int normalized_max=maxMs<50?50:(maxMs>1000?1000:maxMs);
+    int normalized_max_hold=maxHoldMs<0?0:(maxHoldMs>60000?60000:maxHoldMs);
     if (normalized_max<normalized_min) normalized_min=normalized_max;
     if (same_transport) {
         /* Parameter/UI updates must not tear down a live transport. In
@@ -1943,6 +1962,8 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
          * decoder must stay alive; only a sender needs a new encoder. */
         g.net_min_ms=normalized_min;
         g.net_max_ms=normalized_max;
+        g.net_max_hold_ms=normalized_max_hold;
+        g.net_max_since_ns=0;
         if (codec==1 && role==1 && normalized_bitrate != g.net_bitrate) {
             pthread_mutex_lock(&g.net_codec_lock);
             wifi_aac_t previous=g.net_aac;
@@ -1997,6 +2018,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
     memset(&g.net_addr,0,sizeof(g.net_addr));g.net_addr.sin_family=AF_INET;g.net_addr.sin_port=htons((uint16_t)port);g.net_addr.sin_addr=requested_addr;
     atomic_store(&g.net_last_packet_ns,now_ns());atomic_store(&g.net_packet_seen,0);
     g.net_min_ms=normalized_min;g.net_max_ms=normalized_max;
+    g.net_max_hold_ms=normalized_max_hold;
     g.net_send_count=0;g.net_seq=0;g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);g.net_missing_packets=g.net_late_packets=g.net_duplicate_packets=0;network_clear_jitter_state();
     atomic_store(&g.net_min_buffer_events,0);
     atomic_store(&g.net_max_buffer_events,0);

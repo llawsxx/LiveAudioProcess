@@ -186,8 +186,8 @@ class AudioEngine(private val context: Context) {
         if (displayed != null && routeNotice == displayed) routeNotice = null
         displayedWifiErrorNotice = null
     }
-    fun configureNetwork(role: Int, transport: Int, codec: Int, bitrate: Int, host: String, port: Int, minBufferMs: Int, maxBufferMs: Int): Boolean {
-        val configured = NativeAudio.configureNetwork(role, transport, codec, sampleRate, bitrate, host, port, minBufferMs, maxBufferMs)
+    fun configureNetwork(role: Int, transport: Int, codec: Int, bitrate: Int, host: String, port: Int, minBufferMs: Int, maxBufferMs: Int, maxHoldMs: Int): Boolean {
+        val configured = NativeAudio.configureNetwork(role, transport, codec, sampleRate, bitrate, host, port, minBufferMs, maxBufferMs, maxHoldMs)
         networkRole = if (configured) role else 0
         if (role != 1) { wifiReconnectCount = 0; wifiReconnectPending = false }
         val nativeError = nativeWifiError()
