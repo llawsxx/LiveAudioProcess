@@ -11,7 +11,7 @@ object NativeAudio {
     external fun stop()
     external fun stopForRouteChange()
     external fun update(flags: Int, values: FloatArray)
-    external fun configureTone(enabled: Boolean, waveform: Int, channels: Int, frequency: Float, frequency2: Float, durationSeconds: Float, clickIntervalMs: Float, level: Float)
+    external fun configureTone(enabled: Boolean, waveform: Int, music: Int, channels: Int, frequency: Float, frequency2: Float, durationSeconds: Float, clickIntervalMs: Float, level: Float)
     external fun levels(): FloatArray
     external fun waveform(): FloatArray
     external fun startRecordingFd(dryFd: Int, wetFd: Int): Boolean

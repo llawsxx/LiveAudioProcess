@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include "convolution_reverb.h"
+#include "test_music.h"
 #include "usb_host_bridge.h"
 #include "wifi_aac_bridge.h"
 
@@ -187,11 +188,13 @@ typedef struct {
     uint64_t net_tcp_next_connect_ns;
     atomic_int tone_enabled;
     int tone_waveform;
+    int tone_music;
     int tone_channels;
     float tone_frequency, tone_frequency2, tone_duration_seconds, tone_click_interval_ms, tone_level;
     double tone_phase, tone_phase2;
     uint64_t tone_frame_counter;
     uint32_t tone_noise_state;
+    TestMusicState tone_music_state;
     float net_send_buffer[NET_AAC_FRAMES * 2];
 } Engine;
 
@@ -1501,11 +1504,12 @@ static void *audio_thread(void *unused) {
         else if(using_tone){ got=want; }
         else { memset(input,0,(size_t)want*MAX_INPUT_CHANNELS*sizeof(float)); got=want; }
         if(got<=0){usleep(1000);continue;}
-        int tone_waveform, tone_channels;
+        int tone_waveform, tone_music, tone_channels;
         float tone_frequency, tone_frequency2, tone_duration_seconds, tone_click_interval_ms, tone_level;
         pthread_mutex_lock(&g.param_lock);
         memcpy(p,g.values,sizeof(p));
         tone_waveform=g.tone_waveform;
+        tone_music=g.tone_music;
         tone_channels=g.tone_channels;
         tone_frequency=g.tone_frequency;
         tone_frequency2=g.tone_frequency2;
@@ -1563,12 +1567,15 @@ static void *audio_thread(void *unused) {
                         g.tone_phase2=phase2;
                         break;
                     }
+                    case 7:
+                        value=test_music_render(&g.tone_music_state,tone_music,g.rate);
+                        break;
                     default: value=sin(phase*6.283185307179586); break;
                 }
                 value*=clampf(tone_level,0.f,1.f);
                 l=(tone_channels==2)?0.f:(float)value;
                 r=(tone_channels==1)?0.f:(float)value;
-                if(tone_waveform!=4&&tone_waveform!=5)phase += (double)tone_frequency/(double)g.rate;
+                if(tone_waveform!=4&&tone_waveform!=5&&tone_waveform!=7)phase += (double)tone_frequency/(double)g.rate;
                 phase -= floor(phase);
                 g.tone_phase=phase;
                 g.tone_frame_counter++;
@@ -1759,6 +1766,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
     return JNI_TRUE;
 fail:
     atomic_store(&g.running,0);
+    atomic_store(&g.tone_enabled,0);
     if (input_started && g.input) AAudioStream_requestStop(g.input);
     if (audio_thread_started) pthread_join(g.thread,NULL);
     if (output_started && g.output) AAudioStream_requestStop(g.output);
@@ -1780,6 +1788,7 @@ fail:
  * teardown/reconnect cycle. A full stop still closes all network resources. */
 static void native_stop_internal(int finalize_recording, int preserve_network) {
     int was_running = atomic_exchange(&g.running,0);
+    atomic_store(&g.tone_enabled,0);
     if (!was_running) {
         if (finalize_recording) stop_recording_internal();
         return;
@@ -1814,13 +1823,17 @@ static void native_stop_internal(int finalize_recording, int preserve_network) {
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stop(JNIEnv*e,jobject o){(void)e;(void)o;native_stop_internal(1,0);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stopForRouteChange(JNIEnv*e,jobject o){(void)e;(void)o;native_stop_internal(0,1);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_update(JNIEnv*e,jobject o,jint flags,jfloatArray values){(void)o;float incoming[28]={0};jsize n=(*e)->GetArrayLength(e,values);if(n>28)n=28;(*e)->GetFloatArrayRegion(e,values,0,n,incoming);pthread_mutex_lock(&g.param_lock);int reverb_changed=n>P_DAMP&&(g.values[P_ROOM]!=incoming[P_ROOM]||g.values[P_DECAY]!=incoming[P_DECAY]||g.values[P_DAMP]!=incoming[P_DAMP]);memcpy(g.values,incoming,(size_t)n*sizeof(float));pthread_mutex_unlock(&g.param_lock);if(reverb_changed)atomic_fetch_add(&g.reverb_generation,1);atomic_store(&g.flags,flags);}
-JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureTone(JNIEnv*e,jobject o,jboolean enabled,jint waveform,jint channels,jfloat frequency,jfloat frequency2,jfloat durationSeconds,jfloat clickIntervalMs,jfloat level){
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureTone(JNIEnv*e,jobject o,jboolean enabled,jint waveform,jint music,jint channels,jfloat frequency,jfloat frequency2,jfloat durationSeconds,jfloat clickIntervalMs,jfloat level){
     (void)e;(void)o;
     float max_frequency=g.rate>0?(float)g.rate*.45f:20000.f;
     pthread_mutex_lock(&g.param_lock);
-    int normalized_waveform=waveform<0?0:(waveform>6?6:waveform);
-    if(g.tone_waveform!=normalized_waveform){g.tone_phase=0.0;g.tone_phase2=0.0;g.tone_frame_counter=0;}
+    int normalized_waveform=waveform<0?0:(waveform>7?7:waveform);
+    int music_count=test_music_track_count();
+    int normalized_music=music<0?0:(music>=music_count?music_count-1:music);
+    int restart=g.tone_waveform!=normalized_waveform||g.tone_music!=normalized_music||(!atomic_load(&g.tone_enabled)&&enabled);
+    if(restart){g.tone_phase=0.0;g.tone_phase2=0.0;g.tone_frame_counter=0;test_music_reset(&g.tone_music_state);}
     g.tone_waveform=normalized_waveform;
+    g.tone_music=normalized_music;
     g.tone_channels=channels<0?0:(channels>2?2:channels);
     g.tone_frequency=frequency<1.f?1.f:(frequency>max_frequency?max_frequency:frequency);
     g.tone_frequency2=frequency2<1.f?1.f:(frequency2>max_frequency?max_frequency:frequency2);

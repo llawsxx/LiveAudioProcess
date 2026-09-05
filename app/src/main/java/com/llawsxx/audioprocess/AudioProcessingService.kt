@@ -98,7 +98,8 @@ class AudioProcessingService : Service() {
         engine.reverbRoom = effects.reverbRoom; engine.reverbDecay = effects.reverbDecay; engine.reverbDamping = effects.reverbDamping; engine.reverbMix = effects.reverbMix / 100f
         engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease
         engine.loudnessTarget = effects.loudnessTarget; engine.loudnessLra = effects.loudnessLra; engine.loudnessTruePeak = effects.loudnessTruePeak; engine.loudnessEnabled = effects.loudnessEnabled
-        engine.toneWaveform = p.getInt("toneWaveform", 0).coerceIn(0, 6)
+        engine.toneWaveform = p.getInt("toneWaveform", 0).coerceIn(0, 7)
+        engine.toneMusic = p.getInt("toneMusic", 0).coerceIn(0, 5)
         engine.toneChannels = p.getInt("toneChannels", 0).coerceIn(0, 2)
         engine.toneFrequency = p.getFloat("toneFrequency", 1000f).coerceIn(1f, 20_000f)
         engine.toneFrequency2 = p.getFloat("toneFrequency2", 20_000f).coerceIn(1f, 20_000f)

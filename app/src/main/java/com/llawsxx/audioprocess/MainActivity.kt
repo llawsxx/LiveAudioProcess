@@ -102,6 +102,14 @@ private val Teal = Color(0xFF43D5C1)
 private val Amber = Color(0xFFFFC857)
 private val Red = Color(0xFFFF6B6B)
 private val UsbBurstPacketOptions = listOf(1, 2, 4, 8, 16, 24, 32, 48, 64, 128)
+private val ToneMusicNames = listOf(
+    "贝多芬《欢乐颂》",
+    "贝多芬《致爱丽丝》",
+    "莫扎特《土耳其进行曲》",
+    "帕赫贝尔《卡农》",
+    "莫扎特《小星星变奏曲》主题",
+    "皮尔庞特《铃儿响叮当》"
+)
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun LiveAudioProcessApp() {
@@ -131,7 +139,8 @@ private fun LiveAudioProcessApp() {
     var inputPeakL by remember { mutableFloatStateOf(0f) }; var inputPeakR by remember { mutableFloatStateOf(0f) }
     var outputPeakL by remember { mutableFloatStateOf(0f) }; var outputPeakR by remember { mutableFloatStateOf(0f) }
     var waveformData by remember { mutableStateOf(FloatArray(1024)) }
-    var toneWaveform by remember { mutableIntStateOf(prefs.getInt("toneWaveform", 0).coerceIn(0, 6)) }
+    var toneWaveform by remember { mutableIntStateOf(prefs.getInt("toneWaveform", 0).coerceIn(0, 7)) }
+    var toneMusic by remember { mutableIntStateOf(prefs.getInt("toneMusic", 0).coerceIn(ToneMusicNames.indices)) }
     var showWaveforms by remember { mutableStateOf(prefs.getBoolean("showWaveforms", false)) }
     var toneChannels by remember { mutableIntStateOf(prefs.getInt("toneChannels", 0).coerceIn(0, 2)) }
     var toneFrequency by remember { mutableFloatStateOf(prefs.getFloat("toneFrequency", 1000f).coerceIn(1f, 20000f)) }
@@ -255,9 +264,10 @@ private fun LiveAudioProcessApp() {
         prefs.edit().putString("wifiReceiveHost", wifiReceiveHost).putString("wifiReceivePort", wifiReceivePort).putString("wifiMinBuffer", wifiMinBuffer).putString("wifiMaxBuffer", wifiMaxBuffer).putString("wifiInputTimeout", wifiInputTimeout).apply()
         if (input == InputSource.WIFI) wifiActive = configureWifiForCurrentRoute()
     }
-    LaunchedEffect(toneWaveform, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevelDb, input) {
-        prefs.edit().putInt("toneWaveform", toneWaveform).putInt("toneChannels", toneChannels).putFloat("toneFrequency", toneFrequency).putFloat("toneFrequency2", toneFrequency2).putFloat("toneDurationSeconds", toneDurationSeconds).putFloat("toneClickIntervalMs", toneClickIntervalMs).putInt("toneLevelDb", toneLevelDb).apply()
+    LaunchedEffect(toneWaveform, toneMusic, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevelDb, input) {
+        prefs.edit().putInt("toneWaveform", toneWaveform).putInt("toneMusic", toneMusic).putInt("toneChannels", toneChannels).putFloat("toneFrequency", toneFrequency).putFloat("toneFrequency2", toneFrequency2).putFloat("toneDurationSeconds", toneDurationSeconds).putFloat("toneClickIntervalMs", toneClickIntervalMs).putInt("toneLevelDb", toneLevelDb).apply()
         engine.toneWaveform = toneWaveform
+        engine.toneMusic = toneMusic
         engine.toneChannels = toneChannels
         engine.toneFrequency = toneFrequency
         engine.toneFrequency2 = toneFrequency2
@@ -323,7 +333,7 @@ private fun LiveAudioProcessApp() {
             VolumeControlPanel(outputVolumePercent, output == OutputSource.USB, output != OutputSource.NONE && (output != OutputSource.USB || running)) { value -> if (output == OutputSource.USB) usbOutputVolumePercent = value else { systemOutputVolumePercent = value; engine.outputVolumePercent = value; engine.setOutputVolumePercent(value) } }
             LevelPanel(inputLevelL, inputLevelR, outputLevelL, outputLevelR, inputPeakL, inputPeakR, outputPeakL, outputPeakR, limiterGain, limiterReleaseMs, running, running && effects.dspEnabled && effects.limiterEnabled, waveformData, showWaveforms) { showWaveforms = it; prefs.edit().putBoolean("showWaveforms", it).apply() }
             RoutingPanel2(input, { selected -> input = selected; channelPair = 0; if (selected == InputSource.TEST_TONE && output == OutputSource.NONE) { output = OutputSource.SPEAKER; routeNotice = "测试 Tone 需要本地输出，已切换到扬声器" }; if (selected == InputSource.WIFI) wifiOutputEnabled = false; wifiActive = configureWifiForCurrentRoute(); syncEngine() }, output, { selected -> val applied = if (selected == OutputSource.NONE && input == InputSource.TEST_TONE) { routeNotice = "测试 Tone 需要本地输出，已保持扬声器输出"; OutputSource.SPEAKER } else selected; if (applied == OutputSource.BLUETOOTH && Build.VERSION.SDK_INT >= 31 && ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) { pendingBluetoothOutput = applied; bluetoothPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT) } else { output = applied; syncEngine() } }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
-            if (input == InputSource.TEST_TONE) TonePanel(toneWaveform, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevelDb, { selected -> toneWaveform = selected; when (selected) { 4 -> { toneFrequency = 20f; toneFrequency2 = 20_000f }; 6 -> { toneFrequency = 19_000f; toneFrequency2 = 20_000f }; else -> Unit } }, { toneChannels = it }, { toneFrequency = it }, { toneFrequency2 = it }, { toneDurationSeconds = it }, { toneClickIntervalMs = it }, { toneLevelDb = it })
+            if (input == InputSource.TEST_TONE) TonePanel(toneWaveform, toneMusic, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevelDb, { selected -> toneWaveform = selected; when (selected) { 4 -> { toneFrequency = 20f; toneFrequency2 = 20_000f }; 6 -> { toneFrequency = 19_000f; toneFrequency2 = 20_000f }; else -> Unit } }, { toneMusic = it }, { toneChannels = it }, { toneFrequency = it }, { toneFrequency2 = it }, { toneDurationSeconds = it }, { toneClickIntervalMs = it }, { toneLevelDb = it })
             EnginePanelWithIoRates(rate, { rate = it; syncEngine() }, outputRate, { outputRate = it; syncEngine() }, buffer, { buffer = it; syncEngine() }, running)
             SystemInputPanel(inputInfo, input != InputSource.USB && input != InputSource.WIFI, systemInputBufferMaxMs) { systemInputBufferMaxMs = it }
             SystemOutputPanel(outputInfo, output != OutputSource.USB && output != OutputSource.NONE, systemOutputBufferMaxMs) { systemOutputBufferMaxMs = it }
@@ -393,12 +403,12 @@ private fun LiveAudioProcessApp() {
 }
 @Composable private fun LevelPanel(inputL: Float, inputR: Float, outputL: Float, outputR: Float, limiterGain: Float, limiterReleaseMs: Float, active: Boolean, limiterActive: Boolean) { Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) { Column(Modifier.padding(16.dp)) { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("信号电平", color = Color.White, fontWeight = FontWeight.SemiBold); Text("峰值监视 · ${if (active) "实时" else "待机"}", color = Muted, fontSize = 12.sp) }; Spacer(Modifier.height(13.dp)); MeterRow("INPUT L / DRY", inputL, Teal); Spacer(Modifier.height(6.dp)); MeterRow("INPUT R / DRY", inputR, Teal); Spacer(Modifier.height(8.dp)); MeterRow("OUTPUT L / WET", outputL, Amber); Spacer(Modifier.height(6.dp)); MeterRow("OUTPUT R / WET", outputR, Amber); Spacer(Modifier.height(12.dp)); HorizontalDivider(color = Color(0xFF344248)); Spacer(Modifier.height(9.dp)); Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("LIMITER", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold); Text(if (limiterActive) "ACTIVE" else "BYPASS", color = if (limiterActive) Teal else Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold) }; Spacer(Modifier.height(5.dp)); Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("GAIN", color = Muted, fontSize = 10.sp); Text("%.6f".format(limiterGain), color = Color.White, fontSize = 11.sp); Text("RELEASE", color = Muted, fontSize = 10.sp); Text(limiterReleaseStatus(limiterReleaseMs), color = Color.White, fontSize = 11.sp) } } } }
 @Composable private fun MeterRow(label: String, level: Float, tint: Color) { Row(verticalAlignment = Alignment.CenterVertically) { Text(label, color = Muted, fontSize = 10.sp, modifier = Modifier.width(86.dp)); LinearProgressIndicator(progress = { level.coerceIn(0f, 1f) }, modifier = Modifier.weight(1f).height(7.dp).clip(RoundedCornerShape(4.dp)), color = tint, trackColor = Color(0xFF2C3B40)); Text("${(-60 + level * 60).toInt()} dB", color = Color.White, fontSize = 11.sp, modifier = Modifier.width(52.dp).padding(start = 8.dp)) } }
-@Composable private fun TonePanel(waveform: Int, channels: Int, frequency: Float, frequency2: Float, durationSeconds: Float, clickIntervalMs: Float, levelDb: Int, onWaveform: (Int) -> Unit, onChannels: (Int) -> Unit, onFrequency: (Float) -> Unit, onFrequency2: (Float) -> Unit, onDurationSeconds: (Float) -> Unit, onClickIntervalMs: (Float) -> Unit, onLevelDb: (Int) -> Unit) {
+@Composable private fun TonePanel(waveform: Int, music: Int, channels: Int, frequency: Float, frequency2: Float, durationSeconds: Float, clickIntervalMs: Float, levelDb: Int, onWaveform: (Int) -> Unit, onMusic: (Int) -> Unit, onChannels: (Int) -> Unit, onFrequency: (Float) -> Unit, onFrequency2: (Float) -> Unit, onDurationSeconds: (Float) -> Unit, onClickIntervalMs: (Float) -> Unit, onLevelDb: (Int) -> Unit) {
     Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            SectionTitle("测试 Tone", "SIGNAL GENERATOR")
-            Text("波形", color = Muted, fontSize = 12.sp)
-            ToneChoiceRow(listOf("正弦波", "方波", "三角波", "噪声", "对数扫频", "脉冲", "双音 IMD"), waveform, onWaveform)
+            SectionTitle("测试 Tone / 音乐", "SIGNAL GENERATOR")
+            Text("信号类型", color = Muted, fontSize = 12.sp)
+            ToneChoiceRow(listOf("正弦波", "方波", "三角波", "噪声", "对数扫频", "脉冲", "双音 IMD", "测试音乐"), waveform, onWaveform)
             Text("声道", color = Muted, fontSize = 12.sp)
             ToneChoiceRow(listOf("双声道", "仅左声道", "仅右声道"), channels, onChannels)
             when (waveform) {
@@ -417,6 +427,11 @@ private fun LiveAudioProcessApp() {
                     EffectSlider("频率 1", "双音等幅混合", frequency, 1f..20000f, onFrequency, "${frequency.toInt()} Hz")
                     EffectSlider("频率 2", "双音等幅混合", frequency2, 1f..20000f, onFrequency2, "${frequency2.toInt()} Hz")
                 }
+                7 -> {
+                    Text("曲目", color = Muted, fontSize = 12.sp)
+                    ToneMusicDropdown(music, onMusic)
+                    Text("公版旋律片段 · 实时合成 · 循环播放", color = Teal, fontSize = 11.sp)
+                }
                 3 -> Unit
                 else -> {
                     EffectSlider("频率", "1 Hz - 20 kHz", frequency, 1f..20000f, onFrequency, "${frequency.toInt()} Hz")
@@ -426,6 +441,24 @@ private fun LiveAudioProcessApp() {
             }
             Text("音量", color = Muted, fontSize = 12.sp)
             ToneLevelChoiceRow(levelDb, onLevelDb)
+        }
+    }
+}
+@Composable private fun ToneMusicDropdown(selected: Int, onSelect: (Int) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    Box(Modifier.fillMaxWidth()) {
+        OutlinedButton(onClick = { expanded = true }, modifier = Modifier.fillMaxWidth()) {
+            Text(ToneMusicNames.getOrElse(selected) { ToneMusicNames.first() }, color = Color.White, modifier = Modifier.weight(1f))
+            Icon(Icons.Outlined.ArrowDropDown, contentDescription = "选择测试音乐", tint = Teal)
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            ToneMusicNames.forEachIndexed { index, name ->
+                DropdownMenuItem(
+                    text = { Text(name) },
+                    onClick = { onSelect(index); expanded = false },
+                    leadingIcon = { if (selected == index) Icon(Icons.Outlined.Check, contentDescription = null, tint = Teal) }
+                )
+            }
         }
     }
 }

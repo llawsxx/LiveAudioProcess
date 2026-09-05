@@ -40,7 +40,7 @@ target_link_libraries(uac PRIVATE libusb)
 target_compile_options(uac PRIVATE -fno-rtti -pthread)
 target_compile_definitions(uac PRIVATE UAC_ENABLE_LOGGING)
 
-add_library(audioprocess SHARED native_audio.c convolution_reverb.c usb_host_bridge.cpp wifi_aac_bridge.cpp)
+add_library(audioprocess SHARED native_audio.c convolution_reverb.c test_music.c usb_host_bridge.cpp wifi_aac_bridge.cpp)
 target_include_directories(audioprocess PRIVATE ${LIBUAC_ROOT}/include ${LIBUSB_ROOT}/libusb)
 target_compile_options(audioprocess PRIVATE -O3 -ffast-math -Wall -Wextra)
 target_link_libraries(audioprocess log m dl aaudio uac libusb fdk-aac)
