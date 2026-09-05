@@ -75,12 +75,15 @@ class MainActivity : ComponentActivity() {
 
     fun requestUsbAudioPermission(onResult: (Boolean) -> Unit) {
         val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
-        val device = usbManager.deviceList.values.firstOrNull { usbDevice ->
-            (0 until usbDevice.interfaceCount).any {
-                usbDevice.getInterface(it).interfaceClass == UsbConstants.USB_CLASS_AUDIO
-            }
+        val device = usbAudioDevice(usbManager)
+        if (device == null) {
+            // Keep the user's USB route selection even while no device is
+            // connected; AudioEngine will fall back to the system route and
+            // retry automatically when a device is attached.
+            onResult(true)
+            return
         }
-        if (device == null || usbManager.hasPermission(device)) {
+        if (usbManager.hasPermission(device)) {
             onResult(true)
             return
         }
@@ -92,6 +95,18 @@ class MainActivity : ComponentActivity() {
         )
         usbManager.requestPermission(device, permissionIntent)
     }
+
+    fun hasUsbAudioDevice(): Boolean {
+        val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
+        return usbAudioDevice(usbManager) != null
+    }
+
+    private fun usbAudioDevice(usbManager: UsbManager) =
+        usbManager.deviceList.values.firstOrNull { usbDevice ->
+            (0 until usbDevice.interfaceCount).any {
+                usbDevice.getInterface(it).interfaceClass == UsbConstants.USB_CLASS_AUDIO
+            }
+        }
 }
 
 private val Ink = Color(0xFF101417)
@@ -135,7 +150,9 @@ private fun LiveAudioProcessApp() {
     var outputLevelL by remember { mutableFloatStateOf(0.05f) }; var outputLevelR by remember { mutableFloatStateOf(0.05f) }
     var systemOutputVolumePercent by remember { mutableIntStateOf(engine.systemVolumePercent()) }
     var usbOutputVolumePercent by remember { mutableIntStateOf(prefs.getInt("usbOutputVolumePercent", prefs.getInt("outputVolumePercent", 100)).coerceIn(0, 100)) }
-    val outputVolumePercent = if (output == OutputSource.USB) usbOutputVolumePercent else systemOutputVolumePercent
+    var usbOutputHostActive by remember { mutableStateOf(engine.usbOutputHostActive) }
+    val usesUsbHostVolume = output == OutputSource.USB && (!running || usbOutputHostActive)
+    val outputVolumePercent = if (usesUsbHostVolume) usbOutputVolumePercent else systemOutputVolumePercent
     var inputPeakL by remember { mutableFloatStateOf(0f) }; var inputPeakR by remember { mutableFloatStateOf(0f) }
     var outputPeakL by remember { mutableFloatStateOf(0f) }; var outputPeakR by remember { mutableFloatStateOf(0f) }
     var waveformData by remember { mutableStateOf(FloatArray(1024)) }
@@ -205,6 +222,10 @@ private fun LiveAudioProcessApp() {
         while (true) {
             running = engine.isRunning
             recording = engine.isRecording
+            val actualUsbOutputHostActive = engine.usbOutputHostActive
+            if (usbOutputHostActive && !actualUsbOutputHostActive && output == OutputSource.USB)
+                systemOutputVolumePercent = engine.systemVolumePercent()
+            usbOutputHostActive = actualUsbOutputHostActive
             val engineNotice = engine.routeNotice ?: engine.lastError
             if (!engineNotice.isNullOrBlank()) {
                 routeNotice = engineNotice
@@ -248,11 +269,14 @@ private fun LiveAudioProcessApp() {
     }
     fun syncEngine() { val inputBufferMaxMs = (systemInputBufferMaxMs.toIntOrNull() ?: 20).coerceIn(5, 200); val outputBufferMaxMs = (systemOutputBufferMaxMs.toIntOrNull() ?: 40).coerceIn(5, 200); val usbInputMaxMs = (usbInputBufferMaxMs.toIntOrNull() ?: 20).coerceIn(5, 200); engine.configureAudioFormat(rate, outputRate, usbInputBitDepth, usbOutputBitDepth); engine.bufferFrames = buffer; engine.configureSystemOutputBuffer(outputBufferMaxMs); engine.configureSystemInputBuffer(inputBufferMaxMs); engine.configureUsbInputBuffer(usbInputMaxMs); engine.eqGain = effects.eqGain; engine.eqFrequency = effects.eqFrequency; engine.eqQ = effects.eqQ; engine.eq2Frequency = effects.eq2Frequency; engine.eq2Gain = effects.eq2Gain; engine.eq2Q = effects.eq2Q; engine.eq3Frequency = effects.eq3Frequency; engine.eq3Gain = effects.eq3Gain; engine.eq3Q = effects.eq3Q; engine.eq4Frequency = effects.eq4Frequency; engine.eq4Gain = effects.eq4Gain; engine.eq4Q = effects.eq4Q; engine.reverbRoom = effects.reverbRoom; engine.reverbDecay = effects.reverbDecay; engine.reverbDamping = effects.reverbDamping; engine.reverbMix = effects.reverbMix / 100f; engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease; engine.loudnessTarget = effects.loudnessTarget; engine.loudnessLra = effects.loudnessLra; engine.loudnessTruePeak = effects.loudnessTruePeak; engine.loudnessEnabled = effects.loudnessEnabled; engine.wifiInputTimeoutMs = ((wifiInputTimeout.toFloatOrNull() ?: 1f) * 1000f).toInt().coerceIn(100, 60_000); engine.updateRouting(input, output, channelPair); effects.save(prefs); prefs.edit().putInt("rate", rate).putInt("outputRate", outputRate).putInt("usbInputBitDepth", usbInputBitDepth).putInt("usbOutputBitDepth", usbOutputBitDepth).putInt("buffer", buffer).putInt("systemOutputBufferMaxMs", outputBufferMaxMs).putInt("systemInputBufferMaxMs", inputBufferMaxMs).putInt("usbInputBufferMaxMs", usbInputMaxMs).putInt("channelPair", channelPair).putString("input", input.name).putString("output", output.name).putBoolean("wifiOutputEnabled", wifiOutputEnabled).putBoolean("wifiActive", wifiActive).apply() }
     LaunchedEffect(input, channelPair, output, wifiOutputEnabled, rate, outputRate, usbInputBitDepth, usbOutputBitDepth, buffer, effects) { syncEngine(); engine.dspEnabled = effects.dspEnabled; engine.eqEnabled = effects.eqEnabled; engine.reverbEnabled = effects.reverbEnabled; engine.limiterEnabled = effects.limiterEnabled; engine.loudnessEnabled = effects.loudnessEnabled; if (input == InputSource.WIFI || wifiOutputEnabled) wifiActive = configureWifiForCurrentRoute() else { engine.clearNetwork(); wifiActive = false }; engine.refreshNativeParameters() }
-    LaunchedEffect(outputVolumePercent, output, running) {
-        engine.outputVolumePercent = outputVolumePercent
+    LaunchedEffect(outputVolumePercent, output, running, usbOutputHostActive) {
         if (output == OutputSource.USB) {
-            prefs.edit().putInt("usbOutputVolumePercent", outputVolumePercent).apply()
+            engine.outputVolumePercent = usbOutputVolumePercent
+            if (usesUsbHostVolume)
+                prefs.edit().putInt("usbOutputVolumePercent", usbOutputVolumePercent).apply()
             if (running) engine.setOutputVolumePercent(outputVolumePercent)
+        } else {
+            engine.outputVolumePercent = outputVolumePercent
         }
     }
     LaunchedEffect(wifiSendHost, wifiSendPort, wifiTransport, wifiCodec, wifiAacBitrate) {
@@ -322,6 +346,65 @@ private fun LiveAudioProcessApp() {
             Intent(context, AudioProcessingService::class.java).setAction(AudioProcessingService.ACTION_START)
         )
     }
+    fun applyInputSelection(selected: InputSource) {
+        input = selected
+        channelPair = 0
+        if (selected == InputSource.TEST_TONE && output == OutputSource.NONE) {
+            output = OutputSource.SPEAKER
+            routeNotice = "测试 Tone 需要本地输出，已切换到扬声器"
+        }
+        if (selected == InputSource.WIFI) wifiOutputEnabled = false
+        wifiActive = configureWifiForCurrentRoute()
+        syncEngine()
+    }
+    fun selectInput(selected: InputSource) {
+        if (selected != InputSource.USB) {
+            applyInputSelection(selected)
+            return
+        }
+        val currentActivity = activity as? MainActivity
+        if (currentActivity == null) {
+            routeNotice = "无法打开 USB 声卡授权窗口"
+            return
+        }
+        currentActivity.requestUsbAudioPermission { granted ->
+            if (granted) applyInputSelection(selected)
+            else routeNotice = if (currentActivity.hasUsbAudioDevice())
+                "USB 声卡授权被拒绝，未切换输入"
+            else "未检测到 USB 声卡，未切换输入"
+        }
+    }
+    fun applyOutputSelection(selected: OutputSource) {
+        val applied = if (selected == OutputSource.NONE && input == InputSource.TEST_TONE) {
+            routeNotice = "测试 Tone 需要本地输出，已保持扬声器输出"
+            OutputSource.SPEAKER
+        } else selected
+        if (applied == OutputSource.BLUETOOTH && Build.VERSION.SDK_INT >= 31 &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            pendingBluetoothOutput = applied
+            bluetoothPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+        } else {
+            output = applied
+            syncEngine()
+        }
+    }
+    fun selectOutput(selected: OutputSource) {
+        if (selected != OutputSource.USB) {
+            applyOutputSelection(selected)
+            return
+        }
+        val currentActivity = activity as? MainActivity
+        if (currentActivity == null) {
+            routeNotice = "无法打开 USB 声卡授权窗口"
+            return
+        }
+        currentActivity.requestUsbAudioPermission { granted ->
+            if (granted) applyOutputSelection(selected)
+            else routeNotice = if (currentActivity.hasUsbAudioDevice())
+                "USB 声卡授权被拒绝，未切换输出"
+            else "未检测到 USB 声卡，未切换输出"
+        }
+    }
     Scaffold(containerColor = Ink, topBar = { TopAppBar(title = { Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.GraphicEq, null, tint = Teal, modifier = Modifier.size(25.dp)); Spacer(Modifier.width(9.dp)); Text("LiveAudioProcess", fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp) } }, actions = { StatusDot(running) }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Ink, titleContentColor = Color.White)) }) { pad ->
         Column(Modifier.fillMaxSize().padding(pad).padding(horizontal = 16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Spacer(Modifier.height(2.dp))
@@ -330,9 +413,9 @@ private fun LiveAudioProcessApp() {
                 screenAlwaysOn = enabled
                 prefs.edit().putBoolean("screenAlwaysOn", enabled).apply()
             }
-            VolumeControlPanel(outputVolumePercent, output == OutputSource.USB, output != OutputSource.NONE && (output != OutputSource.USB || running)) { value -> if (output == OutputSource.USB) usbOutputVolumePercent = value else { systemOutputVolumePercent = value; engine.outputVolumePercent = value; engine.setOutputVolumePercent(value) } }
+            VolumeControlPanel(outputVolumePercent, usesUsbHostVolume, output != OutputSource.NONE && (output != OutputSource.USB || running)) { value -> if (usesUsbHostVolume) usbOutputVolumePercent = value else { systemOutputVolumePercent = value; if (output != OutputSource.USB) engine.outputVolumePercent = value; engine.setOutputVolumePercent(value) } }
             LevelPanel(inputLevelL, inputLevelR, outputLevelL, outputLevelR, inputPeakL, inputPeakR, outputPeakL, outputPeakR, limiterGain, limiterReleaseMs, running, running && effects.dspEnabled && effects.limiterEnabled, waveformData, showWaveforms) { showWaveforms = it; prefs.edit().putBoolean("showWaveforms", it).apply() }
-            RoutingPanel2(input, { selected -> input = selected; channelPair = 0; if (selected == InputSource.TEST_TONE && output == OutputSource.NONE) { output = OutputSource.SPEAKER; routeNotice = "测试 Tone 需要本地输出，已切换到扬声器" }; if (selected == InputSource.WIFI) wifiOutputEnabled = false; wifiActive = configureWifiForCurrentRoute(); syncEngine() }, output, { selected -> val applied = if (selected == OutputSource.NONE && input == InputSource.TEST_TONE) { routeNotice = "测试 Tone 需要本地输出，已保持扬声器输出"; OutputSource.SPEAKER } else selected; if (applied == OutputSource.BLUETOOTH && Build.VERSION.SDK_INT >= 31 && ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) { pendingBluetoothOutput = applied; bluetoothPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT) } else { output = applied; syncEngine() } }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
+            RoutingPanel2(input, { selectInput(it) }, output, { selectOutput(it) }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
             if (input == InputSource.TEST_TONE) TonePanel(toneWaveform, toneMusic, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevelDb, { selected -> toneWaveform = selected; when (selected) { 4 -> { toneFrequency = 20f; toneFrequency2 = 20_000f }; 6 -> { toneFrequency = 19_000f; toneFrequency2 = 20_000f }; else -> Unit } }, { toneMusic = it }, { toneChannels = it }, { toneFrequency = it }, { toneFrequency2 = it }, { toneDurationSeconds = it }, { toneClickIntervalMs = it }, { toneLevelDb = it })
             EnginePanelWithIoRates(rate, { rate = it; syncEngine() }, outputRate, { outputRate = it; syncEngine() }, buffer, { buffer = it; syncEngine() }, running)
             SystemInputPanel(inputInfo, input != InputSource.USB && input != InputSource.WIFI, systemInputBufferMaxMs) { systemInputBufferMaxMs = it }

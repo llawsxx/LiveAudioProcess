@@ -29,6 +29,7 @@ object NativeAudio {
     external fun networkOutputConnected(): Boolean
     external fun networkOutputConnectAttempts(): Int
     external fun routeInfo(): IntArray
+    external fun usbHostFailed(): Boolean
     external fun inputInfo(): LongArray
     external fun outputInfo(): LongArray
     external fun usbStats(): LongArray

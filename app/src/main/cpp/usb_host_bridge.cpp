@@ -117,6 +117,10 @@ public:
         return frames;
     }
 
+    void requestStop() {
+        stopping_.store(true, std::memory_order_release);
+    }
+
     void configureOutputBuffer(int maxBufferMs) {
         outputMaxBufferMs_.store(std::clamp(maxBufferMs, 5, 200), std::memory_order_relaxed);
         updateOutputBufferFrames();
@@ -160,6 +164,11 @@ public:
             USB_HOST_LOGI("USB output volume SET_CUR success percent=%d raw=%d", p, raw);
         }
         return ok;
+    }
+
+    bool hasFailed() const {
+        return (inputStream_ && inputStream_->check_streaming_error() != uac::UAC_NO_ERROR) ||
+               (outputStream_ && outputStream_->check_streaming_error() != uac::UAC_NO_ERROR);
     }
 
     usb_host_audio_stats_t stats() const {
@@ -316,5 +325,7 @@ extern "C" int usb_host_audio_write(usb_host_audio_t a,const float*d,int n){retu
 extern "C" void usb_host_audio_configure_output_buffer(usb_host_audio_t a,int maxMs){if(a)static_cast<UsbHostAudio*>(a)->configureOutputBuffer(maxMs);}
 extern "C" void usb_host_audio_configure_input_buffer(usb_host_audio_t a,int maxMs){if(a)static_cast<UsbHostAudio*>(a)->configureInputBuffer(maxMs);}
 extern "C" int usb_host_audio_set_volume(usb_host_audio_t a,int percent){return a&&static_cast<UsbHostAudio*>(a)->setVolumePercent(percent)?1:0;}
+extern "C" int usb_host_audio_has_failed(usb_host_audio_t a){return a&&static_cast<UsbHostAudio*>(a)->hasFailed()?1:0;}
 extern "C" void usb_host_audio_get_stats(usb_host_audio_t a,usb_host_audio_stats_t*stats){if(!stats)return;*stats=a?static_cast<UsbHostAudio*>(a)->stats():usb_host_audio_stats_t{};}
+extern "C" void usb_host_audio_request_stop(usb_host_audio_t a){if(a)static_cast<UsbHostAudio*>(a)->requestStop();}
 extern "C" void usb_host_audio_stop(usb_host_audio_t a){delete static_cast<UsbHostAudio*>(a);}

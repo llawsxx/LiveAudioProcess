@@ -428,7 +428,7 @@ namespace uac {
     }
 
     error_code uac_stream_handle_impl::check_streaming_error() const {
-        return usbTransferError;
+        return usbTransferError.load(std::memory_order_acquire);
     }
 
     uac_stream_stats uac_stream_handle_impl::get_streaming_stats() const {

@@ -72,7 +72,7 @@ namespace uac {
         std::atomic<bool> active = false;
         std::vector<libusb_transfer*> transfers;
 
-        error_code usbTransferError = UAC_NO_ERROR;
+        std::atomic<error_code> usbTransferError{UAC_NO_ERROR};
         std::atomic<uint64_t> packetErrors{0};
         std::atomic<uint64_t> emptyPackets{0};
         std::atomic<uint64_t> transferErrors{0};

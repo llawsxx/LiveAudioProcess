@@ -1767,6 +1767,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
 fail:
     atomic_store(&g.running,0);
     atomic_store(&g.tone_enabled,0);
+    usb_host_audio_request_stop(g.usb_audio);
     if (input_started && g.input) AAudioStream_requestStop(g.input);
     if (audio_thread_started) pthread_join(g.thread,NULL);
     if (output_started && g.output) AAudioStream_requestStop(g.output);
@@ -1789,6 +1790,11 @@ fail:
 static void native_stop_internal(int finalize_recording, int preserve_network) {
     int was_running = atomic_exchange(&g.running,0);
     atomic_store(&g.tone_enabled,0);
+    /* A disconnected USB OUT endpoint no longer drains its ring. Wake a DSP
+     * thread blocked in usb_host_audio_write() before waiting for that thread;
+     * destroying the USB object happens only after the join, when callbacks
+     * can no longer race the DSP thread. */
+    usb_host_audio_request_stop(g.usb_audio);
     if (!was_running) {
         if (finalize_recording) stop_recording_internal();
         return;
@@ -2025,6 +2031,7 @@ JNIEXPORT jint JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkOutputCo
     return (jint)atomic_load(&g.net_tcp_connect_attempts);
 }
 JNIEXPORT jintArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_routeInfo(JNIEnv*e,jobject o){(void)o;jint route[4];pthread_mutex_lock(&g.stream_lock);route[0]=g.usb_input_host?-3:(atomic_load(&g.use_network_input)&&atomic_load(&g.net_role)==2?-2:(g.input?AAudioStream_getDeviceId(g.input):-1));route[1]=g.usb_output_host?-4:(g.output?AAudioStream_getDeviceId(g.output):-1);route[2]=g.usb_input_host?2:(g.input?AAudioStream_getChannelCount(g.input):-1);route[3]=g.usb_output_host?2:(g.output?AAudioStream_getChannelCount(g.output):-1);pthread_mutex_unlock(&g.stream_lock);jintArray result=(*e)->NewIntArray(e,4);(*e)->SetIntArrayRegion(e,result,0,4,route);return result;}
+JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_usbHostFailed(JNIEnv*e,jobject o){(void)e;(void)o;return usb_host_audio_has_failed(g.usb_audio)?JNI_TRUE:JNI_FALSE;}
 JNIEXPORT jlongArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_inputInfo(JNIEnv*e,jobject o){
     (void)o;
     jlong values[14]={0};

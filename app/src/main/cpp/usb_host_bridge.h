@@ -36,7 +36,10 @@ int usb_host_audio_write(usb_host_audio_t audio, const float *stereo, int frames
 void usb_host_audio_configure_output_buffer(usb_host_audio_t audio, int max_buffer_ms);
 void usb_host_audio_configure_input_buffer(usb_host_audio_t audio, int max_buffer_ms);
 int usb_host_audio_set_volume(usb_host_audio_t audio, int percent);
+int usb_host_audio_has_failed(usb_host_audio_t audio);
 void usb_host_audio_get_stats(usb_host_audio_t audio, usb_host_audio_stats_t *stats);
+/* Interrupt a pending write/read before the owning object is destroyed. */
+void usb_host_audio_request_stop(usb_host_audio_t audio);
 void usb_host_audio_stop(usb_host_audio_t audio);
 #ifdef __cplusplus
 }
