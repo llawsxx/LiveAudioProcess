@@ -23,6 +23,7 @@ object NativeAudio {
     external fun configureOutputBufferMaxMs(maxMs: Int)
     external fun configureInputBufferMaxMs(maxMs: Int)
     external fun clearNetwork()
+    external fun networkErrorInfo(): IntArray
     external fun networkInputTimedOut(timeoutMs: Int): Boolean
     external fun networkOutputTimedOut(timeoutMs: Int): Boolean
     external fun networkOutputConnected(): Boolean

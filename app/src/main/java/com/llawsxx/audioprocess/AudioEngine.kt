@@ -19,6 +19,9 @@ import android.os.ParcelFileDescriptor
 import kotlin.math.roundToInt
 
 class AudioEngine(private val context: Context) {
+    private val wifiConfigurationFailureNotice = "Wi-Fi 音频配置失败，所选 Wi-Fi 路由未生效"
+    private val usbVolumeFailureNotice = "USB 音频设备不支持主音量控制，或音量命令发送失败"
+    private val systemVolumeFailureNotice = "系统媒体音量调节失败"
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val routeHandler = Handler(Looper.getMainLooper())
     @Volatile private var activeInputDeviceId = -1
@@ -31,6 +34,7 @@ class AudioEngine(private val context: Context) {
     @Volatile private var wifiFallbackActive = false
     @Volatile private var wifiReconnectCount = 0
     @Volatile private var wifiReconnectPending = false
+    @Volatile private var displayedWifiErrorNotice: String? = null
     @Volatile var wifiInputTimeoutMs = 1_000
     @Volatile var routeNotice: String? = null
         private set
@@ -87,11 +91,70 @@ class AudioEngine(private val context: Context) {
     private data class RecordingTarget(val dryUri: android.net.Uri?, val wetUri: android.net.Uri?, val dryPfd: ParcelFileDescriptor, val wetPfd: ParcelFileDescriptor)
     private var recordingTarget: RecordingTarget? = null
     private var usbConnection: UsbDeviceConnection? = null
+    private fun socketErrorText(error: Int): String = when (error) {
+        13 -> "权限不足"
+        98 -> "地址或端口已被占用"
+        99 -> "本机不存在该 IP 地址"
+        101 -> "网络不可达"
+        110 -> "连接超时"
+        111 -> "连接被拒绝"
+        113 -> "找不到到目标主机的路由"
+        else -> "系统错误 $error"
+    }
+    private fun codecName(value: Int): String = when (value) { 0 -> "PCM"; 1 -> "AAC"; else -> "未知($value)" }
+    private fun nativeWifiError(): Pair<Int, String?> {
+        val info = runCatching { NativeAudio.networkErrorInfo() }.getOrDefault(IntArray(0))
+        val code = info.getOrElse(0) { 0 }
+        val actual = info.getOrElse(1) { 0 }
+        val expected = info.getOrElse(2) { 0 }
+        val message = when (code) {
+            0 -> null
+            1 -> "Wi-Fi 配置失败：收发角色参数无效（$actual）"
+            2 -> "Wi-Fi 配置失败：传输协议参数无效（$actual）"
+            3 -> "Wi-Fi 配置失败：编码参数无效（$actual）"
+            4 -> "Wi-Fi 配置失败：不支持 $actual Hz 采样率"
+            5 -> "Wi-Fi 配置失败：IP 地址格式无效"
+            6 -> "Wi-Fi 配置失败：端口必须在 1–65535 之间（当前 $actual）"
+            7 -> "Wi-Fi 配置失败：AAC 初始化失败（${actual} Hz，${expected} bps）"
+            8 -> "Wi-Fi 配置失败：无法创建网络套接字（${socketErrorText(actual)}）"
+            9 -> "Wi-Fi 配置失败：端口 $actual 已被占用"
+            10 -> "Wi-Fi 配置失败：无法绑定端口 $actual（${socketErrorText(expected)}）"
+            11 -> "Wi-Fi 配置失败：无法监听端口 $actual（${socketErrorText(expected)}）"
+            12 -> "Wi-Fi 输出连接端口 $expected 失败（${socketErrorText(actual)}）"
+            13 -> "Wi-Fi 输入已建立 TCP 连接，但尚未收到完整音频数据"
+            20 -> "Wi-Fi 数据包过短（收到 $actual 字节，至少需要 $expected 字节）"
+            21 -> "Wi-Fi 协议标识不匹配：对端不是本应用的音频协议"
+            22 -> "Wi-Fi 协议版本不一致（发送端 v$actual，接收端 v$expected）"
+            23 -> "Wi-Fi 编码不一致（发送端 ${codecName(actual)}，接收端 ${codecName(expected)}）"
+            24 -> "Wi-Fi 声道数不一致（发送端 $actual，接收端 $expected）"
+            25 -> "Wi-Fi 采样率不一致（发送端 $actual Hz，接收端 $expected Hz）"
+            26 -> "Wi-Fi 音频帧长不一致（发送端 $actual，接收端 $expected）"
+            27 -> if (actual > 0) "Wi-Fi PCM 位深/格式不一致（发送端每样本 $actual 字节，接收端要求 Float32/$expected 字节）" else "Wi-Fi PCM 数据布局不一致（接收端要求 Float32）"
+            28 -> "Wi-Fi AAC 数据长度异常（收到 $actual 字节，上限 $expected 字节）"
+            29 -> "Wi-Fi AAC 解码失败（返回 $actual，期望 $expected 帧）"
+            30 -> "Wi-Fi TCP 包长度字段异常（$actual 字节，上限 $expected 字节）"
+            31 -> "Wi-Fi 接收失败（${socketErrorText(actual)}）"
+            32 -> "Wi-Fi 发送端已断开连接"
+            else -> "Wi-Fi 音频错误（代码 $code，详情 $actual/$expected）"
+        }
+        return code to message
+    }
+    private fun showWifiError(message: String) {
+        displayedWifiErrorNotice = message
+        routeNotice = message
+    }
+    private fun clearDisplayedWifiError() {
+        val displayed = displayedWifiErrorNotice
+        if (displayed != null && routeNotice == displayed) routeNotice = null
+        displayedWifiErrorNotice = null
+    }
     fun configureNetwork(role: Int, transport: Int, codec: Int, bitrate: Int, host: String, port: Int, minBufferMs: Int, maxBufferMs: Int): Boolean {
         val configured = NativeAudio.configureNetwork(role, transport, codec, sampleRate, bitrate, host, port, minBufferMs, maxBufferMs)
         networkRole = if (configured) role else 0
         if (role != 1) { wifiReconnectCount = 0; wifiReconnectPending = false }
-        if (!configured) routeNotice = "Wi-Fi 音频配置失败，所选 Wi-Fi 路由未生效"
+        val nativeError = nativeWifiError()
+        if (!configured) showWifiError(nativeError.second ?: wifiConfigurationFailureNotice)
+        else if (nativeError.first == 0) clearDisplayedWifiError()
         return configured
     }
     fun clearNetwork() {
@@ -100,6 +163,8 @@ class AudioEngine(private val context: Context) {
         wifiFallbackActive = false
         wifiReconnectCount = 0
         wifiReconnectPending = false
+        displayedWifiErrorNotice = null
+        if (routeNotice?.startsWith("Wi-Fi ") == true) routeNotice = null
     }
     fun configureUsbOutputBuffer(maxBufferMs: Int) {
         if (!NativeAudio.available) return
@@ -166,13 +231,8 @@ class AudioEngine(private val context: Context) {
                 true
             }.getOrDefault(false)
         }
-        if (!applied) {
-            routeNotice = if (outputSource == OutputSource.USB) {
-                "USB 音频设备不支持主音量控制，或音量命令发送失败"
-            } else {
-                "系统媒体音量调节失败"
-            }
-        }
+        if (!applied) routeNotice = if (outputSource == OutputSource.USB) usbVolumeFailureNotice else systemVolumeFailureNotice
+        else if (routeNotice == usbVolumeFailureNotice || routeNotice == systemVolumeFailureNotice) routeNotice = null
         return applied
     }
     fun systemVolumePercent(): Int = runCatching {
@@ -299,39 +359,48 @@ class AudioEngine(private val context: Context) {
     private val wifiHealthMonitor = object : Runnable {
         override fun run() {
             if (!isRunning) return
+            val nativeError = nativeWifiError()
             if (networkRole == 1) {
+                if (nativeError.first == 8 || nativeError.first == 12) {
+                    showWifiError("${nativeError.second}，正在自动重连")
+                }
                 val timeout = NativeAudio.networkOutputTimedOut(wifiInputTimeoutMs.coerceIn(100, 60_000))
                 if (timeout && !wifiReconnectPending) {
                     wifiReconnectCount = (NativeAudio.networkOutputConnectAttempts() - 1).coerceAtLeast(1)
                     wifiReconnectPending = true
-                    routeNotice = "Wi-Fi 输出超过 ${wifiInputTimeoutMs} ms 无法发送，第 ${wifiReconnectCount} 次重连中"
+                    showWifiError("${nativeError.second ?: "Wi-Fi 输出超过 ${wifiInputTimeoutMs} ms 无法发送"}，第 ${wifiReconnectCount} 次重连中")
                 }
                 if (wifiReconnectPending) {
                     val attempts = (NativeAudio.networkOutputConnectAttempts() - 1).coerceAtLeast(1)
                     if (attempts > wifiReconnectCount) {
                         wifiReconnectCount = attempts
-                        routeNotice = "Wi-Fi 输出超过 ${wifiInputTimeoutMs} ms 无法发送，第 ${wifiReconnectCount} 次重连中"
+                        showWifiError("${nativeWifiError().second ?: "Wi-Fi 输出超过 ${wifiInputTimeoutMs} ms 无法发送"}，第 ${wifiReconnectCount} 次重连中")
                     }
                 }
                 if (wifiReconnectPending && NativeAudio.networkOutputConnected()) {
                     wifiReconnectPending = false
-                    routeNotice = null
+                    clearDisplayedWifiError()
                 }
+                if (!wifiReconnectPending && nativeError.first == 0 && NativeAudio.networkOutputConnected()) clearDisplayedWifiError()
             }
             if (inputSource == InputSource.WIFI && networkRole == 2) {
+                val nativeErrorMessage = nativeError.second
+                if (nativeError.first in 20..32 && nativeErrorMessage != null) showWifiError(nativeErrorMessage)
                 val timedOut = NativeAudio.networkInputTimedOut(wifiInputTimeoutMs.coerceIn(100, 60_000))
                 if (timedOut && !wifiFallbackActive) {
                     wifiFallbackActive = true
                     restartStreamsForRouteChange()
-                    routeNotice = "Wi-Fi 输入超过 ${wifiInputTimeoutMs} ms 无数据，已自动切换到默认麦克风"
+                    showWifiError("${nativeError.second ?: "Wi-Fi 输入超过 ${wifiInputTimeoutMs} ms 无数据"}，已自动切换到默认麦克风")
                     return
                 }
                 if (!timedOut && wifiFallbackActive) {
                     wifiFallbackActive = false
                     restartStreamsForRouteChange()
+                    clearDisplayedWifiError()
                     routeNotice = "Wi-Fi 输入已恢复，已自动切回 Wi-Fi 音频"
                     return
                 }
+                if (!timedOut && nativeError.first == 0) clearDisplayedWifiError()
             }
             routeHandler.postDelayed(this, 100)
         }
@@ -435,8 +504,10 @@ class AudioEngine(private val context: Context) {
         val usbOutputId = if (outputSource == OutputSource.USB) usbOutputDevice()?.id ?: -1 else -1
         val bluetoothOutputId = if (outputSource == OutputSource.BLUETOOTH) bluetoothOutputDevice()?.id ?: -1 else -1
         val warnings = mutableListOf<String>()
-        if (inputSource == InputSource.WIFI && !wifiFallbackActive && (networkRole != 2 || actualInput != -2)) warnings += "Wi-Fi 输入未生效，当前使用默认麦克风"
-        if (inputSource == InputSource.WIFI && wifiFallbackActive) warnings += "Wi-Fi 输入暂无数据，当前使用默认麦克风并等待恢复"
+        val wifiError = displayedWifiErrorNotice
+        if (!wifiError.isNullOrBlank()) warnings += wifiError
+        if (wifiError.isNullOrBlank() && inputSource == InputSource.WIFI && !wifiFallbackActive && (networkRole != 2 || actualInput != -2)) warnings += "Wi-Fi 输入未生效，当前使用默认麦克风"
+        if (wifiError.isNullOrBlank() && inputSource == InputSource.WIFI && wifiFallbackActive) warnings += "Wi-Fi 输入暂无数据，当前使用默认麦克风并等待恢复"
         if (inputSource == InputSource.USB && actualInput != -3 && (usbInputId < 0 || actualInput != usbInputId)) warnings += "USB 输入未生效，当前使用系统默认输入（实际设备 ID=$actualInput）"
         else if (inputSource == InputSource.USB && actualInputChannels < 2) warnings += "USB 输入已连接但当前仅为单声道（实际通道数=$actualInputChannels）"
         if (outputSource == OutputSource.USB && (usbOutputId < 0 || (actualOutput != -4 && actualOutput != usbOutputId))) warnings += "USB 输出未生效，当前使用系统默认输出"

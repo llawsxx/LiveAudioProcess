@@ -25,6 +25,9 @@ import androidx.compose.ui.unit.sp
 
 private val WifiTeal = Color(0xFF43D5C1)
 private val WifiMuted = Color(0xFF8EA0A8)
+internal val WifiAacBitrates = listOf(
+    64_000, 96_000, 128_000, 192_000, 256_000, 320_000, 512_000, 768_000, 1_000_000
+)
 
 @Composable
 fun WifiAudioPanel(
@@ -85,11 +88,11 @@ fun WifiAudioPanel(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    listOf(64_000, 96_000, 128_000, 192_000, 256_000, 320_000).forEach { bitrate ->
+                    WifiAacBitrates.forEach { bitrate ->
                         FilterChip(
                             selected = aacBitrate == bitrate,
                             onClick = { onAacBitrate(bitrate) },
-                            label = { Text("${bitrate / 1000} kbps") }
+                            label = { Text(if (bitrate == 1_000_000) "1 Mbps" else "${bitrate / 1000} kbps") }
                         )
                     }
                 }

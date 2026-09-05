@@ -142,8 +142,8 @@ class AudioProcessingService : Service() {
             val legacyPort = p.getString("wifiPort", "40100") ?: "40100"
             val host = if (wifiRole == 2) p.getString("wifiReceiveHost", legacyHost) ?: legacyHost else p.getString("wifiSendHost", legacyHost) ?: legacyHost
             val port = if (wifiRole == 2) p.getString("wifiReceivePort", legacyPort)?.toIntOrNull() ?: 40100 else p.getString("wifiSendPort", legacyPort)?.toIntOrNull() ?: 40100
-            val minBuffer = (p.getString("wifiMinBuffer", "50")?.toIntOrNull() ?: 50).coerceIn(0, 200)
-            val maxBuffer = (p.getString("wifiMaxBuffer", "100")?.toIntOrNull() ?: 100).coerceIn(50, 1000)
+            val minBuffer = (p.getString("wifiMinBuffer", "0")?.toIntOrNull() ?: 0).coerceIn(0, 200)
+            val maxBuffer = (p.getString("wifiMaxBuffer", "200")?.toIntOrNull() ?: 200).coerceIn(50, 1000)
             engine.configureNetwork(wifiRole, p.getInt("wifiTransport", 0).coerceIn(0, 1), p.getInt("wifiCodec", 0).coerceIn(0, 1), p.getInt("wifiAacBitrate", 128_000), host, port, minBuffer, maxBuffer)
         }
     }

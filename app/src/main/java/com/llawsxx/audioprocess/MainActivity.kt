@@ -148,11 +148,11 @@ private fun LiveAudioProcessApp() {
     var wifiSendPort by remember { mutableStateOf(prefs.getString("wifiSendPort", legacyWifiPort) ?: legacyWifiPort) }
     var wifiReceiveHost by remember { mutableStateOf(prefs.getString("wifiReceiveHost", if (input == InputSource.WIFI) legacyWifiHost else "0.0.0.0") ?: "0.0.0.0") }
     var wifiReceivePort by remember { mutableStateOf(prefs.getString("wifiReceivePort", legacyWifiPort) ?: legacyWifiPort) }
-    var wifiMinBuffer by remember { mutableStateOf(prefs.getString("wifiMinBuffer", "50") ?: "50") }; var wifiMaxBuffer by remember { mutableStateOf(prefs.getString("wifiMaxBuffer", "100") ?: "100") }; var wifiActive by remember { mutableStateOf(false) }
+    var wifiMinBuffer by remember { mutableStateOf(prefs.getString("wifiMinBuffer", "0") ?: "0") }; var wifiMaxBuffer by remember { mutableStateOf(prefs.getString("wifiMaxBuffer", "200") ?: "200") }; var wifiActive by remember { mutableStateOf(false) }
     var wifiInputTimeout by remember { mutableStateOf(prefs.getString("wifiInputTimeout", "1.0") ?: "1.0") }
     var wifiTransport by remember { mutableIntStateOf(prefs.getInt("wifiTransport", 0).coerceIn(0, 1)) }
     var wifiCodec by remember { mutableIntStateOf(prefs.getInt("wifiCodec", 0).coerceIn(0, 1)) }
-    var wifiAacBitrate by remember { mutableIntStateOf(prefs.getInt("wifiAacBitrate", 128_000).takeIf { it in listOf(64_000, 96_000, 128_000, 192_000, 256_000, 320_000) } ?: 128_000) }
+    var wifiAacBitrate by remember { mutableIntStateOf(prefs.getInt("wifiAacBitrate", 128_000).takeIf { it in WifiAacBitrates } ?: 128_000) }
     var usbMaxBuffer by remember { mutableStateOf(prefs.getInt("usbMaxBuffer", 50).toString()) }
     var usbInputBufferMaxMs by remember { mutableStateOf(prefs.getInt("usbInputBufferMaxMs", 20).coerceIn(5, 200).toString()) }
     var usbInputBitDepth by remember { mutableIntStateOf(prefs.getInt("usbInputBitDepth", prefs.getInt("usbBitDepth", 16)).takeIf { it == 16 || it == 24 || it == 32 } ?: 16) }
@@ -175,6 +175,7 @@ private fun LiveAudioProcessApp() {
         mutableStateOf(prefs.getInt("systemOutputBufferMaxMs", legacySystemOutputBufferMs).coerceIn(5, 200).toString())
     }
     var routeNotice by remember { mutableStateOf<String?>(null) }
+    var displayedEngineNotice by remember { mutableStateOf<String?>(null) }
     var elapsed by remember { mutableIntStateOf(0) }
     var hasPermission by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) }
     var pendingBluetoothOutput by remember { mutableStateOf<OutputSource?>(null) }
@@ -195,12 +196,16 @@ private fun LiveAudioProcessApp() {
         while (true) {
             running = engine.isRunning
             recording = engine.isRecording
-            /* Keep the last actionable route/error message visible. The
-             * engine may clear its transient route warning after a refresh,
-             * but a fallback or user-facing restriction must not flash away
-             * on the next 100 ms polling tick. */
             val engineNotice = engine.routeNotice ?: engine.lastError
-            if (!engineNotice.isNullOrBlank()) routeNotice = engineNotice
+            if (!engineNotice.isNullOrBlank()) {
+                routeNotice = engineNotice
+                displayedEngineNotice = engineNotice
+            } else if (displayedEngineNotice != null) {
+                // Clear an engine-owned message when its corresponding engine
+                // condition has recovered, without erasing a UI-owned notice.
+                if (routeNotice == displayedEngineNotice) routeNotice = null
+                displayedEngineNotice = null
+            }
             delay(100)
         }
     }
@@ -228,7 +233,7 @@ private fun LiveAudioProcessApp() {
         }
     }
     fun configureWifiForCurrentRoute(): Boolean = when {
-        input == InputSource.WIFI -> engine.configureNetwork(2, wifiTransport, wifiCodec, wifiAacBitrate, wifiReceiveHost, wifiReceivePort.toIntOrNull() ?: 40100, wifiMinBuffer.toIntOrNull()?.coerceIn(0, 200) ?: 50, wifiMaxBuffer.toIntOrNull()?.coerceIn(50, 1000) ?: 100)
+        input == InputSource.WIFI -> engine.configureNetwork(2, wifiTransport, wifiCodec, wifiAacBitrate, wifiReceiveHost, wifiReceivePort.toIntOrNull() ?: 40100, wifiMinBuffer.toIntOrNull()?.coerceIn(0, 200) ?: 0, wifiMaxBuffer.toIntOrNull()?.coerceIn(50, 1000) ?: 200)
         wifiOutputEnabled -> engine.configureNetwork(1, wifiTransport, wifiCodec, wifiAacBitrate, wifiSendHost, wifiSendPort.toIntOrNull() ?: 40100, 0, 50)
         else -> { engine.clearNetwork(); false }
     }
