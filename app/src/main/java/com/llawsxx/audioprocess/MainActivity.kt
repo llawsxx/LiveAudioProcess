@@ -193,6 +193,7 @@ private fun LiveAudioProcessApp() {
     var usbStats by remember { mutableStateOf(LongArray(18)) }
     var inputInfo by remember { mutableStateOf(LongArray(14)) }
     var outputInfo by remember { mutableStateOf(LongArray(16)) }
+    var wifiReceiveStats by remember { mutableStateOf(LongArray(5)) }
     var systemInputBufferMaxMs by remember { mutableStateOf(prefs.getInt("systemInputBufferMaxMs", 20).coerceIn(5, 200).toString()) }
     val legacySystemOutputBufferMs = if (prefs.contains("systemOutputBufferBursts")) {
         (prefs.getInt("systemOutputBufferBursts", 4) * 2).coerceIn(5, 200)
@@ -244,11 +245,13 @@ private fun LiveAudioProcessApp() {
         if (!running) {
             inputInfo = LongArray(14)
             outputInfo = LongArray(16)
+            wifiReceiveStats = LongArray(5)
         }
         while (running && NativeAudio.available) {
             val levels = NativeAudio.levels(); if (levels.size >= 4) { inputLevelL = levels[0]; inputLevelR = levels[1]; outputLevelL = levels[2]; outputLevelR = levels[3] }; if (levels.size >= 6) { limiterGain = levels[4]; limiterReleaseMs = levels[5] }; if (levels.size >= 10) { inputPeakL = levels[6]; inputPeakR = levels[7]; outputPeakL = levels[8]; outputPeakR = levels[9] }; if (showWaveforms) waveformData = NativeAudio.waveform()
             inputInfo = NativeAudio.inputInfo()
             outputInfo = NativeAudio.outputInfo()
+            wifiReceiveStats = if (input == InputSource.WIFI) NativeAudio.networkReceiveStats() else LongArray(5)
             delay(100)
         }
     }
@@ -414,7 +417,7 @@ private fun LiveAudioProcessApp() {
                 prefs.edit().putBoolean("screenAlwaysOn", enabled).apply()
             }
             VolumeControlPanel(outputVolumePercent, usesUsbHostVolume, output != OutputSource.NONE && (output != OutputSource.USB || running)) { value -> if (usesUsbHostVolume) usbOutputVolumePercent = value else { systemOutputVolumePercent = value; if (output != OutputSource.USB) engine.outputVolumePercent = value; engine.setOutputVolumePercent(value) } }
-            LevelPanel(inputLevelL, inputLevelR, outputLevelL, outputLevelR, inputPeakL, inputPeakR, outputPeakL, outputPeakR, limiterGain, limiterReleaseMs, running, running && effects.dspEnabled && effects.limiterEnabled, waveformData, showWaveforms) { showWaveforms = it; prefs.edit().putBoolean("showWaveforms", it).apply() }
+            LevelPanel(inputLevelL, inputLevelR, outputLevelL, outputLevelR, inputPeakL, inputPeakR, outputPeakL, outputPeakR, limiterGain, limiterReleaseMs, running, running && effects.dspEnabled && effects.limiterEnabled, running && input == InputSource.WIFI && wifiActive, wifiReceiveStats, waveformData, showWaveforms) { showWaveforms = it; prefs.edit().putBoolean("showWaveforms", it).apply() }
             RoutingPanel2(input, { selectInput(it) }, output, { selectOutput(it) }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
             if (input == InputSource.TEST_TONE) TonePanel(toneWaveform, toneMusic, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevelDb, { selected -> toneWaveform = selected; when (selected) { 4 -> { toneFrequency = 20f; toneFrequency2 = 20_000f }; 6 -> { toneFrequency = 19_000f; toneFrequency2 = 20_000f }; else -> Unit } }, { toneMusic = it }, { toneChannels = it }, { toneFrequency = it }, { toneFrequency2 = it }, { toneDurationSeconds = it }, { toneClickIntervalMs = it }, { toneLevelDb = it })
             EnginePanelWithIoRates(rate, { rate = it; syncEngine() }, outputRate, { outputRate = it; syncEngine() }, buffer, { buffer = it; syncEngine() }, running)
@@ -589,7 +592,69 @@ private fun LiveAudioProcessApp() {
 }
 @Composable private fun LevelPanel(inputL: Float, inputR: Float, outputL: Float, outputR: Float, inputPeakL: Float, inputPeakR: Float, outputPeakL: Float, outputPeakR: Float, limiterGain: Float, limiterReleaseMs: Float, active: Boolean, limiterActive: Boolean) { Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) { Column(Modifier.padding(16.dp)) { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("信号电平", color = Color.White, fontWeight = FontWeight.SemiBold); Text("峰值监视 · ${if (active) "实时" else "待机"}", color = Muted, fontSize = 12.sp) }; Spacer(Modifier.height(13.dp)); MeterRowPeak("INPUT L / DRY", inputL, inputPeakL, Teal); Spacer(Modifier.height(6.dp)); MeterRowPeak("INPUT R / DRY", inputR, inputPeakR, Teal); Spacer(Modifier.height(8.dp)); MeterRowPeak("OUTPUT L / WET", outputL, outputPeakL, Amber); Spacer(Modifier.height(6.dp)); MeterRowPeak("OUTPUT R / WET", outputR, outputPeakR, Amber); Spacer(Modifier.height(12.dp)); HorizontalDivider(color = Color(0xFF344248)); Spacer(Modifier.height(9.dp)); Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("LIMITER", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold); Text(if (limiterActive) "ACTIVE" else "BYPASS", color = if (limiterActive) Teal else Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold) }; Spacer(Modifier.height(5.dp)); Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("GAIN", color = Muted, fontSize = 10.sp); Text("%.6f".format(limiterGain), color = Color.White, fontSize = 11.sp); Text("RELEASE", color = Muted, fontSize = 10.sp); Text(limiterReleaseStatus(limiterReleaseMs), color = Color.White, fontSize = 11.sp) } } } }
 @Composable private fun MeterRowPeak(label: String, level: Float, peak: Float, tint: Color) { Row(verticalAlignment = Alignment.CenterVertically) { Text(label, color = Muted, fontSize = 10.sp, modifier = Modifier.width(86.dp)); Box(Modifier.weight(1f).height(12.dp)) { LinearProgressIndicator(progress = { level.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().height(7.dp).align(Alignment.Center).clip(RoundedCornerShape(4.dp)), color = tint, trackColor = Color(0xFF2C3B40)); Canvas(Modifier.fillMaxWidth().height(12.dp)) { val x = size.width * peak.coerceIn(0f, 1f); drawCircle(Color.White, 4.dp.toPx(), androidx.compose.ui.geometry.Offset(x, size.height / 2f)) } }; Column(Modifier.width(76.dp).padding(start = 8.dp)) { Text(dbText(level), color = Color.White, fontSize = 11.sp); Text("P ${dbText(peak)}", color = Amber, fontSize = 9.sp) } } }
-@Composable private fun LevelPanel(inputL: Float, inputR: Float, outputL: Float, outputR: Float, inputPeakL: Float, inputPeakR: Float, outputPeakL: Float, outputPeakR: Float, limiterGain: Float, limiterReleaseMs: Float, active: Boolean, limiterActive: Boolean, waveformData: FloatArray, showWaveforms: Boolean, onShowWaveforms: (Boolean) -> Unit) { Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) { Column(Modifier.padding(16.dp)) { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text("信号电平", color = Color.White, fontWeight = FontWeight.SemiBold); Row(verticalAlignment = Alignment.CenterVertically) { Text("波形", color = Muted, fontSize = 11.sp); Switch(checked = showWaveforms, onCheckedChange = onShowWaveforms) } }; Spacer(Modifier.height(13.dp)); MeterRowPeak("INPUT L / DRY", inputL, inputPeakL, Teal); Spacer(Modifier.height(6.dp)); MeterRowPeak("INPUT R / DRY", inputR, inputPeakR, Teal); Spacer(Modifier.height(8.dp)); MeterRowPeak("OUTPUT L / WET", outputL, outputPeakL, Amber); Spacer(Modifier.height(6.dp)); MeterRowPeak("OUTPUT R / WET", outputR, outputPeakR, Amber); if (showWaveforms) { Spacer(Modifier.height(10.dp)); WaveformView("DRY", waveformData, 0, Teal); Spacer(Modifier.height(6.dp)); WaveformView("WET", waveformData, 512, Amber) }; Spacer(Modifier.height(12.dp)); HorizontalDivider(color = Color(0xFF344248)); Spacer(Modifier.height(9.dp)); Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("LIMITER", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold); Text(if (limiterActive) "ACTIVE" else "BYPASS", color = if (limiterActive) Teal else Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold) }; Spacer(Modifier.height(5.dp)); Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("GAIN", color = Muted, fontSize = 10.sp); Text("%.6f".format(limiterGain), color = Color.White, fontSize = 11.sp); Text("RELEASE", color = Muted, fontSize = 10.sp); Text(limiterReleaseStatus(limiterReleaseMs), color = Color.White, fontSize = 11.sp) } } } }
+@Composable private fun LevelPanel(
+    inputL: Float, inputR: Float, outputL: Float, outputR: Float,
+    inputPeakL: Float, inputPeakR: Float, outputPeakL: Float, outputPeakR: Float,
+    limiterGain: Float, limiterReleaseMs: Float, active: Boolean, limiterActive: Boolean,
+    wifiReceiveActive: Boolean, wifiStats: LongArray,
+    waveformData: FloatArray, showWaveforms: Boolean, onShowWaveforms: (Boolean) -> Unit
+) {
+    Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("信号电平", color = Color.White, fontWeight = FontWeight.SemiBold)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("波形", color = Muted, fontSize = 11.sp)
+                    Switch(checked = showWaveforms, onCheckedChange = onShowWaveforms)
+                }
+            }
+            Spacer(Modifier.height(13.dp))
+            MeterRowPeak("INPUT L / DRY", inputL, inputPeakL, Teal)
+            Spacer(Modifier.height(6.dp)); MeterRowPeak("INPUT R / DRY", inputR, inputPeakR, Teal)
+            Spacer(Modifier.height(8.dp)); MeterRowPeak("OUTPUT L / WET", outputL, outputPeakL, Amber)
+            Spacer(Modifier.height(6.dp)); MeterRowPeak("OUTPUT R / WET", outputR, outputPeakR, Amber)
+            if (showWaveforms) {
+                Spacer(Modifier.height(10.dp)); WaveformView("DRY", waveformData, 0, Teal)
+                Spacer(Modifier.height(6.dp)); WaveformView("WET", waveformData, 512, Amber)
+            }
+            Spacer(Modifier.height(12.dp)); HorizontalDivider(color = Color(0xFF344248)); Spacer(Modifier.height(9.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("LIMITER", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                Text(if (limiterActive) "ACTIVE" else "BYPASS", color = if (limiterActive) Teal else Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+            }
+            Spacer(Modifier.height(5.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("GAIN", color = Muted, fontSize = 10.sp); Text("%.6f".format(limiterGain), color = Color.White, fontSize = 11.sp)
+                Text("RELEASE", color = Muted, fontSize = 10.sp); Text(limiterReleaseStatus(limiterReleaseMs), color = Color.White, fontSize = 11.sp)
+            }
+            if (wifiReceiveActive) {
+                Spacer(Modifier.height(10.dp)); HorizontalDivider(color = Color(0xFF344248)); Spacer(Modifier.height(9.dp))
+                WifiReceiveMonitor(wifiStats)
+            }
+        }
+    }
+}
+
+@Composable private fun WifiReceiveMonitor(stats: LongArray) {
+    val currentMs = stats.getOrElse(0) { 0L }
+    val minEvents = stats.getOrElse(1) { 0L }
+    val maxEvents = stats.getOrElse(2) { 0L }
+    val minMs = stats.getOrElse(3) { 0L }
+    val maxMs = stats.getOrElse(4) { 0L }
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text("WI-FI AUDIO RX", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        Text("RECEIVING", color = Teal, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+    }
+    Spacer(Modifier.height(5.dp))
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text("BUFFER", color = Muted, fontSize = 10.sp)
+        Text("$currentMs ms", color = Color.White, fontSize = 11.sp)
+        Text("MIN $minMs ms", color = Muted, fontSize = 10.sp)
+        Text("$minEvents 次", color = Color.White, fontSize = 11.sp)
+        Text("MAX $maxMs ms", color = Muted, fontSize = 10.sp)
+        Text("$maxEvents 次", color = Color.White, fontSize = 11.sp)
+    }
+}
 @Composable private fun WaveformView(label: String, data: FloatArray, offset: Int, tint: Color) { Row(verticalAlignment = Alignment.CenterVertically) { Text(label, color = Muted, fontSize = 9.sp, modifier = Modifier.width(86.dp)); Canvas(Modifier.weight(1f).height(48.dp).clip(RoundedCornerShape(5.dp))) { drawRect(Color(0xFF1B2529)); val n = minOf(512, data.size - offset); if (n > 1) { val path = androidx.compose.ui.graphics.Path(); for (i in 0 until n) { val x = size.width * i / (n - 1).toFloat(); val y = size.height * (0.5f - data[offset + i].coerceIn(-1f, 1f) * 0.45f); if (i == 0) path.moveTo(x, y) else path.lineTo(x, y) }; drawPath(path, tint, style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.5.dp.toPx())) } } } }
 private fun dbText(level: Float): String = "%.1f dB".format(if (level <= 0.000001f) -60f else (20f * kotlin.math.log10(level.coerceIn(0.000001f, 1f))).coerceAtLeast(-60f))
 private fun limiterReleaseStatus(valueMs: Float): String = if (valueMs >= 1000f) "%.2f s".format(valueMs / 1000f) else "%.1f ms".format(valueMs)
