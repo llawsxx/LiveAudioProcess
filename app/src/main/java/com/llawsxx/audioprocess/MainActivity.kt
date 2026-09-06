@@ -167,6 +167,11 @@ private fun LiveAudioProcessApp() {
     var toneClickIntervalMs by remember { mutableFloatStateOf(prefs.getFloat("toneClickIntervalMs", 1000f).coerceIn(50f, 5000f)) }
     var toneLevelDb by remember { mutableIntStateOf(prefs.getInt("toneLevelDb", -12).coerceIn(-60, 0)) }
     var effects by remember { mutableStateOf(EffectSettings.load(prefs)) }
+    // Keep the processing chain on its own page while preserving the
+    // selection across activity recreation.
+    var currentPage by remember { mutableIntStateOf(prefs.getInt("mainPage", 0).coerceIn(0, 1)) }
+    val consoleScrollState = rememberScrollState()
+    val processingScrollState = rememberScrollState()
     var limiterGain by remember { mutableFloatStateOf(1f) }
     var limiterReleaseMs by remember { mutableFloatStateOf(effects.limiterRelease) }
     val legacyWifiHost = prefs.getString("wifiHost", "192.168.1.2") ?: "192.168.1.2"
@@ -411,9 +416,37 @@ private fun LiveAudioProcessApp() {
         }
     }
     Scaffold(containerColor = Ink, topBar = { TopAppBar(title = { Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.GraphicEq, null, tint = Teal, modifier = Modifier.size(25.dp)); Spacer(Modifier.width(9.dp)); Text("LiveAudioProcess", fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp) } }, actions = { StatusDot(running) }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Ink, titleContentColor = Color.White)) }) { pad ->
-        Column(Modifier.fillMaxSize().padding(pad).padding(horizontal = 16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Column(
+            Modifier.fillMaxSize().padding(pad).padding(horizontal = 16.dp)
+                .verticalScroll(if (currentPage == 0) consoleScrollState else processingScrollState),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
             Spacer(Modifier.height(2.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) { Column { Text("LOW-LATENCY DSP CONSOLE", color = Muted, fontSize = 11.sp, letterSpacing = 1.2.sp) }; Text(if (running) "RUNNING" else "STANDBY", color = if (running) Teal else Muted, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+            TabRow(
+                selectedTabIndex = currentPage,
+                containerColor = Panel,
+                contentColor = Teal,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Tab(
+                    selected = currentPage == 0,
+                    onClick = {
+                        currentPage = 0
+                        prefs.edit().putInt("mainPage", 0).apply()
+                    },
+                    text = { Text("控制台") }
+                )
+                Tab(
+                    selected = currentPage == 1,
+                    onClick = {
+                        currentPage = 1
+                        prefs.edit().putInt("mainPage", 1).apply()
+                    },
+                    text = { Text("处理链") }
+                )
+            }
+            if (currentPage == 0) {
             ScreenAlwaysOnOption(screenAlwaysOn) { enabled ->
                 screenAlwaysOn = enabled
                 prefs.edit().putBoolean("screenAlwaysOn", enabled).apply()
@@ -429,9 +462,6 @@ private fun LiveAudioProcessApp() {
                 UsbAudioPanel(usbMaxBuffer, usbInputBufferMaxMs, usbInputBitDepth, usbOutputBitDepth, usbInputBurstPackets, usbOutputBurstPackets, input == InputSource.USB, output == OutputSource.USB, running, usbStats, { usbMaxBuffer = it }, { usbInputBufferMaxMs = it }, { usbInputBitDepth = it }, { usbOutputBitDepth = it }, { usbInputBurstPackets = it }, { usbOutputBurstPackets = it })
             }
             Float32Badge()
-            ProcessingControlPanel(effects) { effects = it }
-            UnifiedEffectsPanel(effects) { effects = it }
-            EqBandsPanel(effects) { effects = it }
             WifiAudioPanel(wifiSendHost, wifiSendPort, wifiTransport, wifiCodec, wifiAacBitrate, wifiOutputEnabled && wifiActive, { wifiSendHost = it }, { wifiSendPort = it }, { wifiTransport = it; prefs.edit().putInt("wifiTransport", it).apply() }, { wifiCodec = it }, { wifiAacBitrate = it }, wifiReceiveHost, wifiReceivePort, wifiMinBuffer, wifiMaxBuffer, wifiMaxHold, wifiInputTimeout, input == InputSource.WIFI && wifiActive, { wifiReceiveHost = it }, { wifiReceivePort = it }, { wifiMinBuffer = it }, { wifiMaxBuffer = it }, { wifiMaxHold = it }, { wifiInputTimeout = it })
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                 Button(onClick = {
@@ -457,6 +487,14 @@ private fun LiveAudioProcessApp() {
             }
             RecordingBar(recording, elapsed)
             Spacer(Modifier.height(12.dp))
+            } else {
+                SectionTitle("处理链", "DSP CHAIN")
+                Text("在此页面启用或调整 EQ、混响、响度与限制器。修改会实时同步到音频引擎。", color = Muted, fontSize = 12.sp)
+                ProcessingControlPanel(effects) { effects = it }
+                UnifiedEffectsPanel(effects) { effects = it }
+                EqBandsPanel(effects) { effects = it }
+                Spacer(Modifier.height(12.dp))
+            }
         }
     }
 }
