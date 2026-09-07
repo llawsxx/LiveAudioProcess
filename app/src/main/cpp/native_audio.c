@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -25,8 +26,39 @@
 #include "wifi_aac_bridge.h"
 
 #define TAG "AudioProcessNative"
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define NET_LOG_LINES 1000
+#define NET_LOG_LINE_BYTES 256
+static uint64_t now_ns(void);
+static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
+static char g_log_lines[NET_LOG_LINES][NET_LOG_LINE_BYTES];
+static int g_log_write, g_log_count;
+static void app_log_print(android_LogPriority priority, const char *fmt, ...) {
+    va_list args, copy;
+    va_start(args, fmt);
+    va_copy(copy, args);
+    __android_log_vprint(priority, TAG, fmt, args);
+    pthread_mutex_lock(&g_log_lock);
+    struct timespec wall_time;
+    struct tm local_time;
+    clock_gettime(CLOCK_REALTIME,&wall_time);
+    localtime_r(&wall_time.tv_sec,&local_time);
+    int prefix=snprintf(g_log_lines[g_log_write],NET_LOG_LINE_BYTES,
+                        "%04d-%02d-%02d %02d:%02d:%02d.%03ld %c | ",
+                        local_time.tm_year+1900,local_time.tm_mon+1,local_time.tm_mday,
+                        local_time.tm_hour,local_time.tm_min,local_time.tm_sec,
+                        wall_time.tv_nsec/1000000L,
+                        priority==ANDROID_LOG_ERROR?'E':'I');
+    if(prefix<0)prefix=0;
+    if(prefix>=NET_LOG_LINE_BYTES)prefix=NET_LOG_LINE_BYTES-1;
+    vsnprintf(g_log_lines[g_log_write]+prefix,NET_LOG_LINE_BYTES-(size_t)prefix,fmt,copy);
+    g_log_write=(g_log_write+1)%NET_LOG_LINES;
+    if(g_log_count<NET_LOG_LINES)g_log_count++;
+    pthread_mutex_unlock(&g_log_lock);
+    va_end(copy);
+    va_end(args);
+}
+#define LOGE(...) app_log_print(ANDROID_LOG_ERROR, __VA_ARGS__)
+#define LOGI(...) app_log_print(ANDROID_LOG_INFO, __VA_ARGS__)
 #define MAX_FRAMES 2048
 #define NET_PACKET_FRAMES 128
 #define NET_PCM_MAX_PACKET_FRAMES 9600
@@ -2351,6 +2383,33 @@ JNIEXPORT jlongArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkRe
     jlongArray result=(*e)->NewLongArray(e,5);
     if(result)(*e)->SetLongArrayRegion(e,result,0,5,values);
     return result;
+}
+JNIEXPORT jobjectArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_logs(JNIEnv*e,jobject o){
+    (void)o;
+    jclass string_class=(*e)->FindClass(e,"java/lang/String");
+    if(!string_class)return NULL;
+    char snapshot[NET_LOG_LINES][NET_LOG_LINE_BYTES];
+    pthread_mutex_lock(&g_log_lock);
+    int count=g_log_count;
+    int write=g_log_write;
+    for(int i=0;i<count;i++) {
+        int index=(write-g_log_count+i+NET_LOG_LINES)%NET_LOG_LINES;
+        memcpy(snapshot[i],g_log_lines[index],NET_LOG_LINE_BYTES);
+    }
+    pthread_mutex_unlock(&g_log_lock);
+    jobjectArray result=(*e)->NewObjectArray(e,count,string_class,NULL);
+    for(int i=0;i<count&&result;i++) {
+        jstring line=(*e)->NewStringUTF(e,snapshot[i]);
+        (*e)->SetObjectArrayElement(e,result,i,line);
+        (*e)->DeleteLocalRef(e,line);
+    }
+    return result;
+}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearLogs(JNIEnv*e,jobject o){
+    (void)e;(void)o;
+    pthread_mutex_lock(&g_log_lock);
+    g_log_write=0;g_log_count=0;
+    pthread_mutex_unlock(&g_log_lock);
 }
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureUsbOutputBuffer(JNIEnv*e,jobject o,jint maxMs){(void)e;(void)o;g.usb_buffer_max_ms=maxMs<5?5:(maxMs>200?200:maxMs);usb_host_audio_configure_output_buffer(g.usb_audio,g.usb_buffer_max_ms);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureOutputBufferMaxMs(JNIEnv*e,jobject o,jint maxMs){(void)e;(void)o;int normalized=maxMs<5?5:(maxMs>200?200:maxMs);atomic_store(&g.output_buffer_max_ms,normalized);output_ring_update_limits(g.rate,g.frames);}

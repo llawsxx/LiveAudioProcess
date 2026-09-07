@@ -29,6 +29,8 @@ object NativeAudio {
     external fun networkOutputTimedOut(timeoutMs: Int): Boolean
     external fun networkOutputConnected(): Boolean
     external fun networkOutputConnectAttempts(): Int
+    external fun logs(): Array<String>
+    external fun clearLogs()
     external fun routeInfo(): IntArray
     external fun usbHostFailed(): Boolean
     external fun inputInfo(): LongArray
