@@ -1768,6 +1768,12 @@ static int network_receive(float *data, int frames) {
     if ((g.net_sock < 0 && !(g.net_transport==NET_TRANSPORT_TCP && g.net_listen_sock>=0)) ||
         atomic_load(&g.net_role) != 2 || !g.net_jitter) {
         atomic_store(&g.net_buffer_ms,0);
+        /* A lost UDP socket or a disconnected receiver must require a fresh
+         * startup prefill when packets become available again. */
+        if (atomic_load(&g.net_role) == 2) {
+            g.net_started = 0;
+            g.net_buffer_monitor_started = 0;
+        }
         network_plc_conceal(data,frames);
         return frames;
     }
