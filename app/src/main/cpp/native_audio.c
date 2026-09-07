@@ -42,6 +42,10 @@
 #define NET_TRANSPORT_UDP 0
 #define NET_TRANSPORT_TCP 1
 #define NET_TCP_BUFFER_BYTES 262144
+#define NET_TCP_RECEIVE_BUFFER_BYTES (1024 * 1024)
+#define NET_TCP_SEND_BUFFER_BYTES (512 * 1024)
+#define NET_UDP_RECEIVE_BUFFER_BYTES (1024 * 1024)
+#define NET_UDP_SEND_BUFFER_BYTES (512 * 1024)
 #define NET_PLC_HISTORY_FRAMES 4096
 #define EQ_BANDS 4
 #define MAX_INPUT_CHANNELS 8
@@ -1030,6 +1034,39 @@ static void network_set_error(int code, int detail0, int detail1) {
     atomic_store(&g.net_error_detail1, detail1);
     atomic_store(&g.net_error, code);
 }
+
+static void network_configure_udp_buffer(int fd, int role) {
+    if(fd<0)return;
+    int option=role==2?SO_RCVBUF:SO_SNDBUF;
+    int requested=role==2?NET_UDP_RECEIVE_BUFFER_BYTES:NET_UDP_SEND_BUFFER_BYTES;
+    if(setsockopt(fd,SOL_SOCKET,option,&requested,sizeof(requested))<0) {
+        LOGI("Wi-Fi UDP %s buffer request failed: bytes=%d errno=%d",
+             role==2?"receive":"send",requested,errno);
+    }
+    int actual=0;
+    socklen_t actual_size=sizeof(actual);
+    if(getsockopt(fd,SOL_SOCKET,option,&actual,&actual_size)==0) {
+        LOGI("Wi-Fi UDP %s buffer: requested=%d actual=%d",
+             role==2?"receive":"send",requested,actual);
+    }
+}
+
+static void network_configure_tcp_buffer(int fd, int role) {
+    if(fd<0)return;
+    int option=role==2?SO_RCVBUF:SO_SNDBUF;
+    int requested=role==2?NET_TCP_RECEIVE_BUFFER_BYTES:NET_TCP_SEND_BUFFER_BYTES;
+    if(setsockopt(fd,SOL_SOCKET,option,&requested,sizeof(requested))<0) {
+        LOGI("Wi-Fi TCP %s buffer request failed: bytes=%d errno=%d",
+             role==2?"receive":"send",requested,errno);
+    }
+    int actual=0;
+    socklen_t actual_size=sizeof(actual);
+    if(getsockopt(fd,SOL_SOCKET,option,&actual,&actual_size)==0) {
+        LOGI("Wi-Fi TCP %s buffer: requested=%d actual=%d",
+             role==2?"receive":"send",requested,actual);
+    }
+}
+
 static void network_tcp_open_sender(void) {
     if(g.net_transport!=NET_TRANSPORT_TCP||atomic_load(&g.net_role)!=1||g.net_sock>=0)return;
     uint64_t now=now_ns();
@@ -1037,6 +1074,7 @@ static void network_tcp_open_sender(void) {
     atomic_fetch_add(&g.net_tcp_connect_attempts,1);
     g.net_sock=socket(AF_INET,SOCK_STREAM,0);
     if(g.net_sock<0){int error=errno;network_set_error(NET_ERROR_SOCKET,error,0);LOGI("Wi-Fi TCP sender socket failed errno=%d",error);g.net_tcp_next_connect_ns=now+1000000000ull;return;}
+    network_configure_tcp_buffer(g.net_sock,1);
     fcntl(g.net_sock,F_SETFL,O_NONBLOCK);
     int rc=connect(g.net_sock,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr));
     if(rc==0) {
@@ -1655,7 +1693,7 @@ static void network_fill(void) {
     if(g.net_transport==NET_TRANSPORT_TCP) {
         if(g.net_sock<0 && g.net_listen_sock>=0) {
             int accepted=accept(g.net_listen_sock,NULL,NULL);
-            if(accepted>=0) { fcntl(accepted,F_SETFL,O_NONBLOCK); g.net_sock=accepted; g.net_rx_used=0; network_set_error(NET_ERROR_TCP_WAITING_DATA,0,0); LOGI("Wi-Fi TCP client connected"); }
+            if(accepted>=0) { network_configure_tcp_buffer(accepted,2); fcntl(accepted,F_SETFL,O_NONBLOCK); g.net_sock=accepted; g.net_rx_used=0; network_set_error(NET_ERROR_TCP_WAITING_DATA,0,0); LOGI("Wi-Fi TCP client connected"); }
         }
         if(g.net_sock>=0) {
             for(;;) {
@@ -2238,10 +2276,11 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
     if(transport==NET_TRANSPORT_TCP) {
         if(role==2) {
             g.net_listen_sock=socket(AF_INET,SOCK_STREAM,0);
-            if(g.net_listen_sock>=0) { int yes=1; setsockopt(g.net_listen_sock,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes)); fcntl(g.net_listen_sock,F_SETFL,O_NONBLOCK); }
+            if(g.net_listen_sock>=0) { int yes=1; setsockopt(g.net_listen_sock,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes)); network_configure_tcp_buffer(g.net_listen_sock,2); fcntl(g.net_listen_sock,F_SETFL,O_NONBLOCK); }
         } else {
             g.net_sock=socket(AF_INET,SOCK_STREAM,0);
             if(g.net_sock>=0) {
+                network_configure_tcp_buffer(g.net_sock,1);
                 atomic_fetch_add(&g.net_tcp_connect_attempts,1);
                 struct sockaddr_in target={0};target.sin_family=AF_INET;target.sin_port=htons((uint16_t)port);target.sin_addr=requested_addr;
                 fcntl(g.net_sock,F_SETFL,O_NONBLOCK);
@@ -2253,7 +2292,10 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
         }
     } else {
         g.net_sock=socket(AF_INET,SOCK_DGRAM,0);
-        if(g.net_sock>=0) fcntl(g.net_sock,F_SETFL,O_NONBLOCK);
+        if(g.net_sock>=0) {
+            network_configure_udp_buffer(g.net_sock,role);
+            fcntl(g.net_sock,F_SETFL,O_NONBLOCK);
+        }
     }
     if((role==1&&g.net_sock<0)||(role==2&&transport==NET_TRANSPORT_TCP&&g.net_listen_sock<0)||(role==2&&transport==NET_TRANSPORT_UDP&&g.net_sock<0)){
         if(atomic_load(&g.net_error)==NET_ERROR_NONE)network_set_error(NET_ERROR_SOCKET,errno,0);
