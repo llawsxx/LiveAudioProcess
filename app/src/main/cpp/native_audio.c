@@ -136,7 +136,9 @@ typedef struct {
 typedef struct {
     AAudioStream *input, *output;
     pthread_t thread;
+    pthread_t net_rx_thread;
     atomic_int running, recording, flags;
+    atomic_int net_rx_worker_running, net_rx_worker_started;
     _Atomic(float) levels[6];
     _Atomic(float) peak_levels[4];
     uint64_t peak_hold_until_ns[4];
@@ -192,6 +194,7 @@ typedef struct {
     int net_tcp_connecting;
     wifi_aac_t net_aac;
     pthread_mutex_t net_codec_lock;
+    pthread_mutex_t net_rx_lock;
     atomic_int net_role, use_network_input, net_packet_seen;
     atomic_int net_error, net_error_detail0, net_error_detail1;
     atomic_int net_rx_disconnect_requested, net_rx_timeout_reported, net_tx_disconnect_requested;
@@ -260,6 +263,7 @@ static Engine g = {
     .record_cv_mutex = PTHREAD_MUTEX_INITIALIZER,
     .record_cv = PTHREAD_COND_INITIALIZER,
     .net_codec_lock = PTHREAD_MUTEX_INITIALIZER,
+    .net_rx_lock = PTHREAD_MUTEX_INITIALIZER,
     .reverb_lock = PTHREAD_MUTEX_INITIALIZER,
     .waveform_lock = PTHREAD_MUTEX_INITIALIZER,
     .tone_noise_state = 0x13579BDFu
@@ -1272,7 +1276,9 @@ static void network_send(const float *data, int frames) {
     }
 }
 
-static void network_clear_jitter_state(void) {
+/* Jitter state is produced by the Wi-Fi receive worker and consumed by the
+ * audio/DSP thread. Call the _unlocked variant only while net_rx_lock is held. */
+static void network_clear_jitter_state_unlocked(void) {
     if(g.net_jitter) memset(g.net_jitter,0,NET_JITTER_SLOTS*sizeof(*g.net_jitter));
     if(g.net_aac_jitter) memset(g.net_aac_jitter,0,NET_AAC_JITTER_SLOTS*sizeof(*g.net_aac_jitter));
     g.net_packet_count=0;
@@ -1293,8 +1299,14 @@ static void network_clear_jitter_state(void) {
     atomic_store(&g.net_buffer_ms,0);
 }
 
+static void network_clear_jitter_state(void) {
+    pthread_mutex_lock(&g.net_rx_lock);
+    network_clear_jitter_state_unlocked();
+    pthread_mutex_unlock(&g.net_rx_lock);
+}
+
 static void network_restart_jitter(uint32_t sequence) {
-    network_clear_jitter_state();
+    network_clear_jitter_state_unlocked();
     g.net_seq_initialized=1;
     g.net_play_seq=sequence;
     g.net_high_seq=sequence;
@@ -1424,7 +1436,7 @@ static void network_store_aac_packet(const NetHeader *h, const uint8_t *data, ui
              * than dropping every packet as late. */
             LOGI("Wi-Fi AAC sequence restart: sequence=%u expected=%u",
                  h->sequence, g.net_aac_play_seq);
-            network_clear_jitter_state();
+            network_clear_jitter_state_unlocked();
             g.net_aac_seq_initialized=1;
             g.net_aac_play_seq=h->sequence;
             g.net_aac_high_seq=end_sequence;
@@ -1553,7 +1565,11 @@ static void network_process_packet(const uint8_t *packet, size_t n) {
 }
 
 static void network_fill(void) {
-    if (atomic_load(&g.net_role) != 2 || !g.net_jitter) return;
+    pthread_mutex_lock(&g.net_rx_lock);
+    if (atomic_load(&g.net_role) != 2 || !g.net_jitter) {
+        pthread_mutex_unlock(&g.net_rx_lock);
+        return;
+    }
     if (atomic_exchange(&g.net_rx_disconnect_requested,0)) {
         if(g.net_sock>=0){shutdown(g.net_sock,SHUT_RDWR);close(g.net_sock);}
         g.net_sock=-1; g.net_rx_used=0;
@@ -1586,9 +1602,10 @@ static void network_fill(void) {
             if(consumed){memmove(g.net_rx_buffer,g.net_rx_buffer+consumed,g.net_rx_used-consumed);g.net_rx_used-=consumed;}
         }
         if(g.net_codec==1)network_decode_aac_packets();
+        pthread_mutex_unlock(&g.net_rx_lock);
         return;
     }
-    if (g.net_sock < 0) return;
+    if (g.net_sock < 0) { pthread_mutex_unlock(&g.net_rx_lock); return; }
     uint8_t packet[sizeof(NetHeader)+NET_PCM_MAX_PACKET_FRAMES*2*sizeof(float)];
     for (;;) {
         ssize_t n=recvfrom(g.net_sock,packet,sizeof(packet),MSG_DONTWAIT,NULL,NULL);
@@ -1597,13 +1614,26 @@ static void network_fill(void) {
         network_process_packet(packet,(size_t)n);
     }
     if(g.net_codec==1)network_decode_aac_packets();
+    pthread_mutex_unlock(&g.net_rx_lock);
+}
+
+static void *network_receive_thread(void *unused) {
+    (void)unused;
+    while (atomic_load(&g.net_rx_worker_running)) {
+        if (atomic_load(&g.running)) network_fill();
+        /* Keep polling independent of the audio callback cadence while
+         * yielding enough CPU for the DSP and platform threads. */
+        usleep(1000);
+    }
+    return NULL;
 }
 
 static int network_receive(float *data, int frames) {
-    network_fill();
+    pthread_mutex_lock(&g.net_rx_lock);
     if ((g.net_sock < 0 && !(g.net_transport==NET_TRANSPORT_TCP && g.net_listen_sock>=0)) ||
         atomic_load(&g.net_role) != 2 || !g.net_jitter) {
         atomic_store(&g.net_buffer_ms,0);
+        pthread_mutex_unlock(&g.net_rx_lock);
         return 0;
     }
     int min_frames=(g.rate*g.net_min_ms)/1000;
@@ -1618,6 +1648,7 @@ static int network_receive(float *data, int frames) {
         } else {
             network_update_buffer_monitor(0);
             memset(data,0,(size_t)frames*2*sizeof(float));
+            pthread_mutex_unlock(&g.net_rx_lock);
             return frames;
         }
     }
@@ -1636,6 +1667,7 @@ static int network_receive(float *data, int frames) {
         g.net_started=0;
         network_update_buffer_monitor(1);
         memset(data,0,(size_t)frames*2*sizeof(float));
+        pthread_mutex_unlock(&g.net_rx_lock);
         return frames;
     }
 
@@ -1677,6 +1709,7 @@ static int network_receive(float *data, int frames) {
     }
     if(network_valid_frames()==0)g.net_started=0;
     network_update_buffer_monitor(1);
+    pthread_mutex_unlock(&g.net_rx_lock);
     return frames;
 }
 
@@ -1693,7 +1726,7 @@ static void *audio_thread(void *unused) {
         int using_tone=atomic_load(&g.tone_enabled);
         if(using_network){ got=network_receive(output,want); if(got<=0){ memset(output,0,(size_t)want*2*sizeof(float)); got=want; } memcpy(dry,output,(size_t)got*2*sizeof(float)); }
         else if(g.usb_input_host && g.usb_audio){got=usb_host_audio_read(g.usb_audio,input,want);}
-        else if(g.input){if(atomic_load(&g.net_role)==2)network_fill();got=input_ring_read(input,(uint32_t)want);}
+        else if(g.input){got=input_ring_read(input,(uint32_t)want);}
         else if(using_tone){ got=want; }
         else { memset(input,0,(size_t)want*MAX_INPUT_CHANNELS*sizeof(float)); got=want; }
         if(got<=0){usleep(1000);continue;}
@@ -1937,6 +1970,15 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
     g.limiter_next_delta=calloc((size_t)g.look_size,sizeof(*g.limiter_next_delta));
     if (!g.reverb || !g.lookahead || !g.limiter_next_pos || !g.limiter_next_delta || !g.net_jitter || !g.net_aac_jitter) { LOGE("DSP or network buffer allocation failed"); goto fail; }
     atomic_store(&g.running,1);
+    atomic_store(&g.net_rx_worker_running,1);
+    atomic_store(&g.net_rx_worker_started,0);
+    if (pthread_create(&g.net_rx_thread,NULL,network_receive_thread,NULL) == 0) {
+        atomic_store(&g.net_rx_worker_started,1);
+    } else {
+        atomic_store(&g.net_rx_worker_running,0);
+        LOGE("Wi-Fi receive worker creation failed");
+        goto fail;
+    }
     if (pthread_create(&g.thread,NULL,audio_thread,NULL) != 0) {
         LOGE("audio thread creation failed");
         atomic_store(&g.running,0);
@@ -1959,6 +2001,8 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
     return JNI_TRUE;
 fail:
     atomic_store(&g.running,0);
+    atomic_store(&g.net_rx_worker_running,0);
+    if (atomic_exchange(&g.net_rx_worker_started,0)) pthread_join(g.net_rx_thread,NULL);
     atomic_store(&g.tone_enabled,0);
     usb_host_audio_request_stop(g.usb_audio);
     if (input_started && g.input) AAudioStream_requestStop(g.input);
@@ -1992,8 +2036,10 @@ static void native_stop_internal(int finalize_recording, int preserve_network) {
         if (finalize_recording) stop_recording_internal();
         return;
     }
+    atomic_store(&g.net_rx_worker_running,0);
     if(g.input)AAudioStream_requestStop(g.input);
     pthread_join(g.thread,NULL);
+    if (atomic_exchange(&g.net_rx_worker_started,0)) pthread_join(g.net_rx_thread,NULL);
     atomic_store(&g.reverb_worker_running,0);
     if(atomic_exchange(&g.reverb_worker_started,0))pthread_join(g.reverb_thread,NULL);
     pthread_mutex_lock(&g.stream_lock);
@@ -2087,6 +2133,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
         network_set_error(NET_ERROR_INVALID_HOST,0,0);
         return JNI_FALSE;
     }
+    pthread_mutex_lock(&g.net_rx_lock);
     int current_role=atomic_load(&g.net_role);
     int socket_ready=g.net_sock>=0 || (g.net_transport==NET_TRANSPORT_TCP&&g.net_listen_sock>=0);
     int same_transport=current_role==role && socket_ready && g.net_transport==transport &&
@@ -2119,12 +2166,14 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
             g.net_bitrate=normalized_bitrate;
             pthread_mutex_unlock(&g.net_codec_lock);
             wifi_aac_destroy(previous);
+            pthread_mutex_unlock(&g.net_rx_lock);
             (*e)->ReleaseStringUTFChars(e,host,h);
             network_set_error(NET_ERROR_NONE,0,0);
             LOGI("Wi-Fi AAC bitrate updated in place: bitrate=%d", normalized_bitrate);
             return JNI_TRUE;
         }
         wifi_aac_destroy(next_aac);
+        pthread_mutex_unlock(&g.net_rx_lock);
         (*e)->ReleaseStringUTFChars(e,host,h);
         return JNI_TRUE;
     }
@@ -2167,13 +2216,13 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
     if((role==1&&g.net_sock<0)||(role==2&&transport==NET_TRANSPORT_TCP&&g.net_listen_sock<0)||(role==2&&transport==NET_TRANSPORT_UDP&&g.net_sock<0)){
         if(atomic_load(&g.net_error)==NET_ERROR_NONE)network_set_error(NET_ERROR_SOCKET,errno,0);
         LOGE("Wi-Fi socket creation failed role=%d transport=%d errno=%d",role,transport,errno);
-        atomic_store(&g.net_role,0);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;
+        atomic_store(&g.net_role,0);pthread_mutex_unlock(&g.net_rx_lock);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;
     }
     memset(&g.net_addr,0,sizeof(g.net_addr));g.net_addr.sin_family=AF_INET;g.net_addr.sin_port=htons((uint16_t)port);g.net_addr.sin_addr=requested_addr;
     atomic_store(&g.net_last_packet_ns,now_ns());atomic_store(&g.net_packet_seen,0);
     g.net_min_ms=normalized_min;g.net_max_ms=normalized_max;
     g.net_max_hold_ms=normalized_max_hold;
-    g.net_send_count=0;g.net_aac_send_used=0;g.net_aac_send_frames=0;g.net_seq=0;g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);g.net_missing_packets=g.net_late_packets=g.net_duplicate_packets=0;network_clear_jitter_state();
+    g.net_send_count=0;g.net_aac_send_used=0;g.net_aac_send_frames=0;g.net_seq=0;g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);g.net_missing_packets=g.net_late_packets=g.net_duplicate_packets=0;network_clear_jitter_state_unlocked();
     atomic_store(&g.net_min_buffer_events,0);
     atomic_store(&g.net_max_buffer_events,0);
     if(role==2) {
@@ -2182,20 +2231,26 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
             int error=errno;
             network_set_error(error==EADDRINUSE?NET_ERROR_ADDRESS_IN_USE:NET_ERROR_BIND,port,error);
             LOGE("Wi-Fi bind failed host=%s port=%d errno=%d",h,port,error);
-            network_close_socket(&g.net_sock);network_close_socket(&g.net_listen_sock);atomic_store(&g.net_role,0);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;
+            network_close_socket(&g.net_sock);network_close_socket(&g.net_listen_sock);atomic_store(&g.net_role,0);pthread_mutex_unlock(&g.net_rx_lock);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;
         }
         if(transport==NET_TRANSPORT_TCP&&listen(g.net_listen_sock,1)<0) {
             int error=errno;
             network_set_error(NET_ERROR_LISTEN,port,error);
             LOGE("Wi-Fi listen failed port=%d errno=%d",port,error);
-            network_close_socket(&g.net_listen_sock);atomic_store(&g.net_role,0);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;
+            network_close_socket(&g.net_listen_sock);atomic_store(&g.net_role,0);pthread_mutex_unlock(&g.net_rx_lock);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_FALSE;
         }
         if(transport==NET_TRANSPORT_TCP) LOGI("Wi-Fi TCP server listening on port=%d",port);
         else LOGI("Wi-Fi UDP receiver bound to port=%d",port);
     }
-    atomic_store(&g.net_role,role);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_TRUE;
+    atomic_store(&g.net_role,role);pthread_mutex_unlock(&g.net_rx_lock);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_TRUE;
 }
-JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearNetwork(JNIEnv*e,jobject o){(void)e;(void)o;atomic_store(&g.net_role,0);network_close_socket(&g.net_sock);network_close_socket(&g.net_listen_sock);g.net_tcp_connecting=0;g.net_tcp_next_connect_ns=0;g.net_rx_used=g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);g.net_send_count=0;g.net_aac_send_used=0;g.net_aac_send_frames=0;network_clear_jitter_state();atomic_store(&g.net_min_buffer_events,0);atomic_store(&g.net_max_buffer_events,0);network_set_error(NET_ERROR_NONE,0,0);pthread_mutex_lock(&g.net_codec_lock);wifi_aac_destroy(g.net_aac);g.net_aac=NULL;pthread_mutex_unlock(&g.net_codec_lock);}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearNetwork(JNIEnv*e,jobject o){
+    (void)e;(void)o;
+    pthread_mutex_lock(&g.net_rx_lock);
+    atomic_store(&g.net_role,0);network_close_socket(&g.net_sock);network_close_socket(&g.net_listen_sock);g.net_tcp_connecting=0;g.net_tcp_next_connect_ns=0;g.net_rx_used=g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);g.net_send_count=0;g.net_aac_send_used=0;g.net_aac_send_frames=0;network_clear_jitter_state_unlocked();atomic_store(&g.net_min_buffer_events,0);atomic_store(&g.net_max_buffer_events,0);network_set_error(NET_ERROR_NONE,0,0);
+    pthread_mutex_lock(&g.net_codec_lock);wifi_aac_destroy(g.net_aac);g.net_aac=NULL;pthread_mutex_unlock(&g.net_codec_lock);
+    pthread_mutex_unlock(&g.net_rx_lock);
+}
 JNIEXPORT jintArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkErrorInfo(JNIEnv*e,jobject o){
     (void)o;
     jint values[3];
