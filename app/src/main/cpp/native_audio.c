@@ -78,7 +78,6 @@ static void app_log_print(android_LogPriority priority, const char *fmt, ...) {
 #define NET_TCP_SEND_BUFFER_BYTES (512 * 1024)
 #define NET_UDP_RECEIVE_BUFFER_BYTES (1024 * 1024)
 #define NET_UDP_SEND_BUFFER_BYTES (512 * 1024)
-#define NET_PLC_HISTORY_FRAMES 4096
 #define EQ_BANDS 4
 #define MAX_INPUT_CHANNELS 8
 
@@ -227,10 +226,6 @@ typedef struct {
     uint32_t net_seq, net_play_seq, net_high_seq;
     uint32_t net_aac_play_seq, net_aac_high_seq;
     uint64_t net_missing_packets, net_late_packets, net_duplicate_packets;
-    float net_plc_history[NET_PLC_HISTORY_FRAMES * 2];
-    int net_plc_history_write, net_plc_history_count;
-    int net_plc_active, net_plc_pitch_lag, net_plc_generated_frames;
-    int net_plc_recovery_frames, net_plc_recovery_total;
     uint8_t net_rx_buffer[NET_TCP_BUFFER_BYTES];
     size_t net_rx_used, net_tx_used, net_tx_offset;
     uint8_t net_tx_buffer[NET_TCP_BUFFER_BYTES];
@@ -1277,8 +1272,6 @@ static void network_send(const float *data, int frames) {
     }
 }
 
-static void network_plc_reset(void);
-
 static void network_clear_jitter_state(void) {
     if(g.net_jitter) memset(g.net_jitter,0,NET_JITTER_SLOTS*sizeof(*g.net_jitter));
     if(g.net_aac_jitter) memset(g.net_aac_jitter,0,NET_AAC_JITTER_SLOTS*sizeof(*g.net_aac_jitter));
@@ -1298,163 +1291,6 @@ static void network_clear_jitter_state(void) {
     g.net_max_boundary_latched=0;
     g.net_max_since_ns=0;
     atomic_store(&g.net_buffer_ms,0);
-    network_plc_reset();
-}
-
-static void network_plc_reset(void) {
-    g.net_plc_history_write=0;
-    g.net_plc_history_count=0;
-    g.net_plc_active=0;
-    g.net_plc_pitch_lag=0;
-    g.net_plc_generated_frames=0;
-    g.net_plc_recovery_frames=0;
-    g.net_plc_recovery_total=0;
-}
-
-static float network_plc_history_sample(int back, int channel) {
-    if(back<1||back>g.net_plc_history_count)return 0.f;
-    int index=g.net_plc_history_write-back;
-    if(index<0)index+=NET_PLC_HISTORY_FRAMES;
-    return g.net_plc_history[index*2+channel];
-}
-
-static void network_plc_record_real(const float *data, int frames) {
-    if(!data||frames<=0)return;
-    if(frames>=NET_PLC_HISTORY_FRAMES) {
-        data += (size_t)(frames-NET_PLC_HISTORY_FRAMES)*2u;
-        frames=NET_PLC_HISTORY_FRAMES;
-    }
-    int first=NET_PLC_HISTORY_FRAMES-g.net_plc_history_write;
-    if(first>frames)first=frames;
-    memcpy(g.net_plc_history+(size_t)g.net_plc_history_write*2u,
-           data,(size_t)first*2u*sizeof(float));
-    int remaining=frames-first;
-    if(remaining>0) {
-        memcpy(g.net_plc_history,data+(size_t)first*2u,
-               (size_t)remaining*2u*sizeof(float));
-    }
-    g.net_plc_history_write=(g.net_plc_history_write+frames)%NET_PLC_HISTORY_FRAMES;
-    g.net_plc_history_count+=frames;
-    if(g.net_plc_history_count>NET_PLC_HISTORY_FRAMES)
-        g.net_plc_history_count=NET_PLC_HISTORY_FRAMES;
-}
-
-static double network_plc_lag_score(int lag, int window, int stride) {
-    double cross=0.0,current_energy=1e-12,delayed_energy=1e-12;
-    for(int i=0;i<window;i+=stride) {
-        float current_left=network_plc_history_sample(i+1,0);
-        float current_right=network_plc_history_sample(i+1,1);
-        float delayed_left=network_plc_history_sample(i+1+lag,0);
-        float delayed_right=network_plc_history_sample(i+1+lag,1);
-        cross+=(double)current_left*delayed_left+(double)current_right*delayed_right;
-        current_energy+=(double)current_left*current_left+(double)current_right*current_right;
-        delayed_energy+=(double)delayed_left*delayed_left+(double)delayed_right*delayed_right;
-    }
-    return cross/sqrt(current_energy*delayed_energy);
-}
-
-static int network_plc_estimate_pitch(void) {
-    int rate=g.rate>0?g.rate:48000;
-    int min_lag=rate/400;
-    int max_lag=rate/60;
-    if(min_lag<16)min_lag=16;
-    if(max_lag>g.net_plc_history_count/2)max_lag=g.net_plc_history_count/2;
-    int window=rate/100;
-    if(window>g.net_plc_history_count-max_lag)window=g.net_plc_history_count-max_lag;
-    if(max_lag<=min_lag||window<64) {
-        int fallback=rate/200;
-        if(fallback>g.net_plc_history_count)fallback=g.net_plc_history_count;
-        return fallback>0?fallback:1;
-    }
-    int best_lag=min_lag;
-    double best_score=-1.0;
-    for(int lag=min_lag;lag<=max_lag;lag+=4) {
-        double score=network_plc_lag_score(lag,window,4);
-        if(score>best_score){best_score=score;best_lag=lag;}
-    }
-    int refine_start=best_lag-3>min_lag?best_lag-3:min_lag;
-    int refine_end=best_lag+3<max_lag?best_lag+3:max_lag;
-    for(int lag=refine_start;lag<=refine_end;lag++) {
-        double score=network_plc_lag_score(lag,window,2);
-        if(score>best_score){best_score=score;best_lag=lag;}
-    }
-    if(best_score<.35) {
-        best_lag=rate/200;
-        if(best_lag>g.net_plc_history_count)best_lag=g.net_plc_history_count;
-    }
-    return best_lag>0?best_lag:1;
-}
-
-static void network_plc_begin(void) {
-    if(g.net_plc_active)return;
-    g.net_plc_active=1;
-    g.net_plc_pitch_lag=network_plc_estimate_pitch();
-    g.net_plc_generated_frames=0;
-    g.net_plc_recovery_frames=0;
-    g.net_plc_recovery_total=0;
-}
-
-static void network_plc_next(float *left, float *right) {
-    if(!left||!right||g.net_plc_history_count==0){if(left)*left=0.f;if(right)*right=0.f;return;}
-    int rate=g.rate>0?g.rate:48000;
-    int lag=g.net_plc_pitch_lag>0?g.net_plc_pitch_lag:1;
-    int back=lag-(g.net_plc_generated_frames%lag);
-    float gain=1.f;
-    int hold_frames=rate/50;
-    int fade_frames=rate/5;
-    if(g.net_plc_generated_frames>hold_frames) {
-        float progress=(float)(g.net_plc_generated_frames-hold_frames)/(float)(fade_frames-hold_frames);
-        if(progress>=1.f)gain=0.f;
-        else gain=.5f+.5f*cosf((float)M_PI*progress);
-    }
-    *left=network_plc_history_sample(back,0)*gain;
-    *right=network_plc_history_sample(back,1)*gain;
-    g.net_plc_generated_frames++;
-}
-
-static void network_plc_conceal(float *data, int frames) {
-    if(!data||frames<=0)return;
-    if(g.net_plc_history_count==0){memset(data,0,(size_t)frames*2*sizeof(float));return;}
-    network_plc_begin();
-    g.net_plc_recovery_frames=0;
-    g.net_plc_recovery_total=0;
-    for(int i=0;i<frames;i++)network_plc_next(&data[i*2],&data[i*2+1]);
-}
-
-static void network_plc_output_real(float *output, const float *real, int frames) {
-    if(!output||!real||frames<=0)return;
-    if(!g.net_plc_active) {
-        memcpy(output,real,(size_t)frames*2*sizeof(float));
-        network_plc_record_real(real,frames);
-        return;
-    }
-    for(int i=0;i<frames;i++) {
-        float left=real[i*2],right=real[i*2+1];
-        if(g.net_plc_active) {
-            if(g.net_plc_recovery_total==0) {
-                g.net_plc_recovery_total=(g.rate>0?g.rate:48000)/200;
-                if(g.net_plc_recovery_total<32)g.net_plc_recovery_total=32;
-            }
-            float predicted_left,predicted_right;
-            network_plc_next(&predicted_left,&predicted_right);
-            float progress=(float)(g.net_plc_recovery_frames+1)/(float)g.net_plc_recovery_total;
-            if(progress>1.f)progress=1.f;
-            float real_mix=.5f-.5f*cosf((float)M_PI*progress);
-            output[i*2]=predicted_left*(1.f-real_mix)+left*real_mix;
-            output[i*2+1]=predicted_right*(1.f-real_mix)+right*real_mix;
-            g.net_plc_recovery_frames++;
-            if(g.net_plc_recovery_frames>=g.net_plc_recovery_total) {
-                g.net_plc_active=0;
-                g.net_plc_generated_frames=0;
-                g.net_plc_recovery_frames=0;
-                g.net_plc_recovery_total=0;
-            }
-        } else {
-            output[i*2]=left;
-            output[i*2+1]=right;
-        }
-        network_plc_record_real(real+i*2,1);
-    }
 }
 
 static void network_restart_jitter(uint32_t sequence) {
@@ -1768,14 +1604,7 @@ static int network_receive(float *data, int frames) {
     if ((g.net_sock < 0 && !(g.net_transport==NET_TRANSPORT_TCP && g.net_listen_sock>=0)) ||
         atomic_load(&g.net_role) != 2 || !g.net_jitter) {
         atomic_store(&g.net_buffer_ms,0);
-        /* A lost UDP socket or a disconnected receiver must require a fresh
-         * startup prefill when packets become available again. */
-        if (atomic_load(&g.net_role) == 2) {
-            g.net_started = 0;
-            g.net_buffer_monitor_started = 0;
-        }
-        network_plc_conceal(data,frames);
-        return frames;
+        return 0;
     }
     int min_frames=(g.rate*g.net_min_ms)/1000;
     int max_frames=(g.rate*g.net_max_ms)/1000;
@@ -1788,7 +1617,7 @@ static int network_receive(float *data, int frames) {
             g.net_buffer_monitor_started=1;
         } else {
             network_update_buffer_monitor(0);
-            network_plc_conceal(data,frames);
+            memset(data,0,(size_t)frames*2*sizeof(float));
             return frames;
         }
     }
@@ -1806,7 +1635,7 @@ static int network_receive(float *data, int frames) {
     if(valid_frames==0||valid_frames<min_frames) {
         g.net_started=0;
         network_update_buffer_monitor(1);
-        network_plc_conceal(data,frames);
+        memset(data,0,(size_t)frames*2*sizeof(float));
         return frames;
     }
 
@@ -1816,7 +1645,7 @@ static int network_receive(float *data, int frames) {
         if(slot->valid && slot->sequence==g.net_play_seq) {
             int available=NET_PACKET_FRAMES-g.net_play_offset;
             int take=frames-produced<available?frames-produced:available;
-            network_plc_output_real(data+produced*2,slot->samples+g.net_play_offset*2,take);
+            memcpy(data+produced*2,slot->samples+g.net_play_offset*2,(size_t)take*2*sizeof(float));
             produced+=take;
             g.net_play_offset+=take;
             if(g.net_play_offset==NET_PACKET_FRAMES) {
@@ -1830,7 +1659,7 @@ static int network_receive(float *data, int frames) {
         if((int32_t)(g.net_high_seq-g.net_play_seq)>0) {
             int missing=NET_PACKET_FRAMES-g.net_play_offset;
             int take=frames-produced<missing?frames-produced:missing;
-            network_plc_conceal(data+produced*2,take);
+            memset(data+produced*2,0,(size_t)take*2*sizeof(float));
             produced+=take;
             g.net_play_offset+=take;
             if(g.net_play_offset==NET_PACKET_FRAMES) {
@@ -1843,7 +1672,7 @@ static int network_receive(float *data, int frames) {
             }
             continue;
         }
-        network_plc_conceal(data+produced*2,frames-produced);
+        memset(data+produced*2,0,(size_t)(frames-produced)*2*sizeof(float));
         break;
     }
     if(network_valid_frames()==0)g.net_started=0;
