@@ -241,6 +241,16 @@ private fun LiveAudioProcessApp() {
             if (usbOutputHostActive && !actualUsbOutputHostActive && output == OutputSource.USB)
                 systemOutputVolumePercent = engine.systemVolumePercent()
             usbOutputHostActive = actualUsbOutputHostActive
+            val currentlyUsesUsbHostVolume = output == OutputSource.USB &&
+                (!running || actualUsbOutputHostActive)
+            if (!currentlyUsesUsbHostVolume) {
+                val actualSystemVolumePercent = engine.systemVolumePercent()
+                if (systemOutputVolumePercent != actualSystemVolumePercent) {
+                    systemOutputVolumePercent = actualSystemVolumePercent
+                    if (output != OutputSource.USB)
+                        engine.outputVolumePercent = actualSystemVolumePercent
+                }
+            }
             val engineNotice = engine.routeNotice ?: engine.lastError
             if (!engineNotice.isNullOrBlank()) {
                 routeNotice = engineNotice
@@ -473,7 +483,17 @@ private fun LiveAudioProcessApp() {
                 screenAlwaysOn = enabled
                 prefs.edit().putBoolean("screenAlwaysOn", enabled).apply()
             }
-            VolumeControlPanel(outputVolumePercent, usesUsbHostVolume, output != OutputSource.NONE && (output != OutputSource.USB || running)) { value -> if (usesUsbHostVolume) usbOutputVolumePercent = value else { systemOutputVolumePercent = value; if (output != OutputSource.USB) engine.outputVolumePercent = value; engine.setOutputVolumePercent(value) } }
+            VolumeControlPanel(outputVolumePercent, usesUsbHostVolume, output != OutputSource.NONE && (output != OutputSource.USB || running)) { value ->
+                if (usesUsbHostVolume) {
+                    usbOutputVolumePercent = value
+                } else {
+                    engine.setOutputVolumePercent(value)
+                    val actualSystemVolumePercent = engine.systemVolumePercent()
+                    systemOutputVolumePercent = actualSystemVolumePercent
+                    if (output != OutputSource.USB)
+                        engine.outputVolumePercent = actualSystemVolumePercent
+                }
+            }
             LevelPanel(inputLevelL, inputLevelR, outputLevelL, outputLevelR, inputPeakL, inputPeakR, outputPeakL, outputPeakR, limiterGain, limiterReleaseMs, running, running && effects.dspEnabled && effects.limiterEnabled, running && input == InputSource.WIFI && wifiActive, wifiReceiveStats, waveformData, showWaveforms, showLevelMeters, { showWaveforms = it; prefs.edit().putBoolean("showWaveforms", it).apply() }, { showLevelMeters = it; prefs.edit().putBoolean("showLevelMeters", it).apply() })
             RoutingPanel2(input, { selectInput(it) }, output, { selectOutput(it) }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
             if (input == InputSource.TEST_TONE) TonePanel(toneWaveform, toneMusic, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevelDb, { selected -> toneWaveform = selected; when (selected) { 4 -> { toneFrequency = 20f; toneFrequency2 = 20_000f }; 6 -> { toneFrequency = 19_000f; toneFrequency2 = 20_000f }; else -> Unit } }, { toneMusic = it }, { toneChannels = it }, { toneFrequency = it }, { toneFrequency2 = it }, { toneDurationSeconds = it }, { toneClickIntervalMs = it }, { toneLevelDb = it })
