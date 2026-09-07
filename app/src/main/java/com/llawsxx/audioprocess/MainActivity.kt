@@ -40,7 +40,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.llawsxx.audioprocess.ui.theme.LiveAudioProcessTheme
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
@@ -243,7 +245,8 @@ private fun LiveAudioProcessApp() {
             usbOutputHostActive = actualUsbOutputHostActive
             val currentlyUsesUsbHostVolume = output == OutputSource.USB &&
                 (!running || actualUsbOutputHostActive)
-            if (!currentlyUsesUsbHostVolume) {
+            if (!currentlyUsesUsbHostVolume && currentPage == 0 &&
+                !consoleScrollState.isScrollInProgress) {
                 val actualSystemVolumePercent = engine.systemVolumePercent()
                 if (systemOutputVolumePercent != actualSystemVolumePercent) {
                     systemOutputVolumePercent = actualSystemVolumePercent
@@ -272,27 +275,77 @@ private fun LiveAudioProcessApp() {
         }
     }
     LaunchedEffect(recording) { while (recording) { delay(1000); elapsed++ } }
-    LaunchedEffect(running, showWaveforms) {
+    LaunchedEffect(running, showWaveforms, currentPage) {
+        if (currentPage != 0) return@LaunchedEffect
+        if (!running) return@LaunchedEffect
+        while (running && NativeAudio.available) {
+            if (consoleScrollState.isScrollInProgress) {
+                delay(100)
+                continue
+            }
+            val (levels, latestWaveform) = withContext(Dispatchers.Default) {
+                NativeAudio.levels() to if (showWaveforms) NativeAudio.waveform() else null
+            }
+            if (levels.size >= 4) {
+                inputLevelL = levels[0]
+                inputLevelR = levels[1]
+                outputLevelL = levels[2]
+                outputLevelR = levels[3]
+            }
+            if (levels.size >= 6) {
+                limiterGain = levels[4]
+                limiterReleaseMs = levels[5]
+            }
+            if (levels.size >= 10) {
+                inputPeakL = levels[6]
+                inputPeakR = levels[7]
+                outputPeakL = levels[8]
+                outputPeakR = levels[9]
+            }
+            if (latestWaveform != null) waveformData = latestWaveform
+            delay(100)
+        }
+    }
+    LaunchedEffect(running, input, currentPage) {
         if (!running) {
             inputInfo = LongArray(14)
             outputInfo = LongArray(16)
             wifiReceiveStats = LongArray(5)
         }
+        if (!running || currentPage != 0) return@LaunchedEffect
         while (running && NativeAudio.available) {
-            val levels = NativeAudio.levels(); if (levels.size >= 4) { inputLevelL = levels[0]; inputLevelR = levels[1]; outputLevelL = levels[2]; outputLevelR = levels[3] }; if (levels.size >= 6) { limiterGain = levels[4]; limiterReleaseMs = levels[5] }; if (levels.size >= 10) { inputPeakL = levels[6]; inputPeakR = levels[7]; outputPeakL = levels[8]; outputPeakR = levels[9] }; if (showWaveforms) waveformData = NativeAudio.waveform()
-            inputInfo = NativeAudio.inputInfo()
-            outputInfo = NativeAudio.outputInfo()
-            wifiReceiveStats = if (input == InputSource.WIFI) NativeAudio.networkReceiveStats() else LongArray(5)
-            delay(100)
+            if (consoleScrollState.isScrollInProgress) {
+                delay(100)
+                continue
+            }
+            val (latestInputInfo, latestOutputInfo, latestWifiReceiveStats) =
+                withContext(Dispatchers.Default) {
+                    Triple(
+                        NativeAudio.inputInfo(),
+                        NativeAudio.outputInfo(),
+                        if (input == InputSource.WIFI) NativeAudio.networkReceiveStats()
+                        else LongArray(5)
+                    )
+                }
+            if (!inputInfo.contentEquals(latestInputInfo)) inputInfo = latestInputInfo
+            if (!outputInfo.contentEquals(latestOutputInfo)) outputInfo = latestOutputInfo
+            if (!wifiReceiveStats.contentEquals(latestWifiReceiveStats))
+                wifiReceiveStats = latestWifiReceiveStats
+            delay(500)
         }
     }
-    LaunchedEffect(running, input, output) {
-        if (!running || (input != InputSource.USB && output != OutputSource.USB)) {
+    LaunchedEffect(running, input, output, currentPage) {
+        if (!running || currentPage != 0 || (input != InputSource.USB && output != OutputSource.USB)) {
             usbStats = LongArray(18)
             return@LaunchedEffect
         }
         while (running && NativeAudio.available) {
-            usbStats = NativeAudio.usbStats()
+            if (consoleScrollState.isScrollInProgress) {
+                delay(100)
+                continue
+            }
+            val latestUsbStats = withContext(Dispatchers.Default) { NativeAudio.usbStats() }
+            if (!usbStats.contentEquals(latestUsbStats)) usbStats = latestUsbStats
             delay(500)
         }
     }
