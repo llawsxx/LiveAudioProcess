@@ -31,17 +31,20 @@ internal val WifiAacBitrates = listOf(
 
 @Composable
 fun WifiAudioPanel(
+    sampleRate: Int,
     sendHost: String,
     sendPort: String,
     transport: Int,
     codec: Int,
     aacBitrate: Int,
+    packetDuration: String,
     sendActive: Boolean,
     onSendHost: (String) -> Unit,
     onSendPort: (String) -> Unit,
     onTransport: (Int) -> Unit,
     onCodec: (Int) -> Unit,
     onAacBitrate: (Int) -> Unit,
+    onPacketDuration: (String) -> Unit,
     receiveHost: String,
     receivePort: String,
     minBuffer: String,
@@ -56,6 +59,29 @@ fun WifiAudioPanel(
     onMaxHold: (String) -> Unit,
     onInputTimeout: (String) -> Unit
 ) {
+    val requestedPacketMs = packetDuration.toIntOrNull()?.coerceIn(1, 100) ?: 20
+    val pcmFrames = ((sampleRate.toLong() * requestedPacketMs / 1000L) / 128L * 128L)
+        .coerceAtLeast(128L)
+        .let { frames ->
+            if (transport == 0) frames.coerceAtMost(((65_507L - 28L) / 8L / 128L) * 128L)
+            else frames
+        }
+    val aacFramesPerPacket = ((sampleRate.toLong() * requestedPacketMs + 512_000L) / 1_024_000L)
+        .coerceIn(1L, 10L)
+    val packetFrames = if (codec == 1) aacFramesPerPacket * 1024L else pcmFrames
+    val actualPacketMs = packetFrames * 1000.0 / sampleRate
+    val packetBytes = if (codec == 1) {
+        28L + aacFramesPerPacket * 4L + (aacBitrate * actualPacketMs / 8000.0).toLong()
+    } else {
+        28L + packetFrames * 2L * 4L
+    }
+    val segments = ((packetBytes + if (transport == 0) 1471L else 1459L) /
+        if (transport == 0) 1472L else 1460L).coerceAtLeast(1L)
+    val prefillTargetMs = ((minBuffer.toIntOrNull()?.coerceIn(0, 200) ?: 0) +
+        (maxBuffer.toIntOrNull()?.coerceIn(50, 1000) ?: 200)) / 2
+    val prefillTargetFrames = sampleRate.toLong() * prefillTargetMs / 1000L
+    val prefillFrames = ((prefillTargetFrames + packetFrames - 1L) / packetFrames) * packetFrames
+    val actualPrefillMs = prefillFrames * 1000.0 / sampleRate
     val fieldColors = OutlinedTextFieldDefaults.colors(
         focusedTextColor = Color.White,
         unfocusedTextColor = Color.White,
@@ -102,10 +128,30 @@ fun WifiAudioPanel(
 
             EndpointHeader("发送端", "音频输出", sendActive)
             Text(
-                if (codec == 1) "AAC-LC · 双声道 · 1024 frames"
-                else "PCM Float32 · 双声道 · 128 frames",
+                if (codec == 1) "AAC-LC · 双声道 · $aacFramesPerPacket × 1024 frames"
+                else "PCM Float32 · 双声道 · $packetFrames frames",
                 color = WifiTeal,
                 fontSize = 11.sp
+            )
+            OutlinedTextField(
+                packetDuration,
+                onPacketDuration,
+                label = { Text("发包时长 ms") },
+                singleLine = true,
+                colors = fieldColors,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Text(
+                buildString {
+                    append("实际 %.1f ms/包 · 约 %.1f 包/秒 · 约 %,.0f B/包".format(actualPacketMs, 1000.0 / actualPacketMs, packetBytes.toDouble()))
+                    if (packetBytes > if (transport == 0) 1472 else 1460) {
+                        append(if (transport == 0) " · 超过 1500 MTU，约 $segments 个 IP 分片" else " · 约 $segments 个 TCP 段")
+                    } else {
+                        append(" · 未超过 1500 MTU")
+                    }
+                },
+                color = if (transport == 0 && packetBytes > 1472) Color(0xFFFFB86B) else WifiMuted,
+                fontSize = 10.sp
             )
             OutlinedTextField(
                 sendHost,
@@ -173,6 +219,11 @@ fun WifiAudioPanel(
                 modifier = Modifier.fillMaxWidth()
             )
             Text("缓冲范围：最小 0–200 ms，最大 50–1000 ms", color = WifiMuted, fontSize = 10.sp)
+            Text(
+                "开始播放预填充约 %.1f ms（目标 %d ms）；播放中缓冲耗尽后会重新预填充".format(actualPrefillMs, prefillTargetMs),
+                color = WifiTeal,
+                fontSize = 10.sp
+            )
         }
     }
 }

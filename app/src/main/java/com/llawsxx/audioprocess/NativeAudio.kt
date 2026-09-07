@@ -16,7 +16,7 @@ object NativeAudio {
     external fun waveform(): FloatArray
     external fun startRecordingFd(dryFd: Int, wetFd: Int): Boolean
     external fun stopRecording()
-    external fun configureNetwork(role: Int, transport: Int, codec: Int, sampleRate: Int, bitrate: Int, host: String, port: Int, minBufferMs: Int, maxBufferMs: Int, maxHoldMs: Int): Boolean
+    external fun configureNetwork(role: Int, transport: Int, codec: Int, sampleRate: Int, bitrate: Int, host: String, port: Int, packetDurationMs: Int, minBufferMs: Int, maxBufferMs: Int, maxHoldMs: Int): Boolean
     external fun configureUsbOutputBuffer(maxBufferMs: Int)
     external fun configureUsbInputBuffer(maxBufferMs: Int)
     external fun setUsbVolume(percent: Int): Boolean

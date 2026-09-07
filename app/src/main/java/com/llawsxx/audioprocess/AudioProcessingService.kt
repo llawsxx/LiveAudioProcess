@@ -146,7 +146,10 @@ class AudioProcessingService : Service() {
             val minBuffer = (p.getString("wifiMinBuffer", "0")?.toIntOrNull() ?: 0).coerceIn(0, 200)
             val maxBuffer = (p.getString("wifiMaxBuffer", "200")?.toIntOrNull() ?: 200).coerceIn(50, 1000)
             val maxHold = p.getInt("wifiMaxHoldMs", 1000).coerceIn(0, 60_000)
-            engine.configureNetwork(wifiRole, p.getInt("wifiTransport", 0).coerceIn(0, 1), p.getInt("wifiCodec", 0).coerceIn(0, 1), p.getInt("wifiAacBitrate", 128_000), host, port, minBuffer, maxBuffer, maxHold)
+            val packetDuration = runCatching { p.getInt("wifiPacketDurationMs", 20) }
+                .getOrElse { p.getString("wifiPacketDurationMs", "20")?.toIntOrNull() ?: 20 }
+                .coerceIn(1, 100)
+            engine.configureNetwork(wifiRole, p.getInt("wifiTransport", 0).coerceIn(0, 1), p.getInt("wifiCodec", 0).coerceIn(0, 1), p.getInt("wifiAacBitrate", 128_000), host, port, packetDuration, minBuffer, maxBuffer, maxHold)
         }
     }
 

@@ -29,13 +29,16 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define MAX_FRAMES 2048
 #define NET_PACKET_FRAMES 128
+#define NET_PCM_MAX_PACKET_FRAMES 9600
+#define NET_UDP_MAX_PAYLOAD_BYTES 65507
 #define NET_AAC_FRAMES 1024
 #define NET_AAC_MAX_PACKET_BYTES 8192
-#define NET_AAC_STORED_PACKET_BYTES 4096
+#define NET_AAC_MAX_FRAMES_PER_PACKET 10
+#define NET_AAC_STORED_PACKET_BYTES 16384
 #define NET_AAC_JITTER_SLOTS 128
 #define NET_JITTER_SLOTS 1024
 #define NET_REORDER_BACKTRACK_PACKETS 8
-#define NET_PROTOCOL_VERSION 2
+#define NET_PROTOCOL_VERSION 3
 #define NET_TRANSPORT_UDP 0
 #define NET_TRANSPORT_TCP 1
 #define NET_TCP_BUFFER_BYTES 262144
@@ -81,6 +84,7 @@ typedef struct {
 typedef struct {
     uint32_t sequence;
     uint32_t size;
+    uint32_t frames;
     int valid;
     uint8_t data[NET_AAC_STORED_PACKET_BYTES];
 } NetAacJitterSlot;
@@ -146,7 +150,7 @@ typedef struct {
        the format/timebase captured when the files were opened. */
     int record_rate;
     atomic_ullong dsp_last_us, dsp_max_us;
-    int net_sock, net_listen_sock, net_transport, net_codec, net_bitrate, net_port, net_min_ms, net_max_ms;
+    int net_sock, net_listen_sock, net_transport, net_codec, net_bitrate, net_port, net_packet_ms, net_pcm_packet_frames, net_aac_frames_per_packet, net_min_ms, net_max_ms;
     int net_max_hold_ms;
     uint64_t net_max_since_ns;
     int net_tcp_connecting;
@@ -200,7 +204,10 @@ typedef struct {
     uint64_t tone_frame_counter;
     uint32_t tone_noise_state;
     TestMusicState tone_music_state;
-    float net_send_buffer[NET_AAC_FRAMES * 2];
+    float net_send_buffer[NET_PCM_MAX_PACKET_FRAMES * 2];
+    uint8_t net_aac_send_buffer[NET_AAC_STORED_PACKET_BYTES];
+    size_t net_aac_send_used;
+    int net_aac_send_frames;
 } Engine;
 
 static Engine g = {
@@ -1109,47 +1116,66 @@ static void network_write_packet(const uint8_t *packet, size_t size) {
         else network_set_error(NET_ERROR_NONE,0,0);
     }
 }
-static void network_send_pcm_packet(const float *data) {
+static void network_send_pcm_packet(const float *data, int frames) {
     NetHeader h={NET_MAGIC,NET_PROTOCOL_VERSION,0,2,(uint32_t)g.rate,
-                 NET_PACKET_FRAMES,now_ns(),g.net_seq++};
-    uint8_t packet[sizeof(NetHeader)+NET_PACKET_FRAMES*2*sizeof(float)];
+                 (uint32_t)frames,now_ns(),g.net_seq};
+    g.net_seq+=(uint32_t)(frames/NET_PACKET_FRAMES);
+    uint8_t packet[sizeof(NetHeader)+NET_PCM_MAX_PACKET_FRAMES*2*sizeof(float)];
+    size_t packet_size=sizeof(NetHeader)+(size_t)frames*2*sizeof(float);
     memcpy(packet,&h,sizeof(h));
-    memcpy(packet+sizeof(h),data,NET_PACKET_FRAMES*2*sizeof(float));
+    memcpy(packet+sizeof(h),data,(size_t)frames*2*sizeof(float));
     if(g.net_transport==NET_TRANSPORT_TCP) {
-        network_write_packet(packet,sizeof(packet));
+        network_write_packet(packet,packet_size);
     } else {
-        ssize_t expected=(ssize_t)sizeof(packet);
-        ssize_t sent=sendto(g.net_sock,packet,sizeof(packet),0,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr));
+        ssize_t expected=(ssize_t)packet_size;
+        ssize_t sent=sendto(g.net_sock,packet,packet_size,0,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr));
         if(sent!=expected && (h.sequence==0 || h.sequence%100==0))
         LOGI("Wi-Fi send dropped sequence=%u bytes=%zd/%zd",h.sequence,sent,expected);
     }
     if(h.sequence==0)
-        LOGI("Wi-Fi protocol v%d fixed packet: frames=%d bytes=%zu",NET_PROTOCOL_VERSION,
-             NET_PACKET_FRAMES,sizeof(packet));
+        LOGI("Wi-Fi protocol v%d PCM packet: frames=%d bytes=%zu",NET_PROTOCOL_VERSION,
+             frames,packet_size);
 }
 
-static void network_send_aac_packet(const float *data) {
-    uint8_t packet[sizeof(NetHeader)+NET_AAC_MAX_PACKET_BYTES];
-    pthread_mutex_lock(&g.net_codec_lock);
-    int encoded=wifi_aac_encode(g.net_aac,data,NET_AAC_FRAMES,
-                                packet+sizeof(NetHeader),NET_AAC_MAX_PACKET_BYTES);
-    pthread_mutex_unlock(&g.net_codec_lock);
-    if(encoded<=0)return;
+static void network_flush_aac_packet(void) {
+    if(g.net_aac_send_frames<=0||g.net_aac_send_used==0)return;
+    uint8_t packet[sizeof(NetHeader)+NET_AAC_STORED_PACKET_BYTES];
+    int frames=g.net_aac_send_frames*NET_AAC_FRAMES;
     NetHeader h={NET_MAGIC,NET_PROTOCOL_VERSION,1,2,(uint32_t)g.rate,
-                 NET_AAC_FRAMES,now_ns(),g.net_seq};
-    g.net_seq+=NET_AAC_FRAMES/NET_PACKET_FRAMES;
+                 (uint32_t)frames,now_ns(),g.net_seq};
+    g.net_seq+=(uint32_t)(frames/NET_PACKET_FRAMES);
     memcpy(packet,&h,sizeof(h));
-    size_t packet_size=sizeof(h)+(size_t)encoded;
-    if(g.net_transport==NET_TRANSPORT_TCP) {
-        network_write_packet(packet,packet_size);
-    } else {
-        ssize_t sent=sendto(g.net_sock,packet,packet_size,0,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr));
-        if(sent!=(ssize_t)packet_size && (h.sequence==0 || h.sequence%800==0))
-        LOGI("Wi-Fi AAC send dropped sequence=%u bytes=%zd/%zu",h.sequence,sent,packet_size);
-    }
+    memcpy(packet+sizeof(h),g.net_aac_send_buffer,g.net_aac_send_used);
+    size_t packet_size=sizeof(h)+g.net_aac_send_used;
+    network_write_packet(packet,packet_size);
     if(h.sequence==0)
         LOGI("Wi-Fi AAC protocol v%d: frames=%d bitrate=%d bytes=%zu",NET_PROTOCOL_VERSION,
-             NET_AAC_FRAMES,g.net_bitrate,packet_size);
+             frames,g.net_bitrate,packet_size);
+    g.net_aac_send_used=0;
+    g.net_aac_send_frames=0;
+}
+
+static void network_append_aac_frame(const float *data) {
+    uint8_t encoded_data[NET_AAC_MAX_PACKET_BYTES];
+    pthread_mutex_lock(&g.net_codec_lock);
+    int encoded=wifi_aac_encode(g.net_aac,data,NET_AAC_FRAMES,
+                                encoded_data,NET_AAC_MAX_PACKET_BYTES);
+    pthread_mutex_unlock(&g.net_codec_lock);
+    if(encoded<=0)return;
+    size_t framed_size=sizeof(uint32_t)+(size_t)encoded;
+    size_t transport_limit=g.net_transport==NET_TRANSPORT_UDP
+            ? NET_UDP_MAX_PAYLOAD_BYTES-sizeof(NetHeader)
+            : NET_AAC_STORED_PACKET_BYTES;
+    if(g.net_aac_send_frames>0&&g.net_aac_send_used+framed_size>transport_limit) {
+        network_flush_aac_packet();
+    }
+    if(framed_size>sizeof(g.net_aac_send_buffer))return;
+    uint32_t wire_size=htonl((uint32_t)encoded);
+    memcpy(g.net_aac_send_buffer+g.net_aac_send_used,&wire_size,sizeof(wire_size));
+    memcpy(g.net_aac_send_buffer+g.net_aac_send_used+sizeof(wire_size),encoded_data,(size_t)encoded);
+    g.net_aac_send_used+=framed_size;
+    g.net_aac_send_frames++;
+    if(g.net_aac_send_frames>=g.net_aac_frames_per_packet)network_flush_aac_packet();
 }
 
 static void network_send(const float *data, int frames) {
@@ -1162,15 +1188,15 @@ static void network_send(const float *data, int frames) {
     if (g.net_transport != NET_TRANSPORT_TCP && g.net_sock < 0) return;
     int offset=0;
     while(offset<frames) {
-        int packet_frames=g.net_codec==1?NET_AAC_FRAMES:NET_PACKET_FRAMES;
+        int packet_frames=g.net_codec==1?NET_AAC_FRAMES:g.net_pcm_packet_frames;
         int room=packet_frames-g.net_send_count;
         int take=frames-offset<room?frames-offset:room;
         memcpy(g.net_send_buffer+g.net_send_count*2,data+offset*2,(size_t)take*2*sizeof(float));
         g.net_send_count+=take;
         offset+=take;
         if(g.net_send_count==packet_frames) {
-            if(g.net_codec==1)network_send_aac_packet(g.net_send_buffer);
-            else network_send_pcm_packet(g.net_send_buffer);
+            if(g.net_codec==1)network_append_aac_frame(g.net_send_buffer);
+            else network_send_pcm_packet(g.net_send_buffer,packet_frames);
             g.net_send_count=0;
         }
     }
@@ -1311,13 +1337,14 @@ static void network_store_packet(const NetHeader *h, const float *samples, uint6
 
 static void network_store_aac_packet(const NetHeader *h, const uint8_t *data, uint32_t size) {
     if(!g.net_aac_jitter||!data||size==0||size>NET_AAC_STORED_PACKET_BYTES)return;
+    uint32_t end_sequence=h->sequence+h->frames/NET_PACKET_FRAMES-NET_AAC_FRAMES/NET_PACKET_FRAMES;
     if(!g.net_aac_seq_initialized) {
         g.net_aac_seq_initialized=1;
         g.net_aac_play_seq=h->sequence;
-        g.net_aac_high_seq=h->sequence;
+        g.net_aac_high_seq=end_sequence;
     } else {
         int32_t delta=(int32_t)(h->sequence-g.net_aac_play_seq);
-        if(delta<0&&!g.net_aac_started&&delta>=-(NET_AAC_FRAMES/NET_PACKET_FRAMES)) {
+        if(delta<0&&!g.net_aac_started&&delta>=-(NET_AAC_MAX_FRAMES_PER_PACKET*NET_AAC_FRAMES/NET_PACKET_FRAMES)) {
             g.net_aac_play_seq=h->sequence;
             delta=0;
         } else if(delta < -(int32_t)(NET_AAC_JITTER_SLOTS *
@@ -1330,7 +1357,7 @@ static void network_store_aac_packet(const NetHeader *h, const uint8_t *data, ui
             network_clear_jitter_state();
             g.net_aac_seq_initialized=1;
             g.net_aac_play_seq=h->sequence;
-            g.net_aac_high_seq=h->sequence;
+            g.net_aac_high_seq=end_sequence;
             delta=0;
         } else if(delta<0) {
             g.net_late_packets++;
@@ -1338,16 +1365,16 @@ static void network_store_aac_packet(const NetHeader *h, const uint8_t *data, ui
         }
         if(delta>=(int32_t)(NET_AAC_JITTER_SLOTS*(NET_AAC_FRAMES/NET_PACKET_FRAMES))) {
             memset(g.net_aac_jitter,0,NET_AAC_JITTER_SLOTS*sizeof(*g.net_aac_jitter));
-            g.net_aac_packet_count=0;g.net_aac_started=0;g.net_aac_play_seq=h->sequence;
+            g.net_aac_packet_count=0;g.net_aac_started=0;g.net_aac_play_seq=h->sequence;g.net_aac_high_seq=end_sequence;
         }
     }
     uint32_t packet_index=h->sequence/(NET_AAC_FRAMES/NET_PACKET_FRAMES);
     NetAacJitterSlot *slot=&g.net_aac_jitter[packet_index%NET_AAC_JITTER_SLOTS];
     if(slot->valid&&slot->sequence==h->sequence){g.net_duplicate_packets++;return;}
     if(slot->valid)g.net_aac_packet_count--;
-    slot->sequence=h->sequence;slot->size=size;memcpy(slot->data,data,size);slot->valid=1;
+    slot->sequence=h->sequence;slot->size=size;slot->frames=h->frames;memcpy(slot->data,data,size);slot->valid=1;
     g.net_aac_packet_count++;
-    if((int32_t)(h->sequence-g.net_aac_high_seq)>0)g.net_aac_high_seq=h->sequence;
+    if((int32_t)(end_sequence-g.net_aac_high_seq)>0)g.net_aac_high_seq=end_sequence;
 }
 
 static void network_decode_aac_packets(void) {
@@ -1368,19 +1395,44 @@ static void network_decode_aac_packets(void) {
             }
             break;
         }
-        pthread_mutex_lock(&g.net_codec_lock);
-        int decoded_frames=wifi_aac_decode(g.net_aac,slot->data,(int)slot->size,decoded,NET_AAC_FRAMES);
-        pthread_mutex_unlock(&g.net_codec_lock);
-        uint32_t sequence=slot->sequence;slot->valid=0;g.net_aac_packet_count--;
-        g.net_aac_play_seq+=NET_AAC_FRAMES/NET_PACKET_FRAMES;
-        if(decoded_frames!=NET_AAC_FRAMES){
-            network_set_error(NET_ERROR_AAC_DECODE,decoded_frames,NET_AAC_FRAMES);
-            continue;
+        uint32_t sequence=slot->sequence;
+        uint32_t packet_frames=slot->frames;
+        size_t payload_offset=0;
+        int access_units=(int)(packet_frames/NET_AAC_FRAMES);
+        slot->valid=0;g.net_aac_packet_count--;
+        g.net_aac_play_seq+=(uint32_t)(packet_frames/NET_PACKET_FRAMES);
+        if(!g.net_seq_initialized) {
+            g.net_seq_initialized=1;
+            g.net_play_seq=sequence;
+            g.net_high_seq=sequence;
         }
-        for(int offset=0;offset<NET_AAC_FRAMES;offset+=NET_PACKET_FRAMES) {
-            NetHeader slice={NET_MAGIC,NET_PROTOCOL_VERSION,1,2,(uint32_t)g.rate,
-                             NET_PACKET_FRAMES,0,sequence+(uint32_t)(offset/NET_PACKET_FRAMES)};
-            network_store_packet(&slice,decoded+offset*2,now_ns());
+        for(int unit=0;unit<access_units;unit++) {
+            if(slot->size-payload_offset<sizeof(uint32_t)) {
+                network_set_error(NET_ERROR_AAC_PACKET_SIZE,(int)slot->size,access_units);
+                break;
+            }
+            uint32_t wire_size;
+            memcpy(&wire_size,slot->data+payload_offset,sizeof(wire_size));
+            uint32_t encoded_size=ntohl(wire_size);
+            payload_offset+=sizeof(wire_size);
+            if(encoded_size==0||encoded_size>slot->size-payload_offset) {
+                network_set_error(NET_ERROR_AAC_PACKET_SIZE,(int)encoded_size,(int)(slot->size-payload_offset));
+                break;
+            }
+            pthread_mutex_lock(&g.net_codec_lock);
+            int decoded_frames=wifi_aac_decode(g.net_aac,slot->data+payload_offset,(int)encoded_size,decoded,NET_AAC_FRAMES);
+            pthread_mutex_unlock(&g.net_codec_lock);
+            payload_offset+=encoded_size;
+            if(decoded_frames!=NET_AAC_FRAMES){
+                network_set_error(NET_ERROR_AAC_DECODE,decoded_frames,NET_AAC_FRAMES);
+                continue;
+            }
+            uint32_t unit_sequence=sequence+(uint32_t)(unit*NET_AAC_FRAMES/NET_PACKET_FRAMES);
+            for(int offset=0;offset<NET_AAC_FRAMES;offset+=NET_PACKET_FRAMES) {
+                NetHeader slice={NET_MAGIC,NET_PROTOCOL_VERSION,1,2,(uint32_t)g.rate,
+                                 NET_PACKET_FRAMES,0,unit_sequence+(uint32_t)(offset/NET_PACKET_FRAMES)};
+                network_store_packet(&slice,decoded+offset*2,now_ns());
+            }
         }
     }
 }
@@ -1398,8 +1450,8 @@ static void network_process_packet(const uint8_t *packet, size_t n) {
     if(h.rate!=(uint32_t)g.rate){network_set_error(NET_ERROR_RATE_MISMATCH,(int)h.rate,g.rate);return;}
     uint64_t arrival=now_ns();
     if(h.codec==0) {
-        size_t expected=sizeof(NetHeader)+NET_PACKET_FRAMES*2*sizeof(float);
-        if(h.frames!=NET_PACKET_FRAMES){network_set_error(NET_ERROR_FRAMES_MISMATCH,(int)h.frames,NET_PACKET_FRAMES);return;}
+        if(h.frames<NET_PACKET_FRAMES||h.frames>NET_PCM_MAX_PACKET_FRAMES||h.frames%NET_PACKET_FRAMES!=0){network_set_error(NET_ERROR_FRAMES_MISMATCH,(int)h.frames,NET_PACKET_FRAMES);return;}
+        size_t expected=sizeof(NetHeader)+(size_t)h.frames*2*sizeof(float);
         if(n!=expected){
             size_t payload=n-sizeof(NetHeader);
             size_t samples=(size_t)h.frames*h.channels;
@@ -1407,9 +1459,14 @@ static void network_process_packet(const uint8_t *packet, size_t n) {
             network_set_error(NET_ERROR_PCM_FORMAT_MISMATCH,bytes_per_sample,(int)sizeof(float));
             return;
         }
-        network_store_packet(&h,(const float *)(packet+sizeof(h)),arrival);
+        for(uint32_t offset=0;offset<h.frames;offset+=NET_PACKET_FRAMES) {
+            NetHeader slice=h;
+            slice.frames=NET_PACKET_FRAMES;
+            slice.sequence=h.sequence+offset/NET_PACKET_FRAMES;
+            network_store_packet(&slice,(const float *)(packet+sizeof(h))+offset*2,arrival);
+        }
     } else if(h.codec==1) {
-        if(h.frames!=NET_AAC_FRAMES){network_set_error(NET_ERROR_FRAMES_MISMATCH,(int)h.frames,NET_AAC_FRAMES);return;}
+        if(h.frames<NET_AAC_FRAMES||h.frames>NET_AAC_MAX_FRAMES_PER_PACKET*NET_AAC_FRAMES||h.frames%NET_AAC_FRAMES!=0){network_set_error(NET_ERROR_FRAMES_MISMATCH,(int)h.frames,NET_AAC_FRAMES);return;}
         if(n<=sizeof(NetHeader)||n-sizeof(NetHeader)>NET_AAC_STORED_PACKET_BYTES){
             network_set_error(NET_ERROR_AAC_PACKET_SIZE,(int)(n-sizeof(NetHeader)),NET_AAC_STORED_PACKET_BYTES);
             return;
@@ -1462,7 +1519,7 @@ static void network_fill(void) {
         return;
     }
     if (g.net_sock < 0) return;
-    uint8_t packet[sizeof(NetHeader)+NET_AAC_MAX_PACKET_BYTES];
+    uint8_t packet[sizeof(NetHeader)+NET_PCM_MAX_PACKET_FRAMES*2*sizeof(float)];
     for (;;) {
         ssize_t n=recvfrom(g.net_sock,packet,sizeof(packet),MSG_DONTWAIT,NULL,NULL);
         if(n<0){if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)network_set_error(NET_ERROR_TCP_RECEIVE,errno,0);break;}
@@ -1504,7 +1561,8 @@ static int network_receive(float *data, int frames) {
         network_drop_until(new_play_seq);
         network_update_buffer_monitor(1);
     }
-    if(network_valid_frames()<min_frames) {
+    int valid_frames=network_valid_frames();
+    if(valid_frames==0||valid_frames<min_frames) {
         g.net_started=0;
         network_update_buffer_monitor(1);
         memset(data,0,(size_t)frames*2*sizeof(float));
@@ -1547,6 +1605,7 @@ static int network_receive(float *data, int frames) {
         memset(data+produced*2,0,(size_t)(frames-produced)*2*sizeof(float));
         break;
     }
+    if(network_valid_frames()==0)g.net_started=0;
     network_update_buffer_monitor(1);
     return frames;
 }
@@ -1927,7 +1986,7 @@ JNIEXPORT jfloatArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_waveform
     pthread_mutex_unlock(&g.waveform_lock);
     jfloatArray a=(*e)->NewFloatArray(e,1024); (*e)->SetFloatArrayRegion(e,a,0,1024,v); return a;
 }
-JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetwork(JNIEnv*e,jobject o,jint role,jint transport,jint codec,jint sampleRate,jint bitrate,jstring host,jint port,jint minMs,jint maxMs,jint maxHoldMs){
+JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetwork(JNIEnv*e,jobject o,jint role,jint transport,jint codec,jint sampleRate,jint bitrate,jstring host,jint port,jint packetMs,jint minMs,jint maxMs,jint maxHoldMs){
     (void)o;
     if(role!=1&&role!=2){network_set_error(NET_ERROR_INVALID_ROLE,role,0);return JNI_FALSE;}
     if(transport!=NET_TRANSPORT_UDP&&transport!=NET_TRANSPORT_TCP){network_set_error(NET_ERROR_INVALID_TRANSPORT,transport,0);return JNI_FALSE;}
@@ -1936,6 +1995,17 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
     if(port<1||port>65535){network_set_error(NET_ERROR_INVALID_PORT,port,0);return JNI_FALSE;}
     int normalized_rate=sampleRate;
     int normalized_bitrate=bitrate<32000?32000:(bitrate>1000000?1000000:bitrate);
+    int normalized_packet_ms=packetMs<1?1:(packetMs>100?100:packetMs);
+    int pcm_packet_frames=(normalized_rate*normalized_packet_ms/1000/NET_PACKET_FRAMES)*NET_PACKET_FRAMES;
+    if(pcm_packet_frames<NET_PACKET_FRAMES)pcm_packet_frames=NET_PACKET_FRAMES;
+    if(pcm_packet_frames>NET_PCM_MAX_PACKET_FRAMES)pcm_packet_frames=NET_PCM_MAX_PACKET_FRAMES;
+    if(transport==NET_TRANSPORT_UDP) {
+        int udp_max_frames=((NET_UDP_MAX_PAYLOAD_BYTES-(int)sizeof(NetHeader))/(2*(int)sizeof(float))/NET_PACKET_FRAMES)*NET_PACKET_FRAMES;
+        if(pcm_packet_frames>udp_max_frames)pcm_packet_frames=udp_max_frames;
+    }
+    int aac_frames_per_packet=(normalized_rate*normalized_packet_ms+NET_AAC_FRAMES*500)/(NET_AAC_FRAMES*1000);
+    if(aac_frames_per_packet<1)aac_frames_per_packet=1;
+    if(aac_frames_per_packet>NET_AAC_MAX_FRAMES_PER_PACKET)aac_frames_per_packet=NET_AAC_MAX_FRAMES_PER_PACKET;
     wifi_aac_t next_aac=codec==1?wifi_aac_create(normalized_rate,normalized_bitrate):NULL;
     int codec_ready=codec==0||(next_aac&&wifi_aac_frame_length(next_aac)==NET_AAC_FRAMES);
     if(!codec_ready){wifi_aac_destroy(next_aac);network_set_error(NET_ERROR_AAC_INIT,normalized_rate,normalized_bitrate);LOGE("Wi-Fi AAC initialization failed rate=%d bitrate=%d",normalized_rate,normalized_bitrate);return JNI_FALSE;}
@@ -1963,6 +2033,14 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
         g.net_min_ms=normalized_min;
         g.net_max_ms=normalized_max;
         g.net_max_hold_ms=normalized_max_hold;
+        if(role==1&&(g.net_packet_ms!=normalized_packet_ms||g.net_pcm_packet_frames!=pcm_packet_frames||g.net_aac_frames_per_packet!=aac_frames_per_packet||g.net_bitrate!=normalized_bitrate)) {
+            g.net_send_count=0;
+            g.net_aac_send_used=0;
+            g.net_aac_send_frames=0;
+        }
+        g.net_packet_ms=normalized_packet_ms;
+        g.net_pcm_packet_frames=pcm_packet_frames;
+        g.net_aac_frames_per_packet=aac_frames_per_packet;
         g.net_max_since_ns=0;
         if (codec==1 && role==1 && normalized_bitrate != g.net_bitrate) {
             pthread_mutex_lock(&g.net_codec_lock);
@@ -1987,6 +2065,8 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
     network_close_socket(&g.net_sock);
     network_close_socket(&g.net_listen_sock);
     g.net_transport=transport;g.net_codec=codec;g.net_bitrate=normalized_bitrate;g.net_port=port;
+    g.net_packet_ms=normalized_packet_ms;g.net_pcm_packet_frames=pcm_packet_frames;
+    g.net_aac_frames_per_packet=aac_frames_per_packet;
     g.net_tcp_connecting=0;g.net_tcp_next_connect_ns=0;
     atomic_store(&g.net_tcp_connect_attempts,0);
     network_set_error(NET_ERROR_NONE,0,0);
@@ -2019,7 +2099,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
     atomic_store(&g.net_last_packet_ns,now_ns());atomic_store(&g.net_packet_seen,0);
     g.net_min_ms=normalized_min;g.net_max_ms=normalized_max;
     g.net_max_hold_ms=normalized_max_hold;
-    g.net_send_count=0;g.net_seq=0;g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);g.net_missing_packets=g.net_late_packets=g.net_duplicate_packets=0;network_clear_jitter_state();
+    g.net_send_count=0;g.net_aac_send_used=0;g.net_aac_send_frames=0;g.net_seq=0;g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);g.net_missing_packets=g.net_late_packets=g.net_duplicate_packets=0;network_clear_jitter_state();
     atomic_store(&g.net_min_buffer_events,0);
     atomic_store(&g.net_max_buffer_events,0);
     if(role==2) {
@@ -2041,7 +2121,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
     }
     atomic_store(&g.net_role,role);(*e)->ReleaseStringUTFChars(e,host,h);return JNI_TRUE;
 }
-JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearNetwork(JNIEnv*e,jobject o){(void)e;(void)o;atomic_store(&g.net_role,0);network_close_socket(&g.net_sock);network_close_socket(&g.net_listen_sock);g.net_tcp_connecting=0;g.net_tcp_next_connect_ns=0;g.net_rx_used=g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);g.net_send_count=0;network_clear_jitter_state();atomic_store(&g.net_min_buffer_events,0);atomic_store(&g.net_max_buffer_events,0);network_set_error(NET_ERROR_NONE,0,0);pthread_mutex_lock(&g.net_codec_lock);wifi_aac_destroy(g.net_aac);g.net_aac=NULL;pthread_mutex_unlock(&g.net_codec_lock);}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearNetwork(JNIEnv*e,jobject o){(void)e;(void)o;atomic_store(&g.net_role,0);network_close_socket(&g.net_sock);network_close_socket(&g.net_listen_sock);g.net_tcp_connecting=0;g.net_tcp_next_connect_ns=0;g.net_rx_used=g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);g.net_send_count=0;g.net_aac_send_used=0;g.net_aac_send_frames=0;network_clear_jitter_state();atomic_store(&g.net_min_buffer_events,0);atomic_store(&g.net_max_buffer_events,0);network_set_error(NET_ERROR_NONE,0,0);pthread_mutex_lock(&g.net_codec_lock);wifi_aac_destroy(g.net_aac);g.net_aac=NULL;pthread_mutex_unlock(&g.net_codec_lock);}
 JNIEXPORT jintArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkErrorInfo(JNIEnv*e,jobject o){
     (void)o;
     jint values[3];
