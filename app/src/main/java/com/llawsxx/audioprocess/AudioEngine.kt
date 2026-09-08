@@ -44,6 +44,8 @@ class AudioEngine(private val context: Context) {
     @Volatile var wifiClockCorrectionEnabled = false
     @Volatile var wifiDynamicBufferEnabled = true
     @Volatile var wifiManualBufferBias = 0.5f
+    @Volatile var wifiOpusFrameMs = 20
+    @Volatile var wifiOpusProfile = 0
     @Volatile var routeNotice: String? = null
         private set
     private val deviceCallback = if (Build.VERSION.SDK_INT >= 23) object : AudioDeviceCallback() {
@@ -142,7 +144,7 @@ class AudioEngine(private val context: Context) {
         113 -> "找不到到目标主机的路由"
         else -> "系统错误 $error"
     }
-    private fun codecName(value: Int): String = when (value) { 0 -> "PCM"; 1 -> "AAC"; else -> "未知($value)" }
+    private fun codecName(value: Int): String = when (value) { 0 -> "PCM"; 1 -> "AAC"; 2 -> "Opus"; else -> "未知($value)" }
     private fun nativeWifiError(): Pair<Int, String?> {
         val info = runCatching { NativeAudio.networkErrorInfo() }.getOrDefault(IntArray(0))
         val code = info.getOrElse(0) { 0 }
@@ -176,6 +178,9 @@ class AudioEngine(private val context: Context) {
             30 -> "Wi-Fi TCP 包长度字段异常（$actual 字节，上限 $expected 字节）"
             31 -> "Wi-Fi 接收失败（${socketErrorText(actual)}）"
             32 -> "Wi-Fi 发送端已断开连接"
+            33 -> "Wi-Fi 配置失败：Opus 初始化失败（${actual} Hz，${expected} bps）"
+            34 -> "Wi-Fi Opus 数据长度异常（收到 $actual 字节，上限 $expected 字节）"
+            35 -> "Wi-Fi Opus 解码失败（返回 $actual，期望 $expected 帧）"
             else -> "Wi-Fi 音频错误（代码 $code，详情 $actual/$expected）"
         }
         return code to message
@@ -190,14 +195,26 @@ class AudioEngine(private val context: Context) {
         displayedWifiErrorNotice = null
     }
     fun configureNetwork(role: Int, transport: Int, codec: Int, bitrate: Int, host: String, port: Int, packetDurationMs: Int, minBufferMs: Int, maxBufferMs: Int, maxHoldMs: Int): Boolean {
+        val previousNetworkRole = networkRole
+        NativeAudio.configureNetworkOpus(wifiOpusFrameMs, when (wifiOpusProfile) {
+            1 -> 2048
+            2 -> 2051
+            else -> 2049
+        })
         val configured = NativeAudio.configureNetwork(role, transport, codec, sampleRate, bitrate, host, port, packetDurationMs, minBufferMs, maxBufferMs, maxHoldMs)
-        NativeAudio.configureNetworkClockCorrection(wifiClockCorrectionEnabled && role == 2)
+        val nativeError = nativeWifiError()
+        if (!configured) NativeAudio.clearNetwork()
+        NativeAudio.configureNetworkClockCorrection(configured && wifiClockCorrectionEnabled && role == 2)
         NativeAudio.configureNetworkTargetBuffer(wifiDynamicBufferEnabled, (wifiManualBufferBias.coerceIn(0f, 1f) * 1000f).roundToInt())
         networkRole = if (configured) role else 0
         if (role != 1) { wifiReconnectCount = 0; wifiReconnectPending = false }
-        val nativeError = nativeWifiError()
         if (!configured) showWifiError(nativeError.second ?: wifiConfigurationFailureNotice)
         else if (nativeError.first == 0) clearDisplayedWifiError()
+        if (isRunning && inputSource == InputSource.WIFI && previousNetworkRole != networkRole) {
+            routeNotice = if (networkRole == 2) "Wi-Fi 输入已恢复，正在重新连接音频流" else "Wi-Fi 输入不可用，正在切换音频流"
+            routeHandler.removeCallbacks(routeRestart)
+            routeHandler.post(routeRestart)
+        }
         return configured
     }
     fun configureWifiBufferTarget(dynamic: Boolean, bias: Float) {
@@ -206,6 +223,15 @@ class AudioEngine(private val context: Context) {
         if (NativeAudio.available) {
             NativeAudio.configureNetworkTargetBuffer(dynamic, (wifiManualBufferBias * 1000f).roundToInt())
         }
+    }
+    fun configureWifiOpus(frameMs: Int, profile: Int) {
+        wifiOpusFrameMs = frameMs.coerceIn(5, 60)
+        wifiOpusProfile = profile.coerceIn(0, 2)
+        if (NativeAudio.available) NativeAudio.configureNetworkOpus(wifiOpusFrameMs, when (wifiOpusProfile) {
+            1 -> 2048
+            2 -> 2051
+            else -> 2049
+        })
     }
     fun clearNetwork() {
         NativeAudio.clearNetwork()

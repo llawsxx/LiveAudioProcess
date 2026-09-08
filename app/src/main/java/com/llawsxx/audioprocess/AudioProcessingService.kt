@@ -150,9 +150,11 @@ class AudioProcessingService : Service() {
                 .getOrElse { p.getString("wifiPacketDurationMs", "20")?.toIntOrNull() ?: 20 }
                 .coerceIn(1, 100)
             engine.wifiClockCorrectionEnabled = p.getBoolean("wifiClockCorrectionEnabled", false)
+            engine.wifiOpusFrameMs = p.getInt("wifiOpusFrameMs", 20).let { if (it in listOf(5, 10, 20, 40, 60)) it else 20 }
+            engine.wifiOpusProfile = p.getInt("wifiOpusProfile", 0).coerceIn(0, 2)
             engine.wifiDynamicBufferEnabled = p.getBoolean("wifiDynamicBufferEnabled", true)
             engine.wifiManualBufferBias = (p.getInt("wifiManualBufferBiasPermille", 500).coerceIn(0, 1000) / 1000f)
-            engine.configureNetwork(wifiRole, p.getInt("wifiTransport", 0).coerceIn(0, 1), p.getInt("wifiCodec", 0).coerceIn(0, 1), p.getInt("wifiAacBitrate", 128_000), host, port, packetDuration, minBuffer, maxBuffer, maxHold)
+            engine.configureNetwork(wifiRole, p.getInt("wifiTransport", 0).coerceIn(0, 1), p.getInt("wifiCodec", 0).coerceIn(0, 2), p.getInt("wifiAacBitrate", 128_000), host, port, packetDuration, minBuffer, maxBuffer, maxHold)
         }
     }
 

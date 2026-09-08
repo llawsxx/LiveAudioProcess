@@ -41,6 +41,8 @@ fun WifiAudioPanel(
     codec: Int,
     aacBitrate: Int,
     packetDuration: String,
+    opusFrameMs: Int,
+    opusProfile: Int,
     sendActive: Boolean,
     onSendHost: (String) -> Unit,
     onSendPort: (String) -> Unit,
@@ -48,6 +50,8 @@ fun WifiAudioPanel(
     onCodec: (Int) -> Unit,
     onAacBitrate: (Int) -> Unit,
     onPacketDuration: (String) -> Unit,
+    onOpusFrameMs: (Int) -> Unit,
+    onOpusProfile: (Int) -> Unit,
     receiveHost: String,
     receivePort: String,
     minBuffer: String,
@@ -69,18 +73,25 @@ fun WifiAudioPanel(
     onManualBufferBias: (Float) -> Unit
 ) {
     val requestedPacketMs = packetDuration.toIntOrNull()?.coerceIn(1, 100) ?: 20
-    val pcmFrames = ((sampleRate.toLong() * requestedPacketMs / 1000L) / 128L * 128L)
-        .coerceAtLeast(128L)
+    val opusPacketFrames = sampleRate * opusFrameMs / 1000
+    val pcmFrames = (sampleRate.toLong() * requestedPacketMs / 1000L)
+        .coerceAtLeast(1L)
         .let { frames ->
-            if (transport == 0) frames.coerceAtMost(((65_507L - 28L) / 8L / 128L) * 128L)
+            if (transport == 0) frames.coerceAtMost((65_507L - 28L) / 8L)
             else frames
         }
     val aacFramesPerPacket = ((sampleRate.toLong() * requestedPacketMs + 512_000L) / 1_024_000L)
         .coerceIn(1L, 10L)
-    val packetFrames = if (codec == 1) aacFramesPerPacket * 1024L else pcmFrames
+    val packetFrames = when (codec) {
+        1 -> aacFramesPerPacket * 1024L
+        2 -> sampleRate.toLong() * opusFrameMs / 1000L
+        else -> pcmFrames
+    }
     val actualPacketMs = packetFrames * 1000.0 / sampleRate
     val packetBytes = if (codec == 1) {
         28L + aacFramesPerPacket * 4L + (aacBitrate * actualPacketMs / 8000.0).toLong()
+    } else if (codec == 2) {
+        28L + (aacBitrate * opusFrameMs / 8000.0).toLong()
     } else {
         28L + packetFrames * 2L * 4L
     }
@@ -129,9 +140,13 @@ fun WifiAudioPanel(
                 FilterChip(selected = transport == 1, onClick = { onTransport(1) }, label = { Text("TCP") })
             }
             Text("编码格式", color = WifiMuted, fontSize = 12.sp)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 FilterChip(selected = codec == 0, onClick = { onCodec(0) }, label = { Text("PCM Float32") })
                 FilterChip(selected = codec == 1, onClick = { onCodec(1) }, label = { Text("AAC-LC") })
+                FilterChip(selected = codec == 2, onClick = { onCodec(2) }, label = { Text("Opus") })
             }
 
             if (codec == 1) {
@@ -149,10 +164,34 @@ fun WifiAudioPanel(
                     }
                 }
             }
+            if (codec == 2) {
+                Text("Opus 码率", color = WifiMuted, fontSize = 12.sp)
+                Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    WifiAacBitrates.filter { it <= 512_000 }.forEach { bitrate ->
+                        FilterChip(selected = aacBitrate == bitrate, onClick = { onAacBitrate(bitrate) }, label = { Text("${bitrate / 1000} kbps") })
+                    }
+                }
+                Text("Opus 帧长", color = WifiMuted, fontSize = 12.sp)
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf(5, 10, 20, 40, 60).forEach { ms ->
+                        FilterChip(selected = opusFrameMs == ms, onClick = { onOpusFrameMs(ms) }, label = { Text("$ms ms") })
+                    }
+                }
+                Text("Opus Profile", color = WifiMuted, fontSize = 12.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("Audio", "VoIP", "Low-delay").forEachIndexed { index, label ->
+                        FilterChip(selected = opusProfile == index, onClick = { onOpusProfile(index) }, label = { Text(label) })
+                    }
+                }
+            }
 
             EndpointHeader("发送端", "音频输出", sendActive)
             Text(
                 if (codec == 1) "AAC-LC · 双声道 · $aacFramesPerPacket × 1024 frames"
+                else if (codec == 2) "Opus · 双声道 · $opusFrameMs ms · $opusPacketFrames frames"
                 else "PCM Float32 · 双声道 · $packetFrames frames",
                 color = WifiTeal,
                 fontSize = 11.sp

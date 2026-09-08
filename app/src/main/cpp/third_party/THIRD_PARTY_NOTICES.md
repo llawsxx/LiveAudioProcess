@@ -26,3 +26,13 @@ layer used by the driver.
 - License text: `fdk-aac/NOTICE`
 
 FDK-AAC provides AAC-LC encoding and decoding for Wi-Fi audio transport.
+
+## Opus
+
+- Source: https://github.com/xiph/opus
+- Revision: `a6128f40d74fa6d9252ba3aadf726e3bbdc80c47`
+- License: BSD-3-Clause
+- License text: `opus/COPYING`
+
+Opus provides configurable low-latency speech and audio encoding for Wi-Fi
+audio transport.

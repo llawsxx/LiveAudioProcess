@@ -25,7 +25,9 @@ object NativeAudio {
     external fun clearNetwork()
     external fun networkErrorInfo(): IntArray
     external fun networkReceiveStats(): LongArray
+    external fun clearNetworkReceiveStats()
     external fun configureNetworkClockCorrection(enabled: Boolean)
+    external fun configureNetworkOpus(frameMs: Int, application: Int)
     external fun configureNetworkTargetBuffer(dynamic: Boolean, biasPermille: Int)
     external fun networkInputTimedOut(timeoutMs: Int): Boolean
     external fun networkOutputTimedOut(timeoutMs: Int): Boolean
