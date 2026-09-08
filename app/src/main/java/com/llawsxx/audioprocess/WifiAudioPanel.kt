@@ -15,6 +15,8 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Slider
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -22,6 +24,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlin.math.roundToInt
 
 private val WifiTeal = Color(0xFF43D5C1)
 private val WifiMuted = Color(0xFF8EA0A8)
@@ -57,7 +60,13 @@ fun WifiAudioPanel(
     onMinBuffer: (String) -> Unit,
     onMaxBuffer: (String) -> Unit,
     onMaxHold: (String) -> Unit,
-    onInputTimeout: (String) -> Unit
+    onInputTimeout: (String) -> Unit,
+    clockCorrectionEnabled: Boolean,
+    onClockCorrectionEnabled: (Boolean) -> Unit,
+    dynamicBufferEnabled: Boolean,
+    onDynamicBufferEnabled: (Boolean) -> Unit,
+    manualBufferBias: Float,
+    onManualBufferBias: (Float) -> Unit
 ) {
     val requestedPacketMs = packetDuration.toIntOrNull()?.coerceIn(1, 100) ?: 20
     val pcmFrames = ((sampleRate.toLong() * requestedPacketMs / 1000L) / 128L * 128L)
@@ -77,9 +86,13 @@ fun WifiAudioPanel(
     }
     val segments = ((packetBytes + if (transport == 0) 1471L else 1459L) /
         if (transport == 0) 1472L else 1460L).coerceAtLeast(1L)
-    val prefillTargetMs = ((minBuffer.toIntOrNull()?.coerceIn(0, 200) ?: 0) +
-        (maxBuffer.toIntOrNull()?.coerceIn(50, 1000) ?: 200)) / 2
-    val prefillTargetFrames = sampleRate.toLong() * prefillTargetMs / 1000L
+    val minBufferMsValue = minBuffer.toIntOrNull()?.coerceIn(0, 200) ?: 0
+    val maxBufferMsValue = maxBuffer.toIntOrNull()?.coerceIn(50, 1000) ?: 200
+    val dynamicStartupTargetMs = (minBufferMsValue + (actualPacketMs * 2.0).roundToInt())
+        .coerceIn(minBufferMsValue, maxBufferMsValue)
+    val manualTargetMs = minBufferMsValue + ((maxBufferMsValue - minBufferMsValue) * manualBufferBias.coerceIn(0f, 1f)).roundToInt()
+    val displayTargetMs = if (dynamicBufferEnabled) dynamicStartupTargetMs else manualTargetMs
+    val prefillTargetFrames = sampleRate.toLong() * displayTargetMs / 1000L
     val prefillFrames = ((prefillTargetFrames + packetFrames - 1L) / packetFrames) * packetFrames
     val actualPrefillMs = prefillFrames * 1000.0 / sampleRate
     val fieldColors = OutlinedTextFieldDefaults.colors(
@@ -97,6 +110,17 @@ fun WifiAudioPanel(
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("CLOCK DRIFT CORRECTION", color = Color.White, fontSize = 11.sp)
+                    Text("Adaptive playback rate: ±1%", color = WifiMuted, fontSize = 10.sp)
+                }
+                Switch(checked = clockCorrectionEnabled, onCheckedChange = onClockCorrectionEnabled)
+            }
             Text("Wi-Fi 实时音频", color = Color.White, fontWeight = FontWeight.Bold)
 
             Text("传输格式", color = WifiMuted, fontSize = 12.sp)
@@ -209,6 +233,31 @@ fun WifiAudioPanel(
                     modifier = Modifier.weight(1f)
                 )
             }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("目标缓冲模式", color = Color.White, fontSize = 12.sp)
+                    Text(if (dynamicBufferEnabled) "动态计算" else "手动设置", color = WifiMuted, fontSize = 10.sp)
+                }
+                Switch(checked = dynamicBufferEnabled, onCheckedChange = onDynamicBufferEnabled)
+            }
+            if (!dynamicBufferEnabled) {
+                Text("手动目标：$manualTargetMs ms", color = WifiTeal, fontSize = 11.sp)
+                Slider(
+                    value = manualBufferBias.coerceIn(0f, 1f),
+                    onValueChange = onManualBufferBias,
+                    valueRange = 0f..1f,
+                    steps = 19,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("最小", color = WifiMuted, fontSize = 10.sp)
+                    Text("最大", color = WifiMuted, fontSize = 10.sp)
+                }
+            }
             OutlinedTextField(maxHold, onMaxHold, label = { Text("超过最大持续 ms") }, singleLine = true, colors = fieldColors, modifier = Modifier.fillMaxWidth())
             OutlinedTextField(
                 inputTimeout,
@@ -220,7 +269,7 @@ fun WifiAudioPanel(
             )
             Text("缓冲范围：最小 0–200 ms，最大 50–1000 ms", color = WifiMuted, fontSize = 10.sp)
             Text(
-                "开始播放预填充约 %.1f ms（目标 %d ms）；播放中缓冲耗尽后会重新预填充".format(actualPrefillMs, prefillTargetMs),
+                "开始播放预填充约 %.1f ms（目标 %d ms）；播放中缓冲耗尽后会重新预填充".format(actualPrefillMs, displayTargetMs),
                 color = WifiTeal,
                 fontSize = 10.sp
             )

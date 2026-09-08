@@ -41,6 +41,9 @@ class AudioEngine(private val context: Context) {
     @Volatile private var wifiReconnectPending = false
     @Volatile private var displayedWifiErrorNotice: String? = null
     @Volatile var wifiInputTimeoutMs = 1_000
+    @Volatile var wifiClockCorrectionEnabled = false
+    @Volatile var wifiDynamicBufferEnabled = true
+    @Volatile var wifiManualBufferBias = 0.5f
     @Volatile var routeNotice: String? = null
         private set
     private val deviceCallback = if (Build.VERSION.SDK_INT >= 23) object : AudioDeviceCallback() {
@@ -188,6 +191,8 @@ class AudioEngine(private val context: Context) {
     }
     fun configureNetwork(role: Int, transport: Int, codec: Int, bitrate: Int, host: String, port: Int, packetDurationMs: Int, minBufferMs: Int, maxBufferMs: Int, maxHoldMs: Int): Boolean {
         val configured = NativeAudio.configureNetwork(role, transport, codec, sampleRate, bitrate, host, port, packetDurationMs, minBufferMs, maxBufferMs, maxHoldMs)
+        NativeAudio.configureNetworkClockCorrection(wifiClockCorrectionEnabled && role == 2)
+        NativeAudio.configureNetworkTargetBuffer(wifiDynamicBufferEnabled, (wifiManualBufferBias.coerceIn(0f, 1f) * 1000f).roundToInt())
         networkRole = if (configured) role else 0
         if (role != 1) { wifiReconnectCount = 0; wifiReconnectPending = false }
         val nativeError = nativeWifiError()
@@ -195,8 +200,16 @@ class AudioEngine(private val context: Context) {
         else if (nativeError.first == 0) clearDisplayedWifiError()
         return configured
     }
+    fun configureWifiBufferTarget(dynamic: Boolean, bias: Float) {
+        wifiDynamicBufferEnabled = dynamic
+        wifiManualBufferBias = bias.coerceIn(0f, 1f)
+        if (NativeAudio.available) {
+            NativeAudio.configureNetworkTargetBuffer(dynamic, (wifiManualBufferBias * 1000f).roundToInt())
+        }
+    }
     fun clearNetwork() {
         NativeAudio.clearNetwork()
+        NativeAudio.configureNetworkClockCorrection(false)
         networkRole = 0
         wifiFallbackActive = false
         wifiReconnectCount = 0

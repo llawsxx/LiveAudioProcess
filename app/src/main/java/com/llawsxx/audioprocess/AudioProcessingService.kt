@@ -149,6 +149,9 @@ class AudioProcessingService : Service() {
             val packetDuration = runCatching { p.getInt("wifiPacketDurationMs", 20) }
                 .getOrElse { p.getString("wifiPacketDurationMs", "20")?.toIntOrNull() ?: 20 }
                 .coerceIn(1, 100)
+            engine.wifiClockCorrectionEnabled = p.getBoolean("wifiClockCorrectionEnabled", false)
+            engine.wifiDynamicBufferEnabled = p.getBoolean("wifiDynamicBufferEnabled", true)
+            engine.wifiManualBufferBias = (p.getInt("wifiManualBufferBiasPermille", 500).coerceIn(0, 1000) / 1000f)
             engine.configureNetwork(wifiRole, p.getInt("wifiTransport", 0).coerceIn(0, 1), p.getInt("wifiCodec", 0).coerceIn(0, 1), p.getInt("wifiAacBitrate", 128_000), host, port, packetDuration, minBuffer, maxBuffer, maxHold)
         }
     }
