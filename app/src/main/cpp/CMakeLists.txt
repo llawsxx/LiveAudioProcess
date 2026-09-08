@@ -14,12 +14,14 @@ set(BUILD_PROGRAMS OFF CACHE BOOL "Do not build FDK-AAC tools" FORCE)
 set(FDK_AAC_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "Do not install FDK-AAC config" FORCE)
 set(FDK_AAC_INSTALL_PKGCONFIG_MODULE OFF CACHE BOOL "Do not install FDK-AAC pkg-config" FORCE)
 add_subdirectory(${FDK_AAC_ROOT} fdk-aac EXCLUDE_FROM_ALL)
+target_compile_options(fdk-aac PRIVATE -O3)
 set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "Build Opus as a static library" FORCE)
 set(OPUS_BUILD_TESTING OFF CACHE BOOL "Do not build Opus tests" FORCE)
 set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "Do not build Opus programs" FORCE)
 set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "Do not install Opus pkg-config" FORCE)
 set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "Do not install Opus CMake config" FORCE)
 add_subdirectory(${OPUS_ROOT} opus EXCLUDE_FROM_ALL)
+target_compile_options(opus PRIVATE -O3)
 
 add_library(libusb STATIC
         ${LIBUSB_ROOT}/libusb/core.c
