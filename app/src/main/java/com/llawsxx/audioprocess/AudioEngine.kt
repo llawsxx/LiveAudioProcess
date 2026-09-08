@@ -10,6 +10,7 @@ import android.app.PendingIntent
 import android.media.AudioDeviceInfo
 import android.media.AudioDeviceCallback
 import android.media.AudioManager
+import android.net.wifi.WifiManager
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 import android.provider.MediaStore
@@ -42,6 +43,7 @@ class AudioEngine(private val context: Context) {
     @Volatile private var displayedWifiErrorNotice: String? = null
     @Volatile var wifiInputTimeoutMs = 1_000
     @Volatile var wifiClockCorrectionEnabled = false
+    @Volatile var wifiLowLatencyEnabled = false
     @Volatile var wifiDynamicBufferEnabled = true
     @Volatile var wifiManualBufferBias = 0.5f
     @Volatile var wifiOpusFrameMs = 20
@@ -128,6 +130,7 @@ class AudioEngine(private val context: Context) {
     @Volatile var limiterInputGain = 0f; @Volatile var limiterThreshold = -.5f; @Volatile var limiterRelease = 80f; @Volatile var limiterCeiling = -.5f; @Volatile var limiterLookAhead = 1f; @Volatile var limiterAdaptiveRelease = false
     @Volatile var loudnessTarget = -16f; @Volatile var loudnessLra = 7f; @Volatile var loudnessTruePeak = -1f
     @Volatile var dspEnabled = false; @Volatile var eqEnabled = true; @Volatile var reverbEnabled = true; @Volatile var limiterEnabled = true; @Volatile var loudnessEnabled = true
+    private var wifiLowLatencyLock: WifiManager.WifiLock? = null
     @Volatile var isRunning = false; private set
     @Volatile var isRecording = false; private set
     @Volatile var lastError: String? = null; private set
@@ -210,6 +213,7 @@ class AudioEngine(private val context: Context) {
         if (role != 1) { wifiReconnectCount = 0; wifiReconnectPending = false }
         if (!configured) showWifiError(nativeError.second ?: wifiConfigurationFailureNotice)
         else if (nativeError.first == 0) clearDisplayedWifiError()
+        if (isRunning) applyWifiLowLatencyLock()
         if (isRunning && inputSource == InputSource.WIFI && previousNetworkRole != networkRole) {
             routeNotice = if (networkRole == 2) "Wi-Fi 输入已恢复，正在重新连接音频流" else "Wi-Fi 输入不可用，正在切换音频流"
             routeHandler.removeCallbacks(routeRestart)
@@ -233,10 +237,38 @@ class AudioEngine(private val context: Context) {
             else -> 2049
         })
     }
+    fun configureWifiLowLatency(enabled: Boolean) {
+        wifiLowLatencyEnabled = enabled
+        if (isRunning) applyWifiLowLatencyLock()
+    }
+    private fun applyWifiLowLatencyLock() {
+        if (!wifiLowLatencyEnabled || networkRole == 0 || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            wifiLowLatencyLock?.let { if (it.isHeld) it.release() }
+            return
+        }
+        runCatching {
+            val manager = context.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val lock = wifiLowLatencyLock ?: manager.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
+                "${context.packageName}:WlanLowLatency"
+            ).also {
+                it.setReferenceCounted(false)
+                wifiLowLatencyLock = it
+            }
+            if (!lock.isHeld) lock.acquire()
+        }.onFailure {
+            wifiLowLatencyLock = null
+        }
+    }
+    private fun releaseWifiLowLatencyLock() {
+        wifiLowLatencyLock?.let { if (it.isHeld) it.release() }
+        wifiLowLatencyLock = null
+    }
     fun clearNetwork() {
         NativeAudio.clearNetwork()
         NativeAudio.configureNetworkClockCorrection(false)
         networkRole = 0
+        applyWifiLowLatencyLock()
         wifiFallbackActive = false
         wifiReconnectCount = 0
         wifiReconnectPending = false
@@ -603,7 +635,10 @@ class AudioEngine(private val context: Context) {
             started = NativeAudio.start(sampleRate, outputSampleRate, bufferFrames, inputDeviceId, outputDeviceId, enableOutput, 1, inputPair, useNetworkInput, -1, false, false, usbInputBitDepth, usbOutputBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
             if (started) lastError = "USB 输入驱动拒绝立体声，已回退为单声道"
         }
-        if (started) isRunning = true
+        if (started) {
+            isRunning = true
+            applyWifiLowLatencyLock()
+        }
         else { clearBluetoothRoute(); lastError = "AAudio stream open failed; check microphone and speaker settings" }
         if (isRunning) {
             activeInputDeviceId = inputDeviceId
@@ -698,7 +733,7 @@ class AudioEngine(private val context: Context) {
         }
         recordingTarget = null
     }
-    fun stop() { if (isRecording) setRecording(false); routeHandler.removeCallbacks(routeRestart); routeHandler.removeCallbacks(routeRefresh); routeHandler.removeCallbacks(wifiHealthMonitor); routeHandler.removeCallbacks(bluetoothRouteMonitor); NativeAudio.stop(); usbConnection?.close(); usbConnection = null; clearBluetoothRoute(); activeInputDeviceId = -1; activeOutputDeviceId = -1; usbOutputHostActive = false; observedBluetoothDeviceId = Int.MIN_VALUE; bluetoothRetryCount = 0; nextBluetoothRetryAtMs = 0L; isRecording = false; isRunning = false }
+    fun stop() { if (isRecording) setRecording(false); routeHandler.removeCallbacks(routeRestart); routeHandler.removeCallbacks(routeRefresh); routeHandler.removeCallbacks(wifiHealthMonitor); routeHandler.removeCallbacks(bluetoothRouteMonitor); NativeAudio.stop(); releaseWifiLowLatencyLock(); usbConnection?.close(); usbConnection = null; clearBluetoothRoute(); activeInputDeviceId = -1; activeOutputDeviceId = -1; usbOutputHostActive = false; observedBluetoothDeviceId = Int.MIN_VALUE; bluetoothRetryCount = 0; nextBluetoothRetryAtMs = 0L; isRecording = false; isRunning = false }
     fun refreshNativeParameters() { pushNativeParameters() }
     fun configureTone(enabled: Boolean) {
         if (NativeAudio.available) NativeAudio.configureTone(enabled, toneWaveform, toneMusic, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevel)

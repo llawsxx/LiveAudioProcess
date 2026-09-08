@@ -224,6 +224,12 @@ typedef struct {
     atomic_ullong net_last_packet_ns;
     atomic_int net_buffer_ms;
     atomic_ullong net_min_buffer_events, net_max_buffer_events;
+    uint64_t net_tx_stats_start_ns;
+    uint64_t net_tx_prev_ns;
+    uint32_t net_tx_prev_frames;
+    uint64_t net_tx_packet_count, net_tx_byte_count;
+    double net_tx_jitter_ewma_ms;
+    double net_jitter_max_ms;
     NetJitterSlot *net_jitter;
     NetCompressedJitterSlot *net_aac_jitter;
     NetCompressedJitterSlot *net_opus_jitter;
@@ -1198,6 +1204,27 @@ static void network_tcp_flush(void) {
         g.net_tx_blocked_since_ns=now_ns();
     }
 }
+static void network_record_tx_packet(const uint8_t *packet, size_t size) {
+    if (!packet || size < sizeof(NetHeader)) return;
+    NetHeader header;
+    memcpy(&header, packet, sizeof(header));
+    uint64_t now = now_ns();
+    if (g.net_tx_stats_start_ns == 0) g.net_tx_stats_start_ns = now;
+    g.net_tx_packet_count++;
+    g.net_tx_byte_count += size;
+    if (g.net_tx_prev_ns != 0 && g.rate > 0) {
+        uint64_t actual_ns = now >= g.net_tx_prev_ns ? now - g.net_tx_prev_ns : 0;
+        uint64_t expected_ns = (uint64_t)(g.net_tx_prev_frames ? g.net_tx_prev_frames : header.frames) * 1000000000ull / (uint32_t)g.rate;
+        uint64_t deviation_ns = actual_ns >= expected_ns ? actual_ns - expected_ns : expected_ns - actual_ns;
+        if (deviation_ns > 1000000000ull) deviation_ns = 1000000000ull;
+        double sample_ms = (double)deviation_ns / 1000000.0;
+        if (g.net_tx_packet_count == 1) g.net_tx_jitter_ewma_ms = sample_ms;
+        else g.net_tx_jitter_ewma_ms += (sample_ms - g.net_tx_jitter_ewma_ms) / 16.0;
+    }
+    g.net_tx_prev_ns = now;
+    g.net_tx_prev_frames = header.frames;
+}
+
 static void network_write_packet(const uint8_t *packet, size_t size) {
     if(!packet||size==0)return;
     if(g.net_transport==NET_TRANSPORT_TCP) {
@@ -1210,13 +1237,14 @@ static void network_write_packet(const uint8_t *packet, size_t size) {
         memcpy(g.net_tx_buffer+g.net_tx_used,&wire_len,sizeof(wire_len));
         memcpy(g.net_tx_buffer+g.net_tx_used+sizeof(wire_len),packet,size);
         g.net_tx_used+=total;
+        network_record_tx_packet(packet, size);
         if(g.net_tx_blocked_since_ns==0)g.net_tx_blocked_since_ns=now_ns();
         network_tcp_flush();
     } else {
         if(g.net_sock<0)return;
         ssize_t sent=sendto(g.net_sock,packet,size,0,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr));
         if(sent<0)network_set_error(NET_ERROR_CONNECT,errno,g.net_port);
-        else network_set_error(NET_ERROR_NONE,0,0);
+        else { network_set_error(NET_ERROR_NONE,0,0); if ((size_t)sent == size) network_record_tx_packet(packet, size); }
     }
 }
 static void network_send_pcm_packet(const float *data, int frames) {
@@ -1227,14 +1255,7 @@ static void network_send_pcm_packet(const float *data, int frames) {
     size_t packet_size=sizeof(NetHeader)+(size_t)frames*2*sizeof(float);
     memcpy(packet,&h,sizeof(h));
     memcpy(packet+sizeof(h),data,(size_t)frames*2*sizeof(float));
-    if(g.net_transport==NET_TRANSPORT_TCP) {
-        network_write_packet(packet,packet_size);
-    } else {
-        ssize_t expected=(ssize_t)packet_size;
-        ssize_t sent=sendto(g.net_sock,packet,packet_size,0,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr));
-        if(sent!=expected && (h.sequence==0 || h.sequence%100==0))
-        LOGI("Wi-Fi send dropped sequence=%u bytes=%zd/%zd",h.sequence,sent,expected);
-    }
+    network_write_packet(packet,packet_size);
     if(h.sequence==0)
         LOGI("Wi-Fi protocol v%d PCM packet: frames=%d bytes=%zu",NET_PROTOCOL_VERSION,
              frames,packet_size);
@@ -1375,6 +1396,13 @@ static void network_clear_jitter_state_unlocked(void) {
     g.net_arrival_initialized=0;
     g.net_jitter_samples=0;
     g.net_jitter_ewma_ms=0.0;
+    g.net_jitter_max_ms=0.0;
+    g.net_tx_stats_start_ns=0;
+    g.net_tx_prev_ns=0;
+    g.net_tx_prev_frames=0;
+    g.net_tx_packet_count=0;
+    g.net_tx_byte_count=0;
+    g.net_tx_jitter_ewma_ms=0.0;
     g.net_observed_packet_frames=0;
     g.net_play_phase=0.0;
     g.net_playback_ratio=1.0;
@@ -1447,6 +1475,7 @@ static void network_update_jitter_estimate(const NetHeader *h, uint64_t arrival_
     double sample_ms = (double)deviation_ns / 1000000.0;
     if (g.net_jitter_samples == 0) g.net_jitter_ewma_ms = sample_ms;
     else g.net_jitter_ewma_ms += (sample_ms - g.net_jitter_ewma_ms) / 16.0;
+    if (sample_ms > g.net_jitter_max_ms) g.net_jitter_max_ms = sample_ms;
     if (g.net_jitter_samples < 1000000u) g.net_jitter_samples++;
     g.net_arrival_prev_ns = arrival_ns;
     g.net_arrival_prev_sequence = h->sequence;
@@ -2678,18 +2707,37 @@ JNIEXPORT jintArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkErr
 JNIEXPORT jlongArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkReceiveStats(JNIEnv*e,jobject o){
     (void)o;
     pthread_mutex_lock(&g.net_rx_lock);
-    jlong values[7]={
+    jlong values[8]={
         (jlong)atomic_load(&g.net_buffer_ms),
         (jlong)atomic_load(&g.net_min_buffer_events),
         (jlong)atomic_load(&g.net_max_buffer_events),
         (jlong)g.net_min_ms,
         (jlong)g.net_max_ms,
         (jlong)network_target_buffer_ms(),
-        (jlong)llround(g.net_jitter_ewma_ms * 10.0)
+        (jlong)llround(g.net_jitter_ewma_ms * 10.0),
+        (jlong)llround(g.net_jitter_max_ms * 10.0)
     };
     pthread_mutex_unlock(&g.net_rx_lock);
-    jlongArray result=(*e)->NewLongArray(e,7);
-    if(result)(*e)->SetLongArrayRegion(e,result,0,7,values);
+    jlongArray result=(*e)->NewLongArray(e,8);
+    if(result)(*e)->SetLongArrayRegion(e,result,0,8,values);
+    return result;
+}
+JNIEXPORT jlongArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkTransmitStats(JNIEnv*e,jobject o){
+    (void)o;
+    pthread_mutex_lock(&g.net_rx_lock);
+    uint64_t now=now_ns();
+    uint64_t elapsed=now>g.net_tx_stats_start_ns?now-g.net_tx_stats_start_ns:0;
+    jlong values[6]={
+        (jlong)g.net_transport,
+        (jlong)g.net_codec,
+        (jlong)g.net_bitrate,
+        elapsed>0?(jlong)((g.net_tx_byte_count*1000000000ull)/elapsed):0,
+        elapsed>0?(jlong)((g.net_tx_packet_count*1000000000ull)/elapsed):0,
+        (jlong)llround(g.net_tx_jitter_ewma_ms*10.0)
+    };
+    pthread_mutex_unlock(&g.net_rx_lock);
+    jlongArray result=(*e)->NewLongArray(e,6);
+    if(result)(*e)->SetLongArrayRegion(e,result,0,6,values);
     return result;
 }
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearNetworkReceiveStats(JNIEnv*e,jobject o){
@@ -2699,6 +2747,7 @@ JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearNetworkRec
     atomic_store(&g.net_max_buffer_events,0);
     g.net_min_boundary_latched=0;
     g.net_max_boundary_latched=0;
+    g.net_jitter_max_ms=0.0;
     pthread_mutex_unlock(&g.net_rx_lock);
 }
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetworkClockCorrection(JNIEnv*e,jobject o,jboolean enabled){

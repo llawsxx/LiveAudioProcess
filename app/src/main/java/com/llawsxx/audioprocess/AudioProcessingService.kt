@@ -150,6 +150,7 @@ class AudioProcessingService : Service() {
                 .getOrElse { p.getString("wifiPacketDurationMs", "20")?.toIntOrNull() ?: 20 }
                 .coerceIn(1, 100)
             engine.wifiClockCorrectionEnabled = p.getBoolean("wifiClockCorrectionEnabled", false)
+            engine.wifiLowLatencyEnabled = p.getBoolean("wifiLowLatencyEnabled", false)
             engine.wifiOpusFrameMs = p.getInt("wifiOpusFrameMs", 20).let { if (it in listOf(5, 10, 20, 40, 60)) it else 20 }
             engine.wifiOpusProfile = p.getInt("wifiOpusProfile", 0).coerceIn(0, 2)
             engine.wifiDynamicBufferEnabled = p.getBoolean("wifiDynamicBufferEnabled", true)

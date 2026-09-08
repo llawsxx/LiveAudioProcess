@@ -25,6 +25,7 @@ object NativeAudio {
     external fun clearNetwork()
     external fun networkErrorInfo(): IntArray
     external fun networkReceiveStats(): LongArray
+    external fun networkTransmitStats(): LongArray
     external fun clearNetworkReceiveStats()
     external fun configureNetworkClockCorrection(enabled: Boolean)
     external fun configureNetworkOpus(frameMs: Int, application: Int)

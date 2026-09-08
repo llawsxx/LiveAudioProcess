@@ -67,6 +67,8 @@ fun WifiAudioPanel(
     onInputTimeout: (String) -> Unit,
     clockCorrectionEnabled: Boolean,
     onClockCorrectionEnabled: (Boolean) -> Unit,
+    wlanLowLatencyEnabled: Boolean,
+    onWlanLowLatencyEnabled: (Boolean) -> Unit,
     dynamicBufferEnabled: Boolean,
     onDynamicBufferEnabled: (Boolean) -> Unit,
     manualBufferBias: Float,
@@ -131,6 +133,17 @@ fun WifiAudioPanel(
                     Text("Adaptive playback rate: ±1%", color = WifiMuted, fontSize = 10.sp)
                 }
                 Switch(checked = clockCorrectionEnabled, onCheckedChange = onClockCorrectionEnabled)
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("WLAN LOW LATENCY", color = Color.White, fontSize = 11.sp)
+                    Text("Android 10+ Wi-Fi performance lock", color = WifiMuted, fontSize = 10.sp)
+                }
+                Switch(checked = wlanLowLatencyEnabled, onCheckedChange = onWlanLowLatencyEnabled)
             }
             Text("Wi-Fi 实时音频", color = Color.White, fontWeight = FontWeight.Bold)
 
