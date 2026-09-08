@@ -196,6 +196,7 @@ typedef struct {
     int net_arrival_initialized;
     unsigned int net_jitter_samples;
     double net_jitter_ewma_ms;
+    uint32_t net_observed_packet_frames;
     atomic_int net_clock_correction_enabled;
     atomic_int net_target_dynamic_enabled;
     atomic_int net_target_bias_permille;
@@ -1314,6 +1315,7 @@ static void network_clear_jitter_state_unlocked(void) {
     g.net_arrival_initialized=0;
     g.net_jitter_samples=0;
     g.net_jitter_ewma_ms=0.0;
+    g.net_observed_packet_frames=0;
     g.net_play_phase=0.0;
     g.net_playback_ratio=1.0;
     atomic_store(&g.net_buffer_ms,0);
@@ -1387,7 +1389,10 @@ static int network_target_buffer_ms(void) {
     int min_ms = g.net_min_ms < 0 ? 0 : g.net_min_ms;
     int max_ms = g.net_max_ms > 0 ? g.net_max_ms : min_ms;
     int packet_ms = g.net_packet_ms > 0 ? g.net_packet_ms : 1;
-    if (g.net_codec == 1 && g.net_aac_frames_per_packet > 0 && g.rate > 0) {
+    if (g.net_observed_packet_frames > 0 && g.rate > 0) {
+        packet_ms = (int)(((uint64_t)g.net_observed_packet_frames * 1000ull +
+                           (uint32_t)g.rate - 1u) / (uint32_t)g.rate);
+    } else if (g.net_codec == 1 && g.net_aac_frames_per_packet > 0 && g.rate > 0) {
         packet_ms = (int)(((int64_t)g.net_aac_frames_per_packet * NET_AAC_FRAMES * 1000ll +
                            g.rate - 1) / g.rate);
     } else if (g.net_codec == 0 && g.net_pcm_packet_frames > 0 && g.rate > 0) {
@@ -1698,6 +1703,10 @@ static void network_process_packet(const uint8_t *packet, size_t n) {
         network_store_aac_packet(&h,packet+sizeof(NetHeader),
                                  (uint32_t)(n-sizeof(NetHeader)));
     } else return;
+    /* Target buffering must follow the packet actually received from the
+     * sender. The UI packet-duration field is only a sender hint and may be
+     * stale or different on the two devices. */
+    g.net_observed_packet_frames=h.frames;
     network_update_jitter_estimate(&h,arrival);
     atomic_store(&g.net_last_packet_ns,arrival);
     if(!atomic_exchange(&g.net_packet_seen,1))
