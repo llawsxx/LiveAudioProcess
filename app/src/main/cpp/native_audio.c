@@ -1991,13 +1991,52 @@ static void network_fill(void) {
     pthread_mutex_unlock(&g.net_rx_lock);
 }
 
+/* Wait in the kernel until the receiver socket is readable.  The socket
+ * itself remains non-blocking so network_fill() can drain all packets without
+ * holding net_rx_lock while waiting for a future packet. */
+static void network_wait_for_receive(void) {
+    struct pollfd pfd;
+    int fd = -1;
+    memset(&pfd, 0, sizeof(pfd));
+    pthread_mutex_lock(&g.net_rx_lock);
+    if (atomic_load(&g.net_role) == 2) {
+        if (g.net_transport == NET_TRANSPORT_TCP)
+            fd = g.net_sock >= 0 ? g.net_sock : g.net_listen_sock;
+        else
+            fd = g.net_sock;
+    }
+    pthread_mutex_unlock(&g.net_rx_lock);
+    if (fd < 0) {
+        /* No client/socket yet (for example TCP server waiting for a client).
+         * A short poll timeout avoids busy looping and also observes stop or
+         * reconfiguration promptly. */
+        poll(NULL, 0, 20);
+        return;
+    }
+    pfd.fd = fd;
+    pfd.events = POLLIN | POLLERR | POLLHUP;
+    while (atomic_load(&g.net_rx_worker_running)) {
+        int result = poll(&pfd, 1, 100);
+        if (result != 0 || !atomic_load(&g.net_rx_worker_running)) return;
+        /* Recheck the socket every 100 ms so shutdown/reconfiguration cannot
+         * leave the worker asleep indefinitely. */
+        pthread_mutex_lock(&g.net_rx_lock);
+        int current_fd = atomic_load(&g.net_role) == 2
+                ? (g.net_transport == NET_TRANSPORT_TCP
+                   ? (g.net_sock >= 0 ? g.net_sock : g.net_listen_sock)
+                   : g.net_sock)
+                : -1;
+        pthread_mutex_unlock(&g.net_rx_lock);
+        if (current_fd != fd) return;
+    }
+}
+
 static void *network_receive_thread(void *unused) {
     (void)unused;
     while (atomic_load(&g.net_rx_worker_running)) {
+        if (!atomic_load(&g.running)) break;
+        network_wait_for_receive();
         if (atomic_load(&g.running)) network_fill();
-        /* Keep polling independent of the audio callback cadence while
-         * yielding enough CPU for the DSP and platform threads. */
-        usleep(1000);
     }
     return NULL;
 }
