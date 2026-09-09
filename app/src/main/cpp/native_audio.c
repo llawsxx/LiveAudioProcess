@@ -2,6 +2,8 @@
 #include <jni.h>
 #include <android/log.h>
 #include <errno.h>
+#include <limits.h>
+#include <linux/futex.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -17,6 +19,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -242,12 +245,14 @@ typedef struct {
     atomic_int output_buffer_max_ms;
     float *input_ring;
     uint32_t input_ring_capacity;
+    atomic_uint input_ring_wakeup;
     atomic_uint input_write_frame, input_read_frame;
     atomic_uint input_callback_overruns, input_buffer_clears;
     atomic_int input_buffer_max_ms;
     atomic_int input_error;
     float *output_ring;
     uint32_t output_ring_capacity;
+    atomic_uint output_ring_wakeup;
     atomic_uint output_prefill_frames, output_queue_limit;
     atomic_uint output_write_frame, output_read_frame;
     atomic_uint output_callback_underflows, output_buffer_clears;
@@ -313,6 +318,32 @@ static void network_close_socket(int *fd) {
     *fd = -1;
 }
 
+/* Lock-free binary futex event for the SPSC audio rings.  Waiters clear the
+ * state and recheck the ring before sleeping; producers set it and wake.  The
+ * recheck closes the clear-to-wait race, while the binary state avoids ABA from
+ * a wrapping event counter. */
+static void ring_notify(atomic_uint *state) {
+    atomic_store_explicit(state, 1u, memory_order_release);
+    syscall(SYS_futex, (int *)state, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+}
+
+static void ring_prepare_wait(atomic_uint *state) {
+    atomic_store_explicit(state, 0u, memory_order_release);
+}
+
+static void ring_wait(atomic_uint *state) {
+    while (atomic_load_explicit(state, memory_order_acquire) == 0u) {
+        int rc = (int)syscall(SYS_futex, (int *)state, FUTEX_WAIT_PRIVATE,
+                              0, NULL, NULL, 0);
+        if (rc < 0 && errno != EINTR && errno != EAGAIN) break;
+    }
+}
+
+static void ring_wake_all(void) {
+    ring_notify(&g.input_ring_wakeup);
+    ring_notify(&g.output_ring_wakeup);
+}
+
 #define NET_MAGIC 0x50464C58u
 
 enum { DSP_ON=1, EQ_ON=2, REVERB_ON=4, LIMITER_ON=8, LOUDNESS_ON=16 };
@@ -350,6 +381,7 @@ static int input_ring_create(int frames_per_burst, int processing_frames) {
     if (required < 4096u) required = 4096u;
     g.input_ring_capacity = next_power_of_two(required);
     g.input_ring = calloc((size_t)g.input_ring_capacity * channels, sizeof(float));
+    atomic_store(&g.input_ring_wakeup, 0u);
     atomic_store(&g.input_write_frame, 0);
     atomic_store(&g.input_read_frame, 0);
     atomic_store(&g.input_callback_overruns, 0);
@@ -358,6 +390,7 @@ static int input_ring_create(int frames_per_burst, int processing_frames) {
 }
 
 static void input_ring_destroy(void) {
+    ring_notify(&g.input_ring_wakeup);
     free(g.input_ring);
     g.input_ring = NULL;
     g.input_ring_capacity = 0;
@@ -382,7 +415,12 @@ static int input_ring_read(float *data, uint32_t frames) {
             continue;
         }
         if (available <= g.input_ring_capacity && available >= frames) break;
-        usleep(250);
+        ring_prepare_wait(&g.input_ring_wakeup);
+        write = atomic_load_explicit(&g.input_write_frame, memory_order_acquire);
+        read = atomic_load_explicit(&g.input_read_frame, memory_order_relaxed);
+        available = write - read;
+        if (available <= g.input_ring_capacity && available >= frames) continue;
+        ring_wait(&g.input_ring_wakeup);
     }
     if (!atomic_load(&g.running) || atomic_load(&g.input_error) != AAUDIO_OK) return 0;
     uint32_t channels = (uint32_t)g.in_channels;
@@ -423,6 +461,7 @@ static aaudio_data_callback_result_t input_data_callback(
         memcpy(g.input_ring, source + (size_t)first * channels,
                (size_t)(frames - first) * channels * sizeof(float));
     atomic_store_explicit(&g.input_write_frame, write + frames, memory_order_release);
+    ring_notify(&g.input_ring_wakeup);
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -430,6 +469,7 @@ static void input_error_callback(AAudioStream *stream, void *user_data, aaudio_r
     (void)stream;
     (void)user_data;
     atomic_store(&g.input_error, error);
+    ring_notify(&g.input_ring_wakeup);
     LOGE("AAudio input stream error: %d", error);
 }
 
@@ -454,6 +494,7 @@ static void output_ring_update_limits(int sample_rate, int processing_frames) {
     if (prefill > limit) prefill = limit;
     atomic_store_explicit(&g.output_prefill_frames, prefill, memory_order_release);
     atomic_store_explicit(&g.output_queue_limit, limit, memory_order_release);
+    ring_notify(&g.output_ring_wakeup);
 }
 
 static int output_ring_create(int frames_per_burst, int processing_frames, int sample_rate) {
@@ -466,6 +507,7 @@ static int output_ring_create(int frames_per_burst, int processing_frames, int s
     g.output_ring_capacity = next_power_of_two(required);
     g.output_ring = calloc((size_t)g.output_ring_capacity * 2u, sizeof(float));
     if (!g.output_ring) return 0;
+    atomic_store(&g.output_ring_wakeup, 0u);
     output_ring_update_limits(sample_rate, processing_frames);
     atomic_store(&g.output_write_frame, 0);
     atomic_store(&g.output_read_frame, 0);
@@ -476,6 +518,7 @@ static int output_ring_create(int frames_per_burst, int processing_frames, int s
 }
 
 static void output_ring_destroy(void) {
+    ring_notify(&g.output_ring_wakeup);
     free(g.output_ring);
     g.output_ring = NULL;
     g.output_ring_capacity = 0;
@@ -499,7 +542,12 @@ static int output_ring_write(const float *data, uint32_t frames) {
         if (limit == 0 || limit > g.output_ring_capacity)
             limit = g.output_ring_capacity;
         if (queued <= limit && frames <= limit - queued) break;
-        usleep(250);
+        ring_prepare_wait(&g.output_ring_wakeup);
+        write = atomic_load_explicit(&g.output_write_frame, memory_order_relaxed);
+        read = atomic_load_explicit(&g.output_read_frame, memory_order_acquire);
+        queued = write - read;
+        if (queued <= limit && frames <= limit - queued) continue;
+        ring_wait(&g.output_ring_wakeup);
     }
     if (!atomic_load(&g.running)) return 0;
     uint32_t offset = write & (g.output_ring_capacity - 1u);
@@ -533,6 +581,7 @@ static aaudio_data_callback_result_t output_data_callback(
                                               memory_order_acquire);
         atomic_store_explicit(&g.output_read_frame, write, memory_order_release);
         atomic_store_explicit(&g.output_callback_started, 0, memory_order_relaxed);
+        ring_notify(&g.output_ring_wakeup);
         unsigned int count = atomic_fetch_add(&g.output_buffer_clears, 1) + 1;
         if (count == 1 || count % 100 == 0)
             LOGI("AAudio output buffer cleared: queued=%u limit=%u count=%u",
@@ -574,6 +623,7 @@ static aaudio_data_callback_result_t output_data_callback(
     }
     g.output_resample_phase = end_position - (double)source_needed;
     atomic_store_explicit(&g.output_read_frame, read + source_needed, memory_order_release);
+    ring_notify(&g.output_ring_wakeup);
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -581,6 +631,7 @@ static void output_error_callback(AAudioStream *stream, void *user_data, aaudio_
     (void)stream;
     (void)user_data;
     atomic_store(&g.output_error, error);
+    ring_notify(&g.output_ring_wakeup);
     LOGE("AAudio output stream error: %d", error);
 }
 
@@ -2448,6 +2499,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
     return JNI_TRUE;
 fail:
     atomic_store(&g.running,0);
+    ring_wake_all();
     atomic_store(&g.net_rx_worker_running,0);
     if (atomic_exchange(&g.net_rx_worker_started,0)) pthread_join(g.net_rx_thread,NULL);
     atomic_store(&g.tone_enabled,0);
@@ -2475,6 +2527,10 @@ fail:
  * teardown/reconnect cycle. A full stop still closes all network resources. */
 static void native_stop_internal(int finalize_recording, int preserve_network) {
     int was_running = atomic_exchange(&g.running,0);
+    /* Wake DSP/audio-side producers and consumers before joining the audio
+     * thread. They may be sleeping in a futex while waiting for ring data or
+     * free space, and running=0 is otherwise not itself a wakeup event. */
+    ring_wake_all();
     atomic_store(&g.tone_enabled,0);
     /* A disconnected USB OUT endpoint no longer drains its ring. Wake a DSP
      * thread blocked in usb_host_audio_write() before waiting for that thread;
