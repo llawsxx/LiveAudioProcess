@@ -2,6 +2,7 @@ package com.llawsxx.audioprocess
 
 import android.Manifest
 import android.app.Activity
+import android.app.ActivityManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -11,6 +12,8 @@ import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbManager
+import android.os.BatteryManager
+import android.os.Debug
 import android.os.Bundle
 import android.os.Build
 import android.view.WindowManager
@@ -43,6 +46,8 @@ import com.llawsxx.audioprocess.ui.theme.LiveAudioProcessTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import kotlin.math.roundToInt
 
 private data class NetworkStatsSnapshot(
@@ -51,6 +56,52 @@ private data class NetworkStatsSnapshot(
     val receive: LongArray,
     val transmit: LongArray
 )
+
+private data class DeviceInfoSnapshot(
+    val processMemoryMb: Int = 0,
+    val totalMemoryMb: Int = 0,
+    val currentMa: Int? = null,
+    val powerMw: Int? = null,
+    val temperatureC: Float? = null,
+    val ips: List<String> = emptyList()
+)
+
+private fun readDeviceInfo(context: Context): DeviceInfoSnapshot {
+    val activity = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+    val memory = ActivityManager.MemoryInfo().also(activity::getMemoryInfo)
+    val processMemory = Debug.MemoryInfo().also { Debug.getMemoryInfo(it) }
+    val batteryManager = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+    val battery = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+    val propertyCurrent = runCatching {
+        batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
+    }.getOrDefault(Int.MIN_VALUE)
+    val currentMicroAmps = propertyCurrent.takeUnless { it == Int.MIN_VALUE || it == 0 }
+        ?: battery?.getIntExtra("current_now", Int.MIN_VALUE)?.takeUnless { it == Int.MIN_VALUE || it == 0 }
+    val voltageMv = battery?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0)?.takeIf { it > 0 }
+    val temp = battery?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
+        ?.takeUnless { it == Int.MIN_VALUE }
+        ?.div(10f)
+    val currentMa = currentMicroAmps?.let { kotlin.math.abs(it) / 1000 }
+    val powerMw = if (currentMicroAmps != null && voltageMv != null) {
+        (kotlin.math.abs(currentMicroAmps.toLong()) * voltageMv / 1_000_000L).toInt()
+    } else null
+    val ips = runCatching {
+        NetworkInterface.getNetworkInterfaces().asSequence().toList().flatMap { iface ->
+            if (!iface.isUp || iface.isLoopback) emptyList()
+            else iface.inetAddresses.toList().filterIsInstance<Inet4Address>()
+                .filterNot { it.isLoopbackAddress }
+                .map { it.hostAddress }
+        }.distinct().sorted()
+    }.getOrDefault(emptyList())
+    return DeviceInfoSnapshot(
+        processMemoryMb = (processMemory.totalPss / 1024f).roundToInt(),
+        totalMemoryMb = ((memory.totalMem - memory.availMem) / (1024L * 1024L)).toInt(),
+        currentMa = currentMa,
+        powerMw = powerMw,
+        temperatureC = temp,
+        ips = ips
+    )
+}
 
 class MainActivity : ComponentActivity() {
     private val usbPermissionAction = "com.llawsxx.audioprocess.USB_AUDIO_PERMISSION"
@@ -178,7 +229,7 @@ private fun LiveAudioProcessApp() {
     var effects by remember { mutableStateOf(EffectSettings.load(prefs)) }
     // Keep the processing chain on its own page while preserving the
     // selection across activity recreation.
-    var currentPage by remember { mutableIntStateOf(prefs.getInt("mainPage", 0).coerceIn(0, 2)) }
+    var currentPage by remember { mutableIntStateOf(prefs.getInt("mainPage", 0).coerceIn(0, 3)) }
     val consoleScrollState = rememberScrollState()
     val processingScrollState = rememberScrollState()
     val logScrollState = rememberScrollState()
@@ -225,6 +276,7 @@ private fun LiveAudioProcessApp() {
     var wifiReceiveStats by remember { mutableStateOf(LongArray(8)) }
     var wifiTransmitStats by remember { mutableStateOf(LongArray(6)) }
     var nativeLogs by remember { mutableStateOf(emptyList<String>()) }
+    var deviceInfo by remember { mutableStateOf(DeviceInfoSnapshot()) }
     var systemInputBufferMaxMs by remember { mutableStateOf(prefs.getInt("systemInputBufferMaxMs", 20).coerceIn(5, 200).toString()) }
     val legacySystemOutputBufferMs = if (prefs.contains("systemOutputBufferBursts")) {
         (prefs.getInt("systemOutputBufferBursts", 4) * 2).coerceIn(5, 200)
@@ -287,6 +339,13 @@ private fun LiveAudioProcessApp() {
         while (true) {
             nativeLogs = if (NativeAudio.available) NativeAudio.logs().toList() else emptyList()
             delay(500)
+        }
+    }
+    LaunchedEffect(currentPage) {
+        if (currentPage != 3) return@LaunchedEffect
+        while (true) {
+            deviceInfo = withContext(Dispatchers.Default) { readDeviceInfo(context) }
+            delay(1000)
         }
     }
     LaunchedEffect(recording) { while (recording) { delay(1000); elapsed++ } }
@@ -563,6 +622,11 @@ private fun LiveAudioProcessApp() {
                     },
                     text = { Text("日志") }
                 )
+                Tab(
+                    selected = currentPage == 3,
+                    onClick = { currentPage = 3; prefs.edit().putInt("mainPage", 3).apply() },
+                    text = { Text("信息") }
+                )
             }
             if (currentPage == 0) {
             ScreenAlwaysOnOption(screenAlwaysOn) { enabled ->
@@ -622,8 +686,10 @@ private fun LiveAudioProcessApp() {
                 UnifiedEffectsPanel(effects) { effects = it }
                 EqBandsPanel(effects) { effects = it }
                 Spacer(Modifier.height(12.dp))
-            } else {
+            } else if (currentPage == 2) {
                 LogPanel(nativeLogs, { NativeAudio.clearLogs(); nativeLogs = emptyList() })
+            } else {
+                DeviceInfoPanel(deviceInfo)
             }
         }
     }
@@ -915,6 +981,26 @@ private fun LogPanel(lines: List<String>, onClear: () -> Unit) {
         Text("SPEED ${bytesPerSecond / 1024} KB/s", color = Muted, fontSize = 10.sp)
         Text("${packetsPerSecond} pkt/s", color = Color.White, fontSize = 11.sp)
         Text("JITTER %.1f ms".format(jitterTenthsMs / 10f), color = Color.White, fontSize = 11.sp)
+    }
+}
+
+@Composable private fun DeviceInfoPanel(info: DeviceInfoSnapshot) {
+    Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            SectionTitle("信息", "DEVICE INFO")
+            InfoRow("内存占用", "${info.processMemoryMb} MB / ${info.totalMemoryMb} MB")
+            InfoRow("当前耗电", info.currentMa?.let { "${it} mA" } ?: "不可用")
+            InfoRow("当前功率", info.powerMw?.let { "${it} mW" } ?: "不可用")
+            InfoRow("温度", info.temperatureC?.let { "%.1f °C".format(it) } ?: "不可用")
+            InfoRow("本机 IP", info.ips.ifEmpty { listOf("不可用") }.joinToString("  "))
+        }
+    }
+}
+
+@Composable private fun InfoRow(label: String, value: String) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = Muted, fontSize = 12.sp)
+        Text(value, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 @Composable private fun WaveformView(label: String, data: FloatArray, offset: Int, tint: Color) { Row(verticalAlignment = Alignment.CenterVertically) { Text(label, color = Muted, fontSize = 9.sp, modifier = Modifier.width(86.dp)); Canvas(Modifier.weight(1f).height(48.dp).clip(RoundedCornerShape(5.dp))) { drawRect(Color(0xFF1B2529)); val n = minOf(512, data.size - offset); if (n > 1) { val path = androidx.compose.ui.graphics.Path(); for (i in 0 until n) { val x = size.width * i / (n - 1).toFloat(); val y = size.height * (0.5f - data[offset + i].coerceIn(-1f, 1f) * 0.45f); if (i == 0) path.moveTo(x, y) else path.lineTo(x, y) }; drawPath(path, tint, style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.5.dp.toPx())) } } } }
