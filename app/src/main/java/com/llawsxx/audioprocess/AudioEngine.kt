@@ -43,6 +43,7 @@ class AudioEngine(private val context: Context) {
     @Volatile private var displayedWifiErrorNotice: String? = null
     @Volatile var wifiInputTimeoutMs = 1_000
     @Volatile var wifiClockCorrectionEnabled = false
+    @Volatile var wifiClockCorrectionPpm = 100
     @Volatile var wifiLowLatencyEnabled = false
     @Volatile var wifiDynamicBufferEnabled = true
     @Volatile var wifiManualBufferBias = 0.5f
@@ -208,6 +209,7 @@ class AudioEngine(private val context: Context) {
         val nativeError = nativeWifiError()
         if (!configured) NativeAudio.clearNetwork()
         NativeAudio.configureNetworkClockCorrection(configured && wifiClockCorrectionEnabled && role == 2)
+        NativeAudio.configureNetworkClockCorrectionLimitPpm(wifiClockCorrectionPpm)
         NativeAudio.configureNetworkTargetBuffer(wifiDynamicBufferEnabled, (wifiManualBufferBias.coerceIn(0f, 1f) * 1000f).roundToInt())
         networkRole = if (configured) role else 0
         if (role != 1) { wifiReconnectCount = 0; wifiReconnectPending = false }

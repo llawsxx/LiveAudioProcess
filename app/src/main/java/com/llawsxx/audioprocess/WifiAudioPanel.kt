@@ -72,7 +72,9 @@ fun WifiAudioPanel(
     dynamicBufferEnabled: Boolean,
     onDynamicBufferEnabled: (Boolean) -> Unit,
     manualBufferBias: Float,
-    onManualBufferBias: (Float) -> Unit
+    onManualBufferBias: (Float) -> Unit,
+    clockCorrectionPpm: Int = 100,
+    onClockCorrectionPpm: (Int) -> Unit = {}
 ) {
     val requestedPacketMs = packetDuration.toIntOrNull()?.coerceIn(1, 100) ?: 20
     val opusPacketFrames = sampleRate * opusFrameMs / 1000
@@ -134,6 +136,22 @@ fun WifiAudioPanel(
                 }
                 Switch(checked = clockCorrectionEnabled, onCheckedChange = onClockCorrectionEnabled)
             }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("CORRECTION LIMIT", color = WifiMuted, fontSize = 11.sp)
+                Text("±$clockCorrectionPpm ppm", color = WifiTeal, fontSize = 11.sp)
+            }
+            Slider(
+                value = clockCorrectionPpm.coerceIn(1, 200).toFloat(),
+                onValueChange = { onClockCorrectionPpm(it.roundToInt().coerceIn(1, 200)) },
+                valueRange = 1f..200f,
+                steps = 198,
+                enabled = clockCorrectionEnabled,
+                modifier = Modifier.fillMaxWidth()
+            )
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,

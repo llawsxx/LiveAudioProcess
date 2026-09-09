@@ -211,6 +211,7 @@ typedef struct {
     double net_jitter_ewma_ms;
     uint32_t net_observed_packet_frames;
     atomic_int net_clock_correction_enabled;
+    atomic_int net_clock_correction_limit_ppm;
     atomic_int net_target_dynamic_enabled;
     atomic_int net_target_bias_permille;
     double net_play_phase;
@@ -296,6 +297,7 @@ static Engine g = {
     .net_opus_application = WIFI_OPUS_APPLICATION_AUDIO,
     .net_target_dynamic_enabled = ATOMIC_VAR_INIT(1),
     .net_target_bias_permille = ATOMIC_VAR_INIT(500),
+    .net_clock_correction_limit_ppm = ATOMIC_VAR_INIT(100),
     .net_max_hold_ms = 1000,
     .param_lock = PTHREAD_MUTEX_INITIALIZER,
     .file_lock = PTHREAD_MUTEX_INITIALIZER,
@@ -1528,6 +1530,7 @@ static void network_update_jitter_estimate(const NetHeader *h, uint64_t arrival_
     else g.net_jitter_ewma_ms += (sample_ms - g.net_jitter_ewma_ms) / 16.0;
     if (sample_ms > g.net_jitter_max_ms) g.net_jitter_max_ms = sample_ms;
     if (g.net_jitter_samples < 1000000u) g.net_jitter_samples++;
+
     g.net_arrival_prev_ns = arrival_ns;
     g.net_arrival_prev_sequence = h->sequence;
     g.net_arrival_prev_frames = packet_frames;
@@ -1675,11 +1678,15 @@ static double network_playback_step(int target_frames) {
     double error=(double)(valid_frames-target_frames)/(double)control_window;
     /* Positive error means the receiver is ahead, so consume source slightly
      * faster; negative error slows consumption and lets the buffer recover. */
-    double correction=clampf((float)(error*0.02),-0.01f,0.01f);
+    int limit_ppm = atomic_load(&g.net_clock_correction_limit_ppm);
+    if (limit_ppm < 1) limit_ppm = 1;
+    if (limit_ppm > 200) limit_ppm = 200;
+    double limit = (double)limit_ppm / 1000000.0;
+    double correction=clampf((float)(error*0.02), (float)-limit, (float)limit);
     double desired=1.0+correction;
     g.net_playback_ratio += (desired-g.net_playback_ratio)*0.05;
-    if (g.net_playback_ratio<0.99) g.net_playback_ratio=0.99;
-    if (g.net_playback_ratio>1.01) g.net_playback_ratio=1.01;
+    if (g.net_playback_ratio<1.0-limit) g.net_playback_ratio=1.0-limit;
+    if (g.net_playback_ratio>1.0+limit) g.net_playback_ratio=1.0+limit;
     return g.net_playback_ratio;
 }
 
@@ -2802,7 +2809,7 @@ JNIEXPORT jintArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkErr
 JNIEXPORT jlongArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkReceiveStats(JNIEnv*e,jobject o){
     (void)o;
     pthread_mutex_lock(&g.net_rx_lock);
-    jlong values[8]={
+    jlong values[9]={
         (jlong)atomic_load(&g.net_buffer_ms),
         (jlong)atomic_load(&g.net_min_buffer_events),
         (jlong)atomic_load(&g.net_max_buffer_events),
@@ -2810,11 +2817,14 @@ JNIEXPORT jlongArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkRe
         (jlong)g.net_max_ms,
         (jlong)network_target_buffer_ms(),
         (jlong)llround(g.net_jitter_ewma_ms * 10.0),
-        (jlong)llround(g.net_jitter_max_ms * 10.0)
+        (jlong)llround(g.net_jitter_max_ms * 10.0),
+        atomic_load(&g.net_clock_correction_enabled)
+                ? (jlong)llround((g.net_playback_ratio - 1.0) * 1000000.0)
+                : 0
     };
     pthread_mutex_unlock(&g.net_rx_lock);
-    jlongArray result=(*e)->NewLongArray(e,8);
-    if(result)(*e)->SetLongArrayRegion(e,result,0,8,values);
+    jlongArray result=(*e)->NewLongArray(e,9);
+    if(result)(*e)->SetLongArrayRegion(e,result,0,9,values);
     return result;
 }
 JNIEXPORT jlongArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkTransmitStats(JNIEnv*e,jobject o){
@@ -2850,6 +2860,15 @@ JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetwor
     pthread_mutex_lock(&g.net_rx_lock);
     atomic_store(&g.net_clock_correction_enabled,enabled?1:0);
     if(!enabled){g.net_play_phase=0.0;g.net_playback_ratio=1.0;}
+    pthread_mutex_unlock(&g.net_rx_lock);
+}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetworkClockCorrectionLimitPpm(JNIEnv*e,jobject o,jint ppm){
+    (void)e;(void)o;
+    int normalized = (int)ppm;
+    if (normalized < 1) normalized = 1;
+    if (normalized > 200) normalized = 200;
+    pthread_mutex_lock(&g.net_rx_lock);
+    atomic_store(&g.net_clock_correction_limit_ppm, normalized);
     pthread_mutex_unlock(&g.net_rx_lock);
 }
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetworkOpus(JNIEnv*e,jobject o,jint frameMs,jint application){
