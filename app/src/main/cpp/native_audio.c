@@ -16,6 +16,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
@@ -214,6 +215,7 @@ typedef struct {
     atomic_int net_clock_correction_limit_ppm;
     atomic_int net_target_dynamic_enabled;
     atomic_int net_target_bias_permille;
+    atomic_int net_qos_enabled;
     double net_play_phase;
     double net_playback_ratio;
     int net_tcp_connecting;
@@ -297,6 +299,7 @@ static Engine g = {
     .net_opus_application = WIFI_OPUS_APPLICATION_AUDIO,
     .net_target_dynamic_enabled = ATOMIC_VAR_INIT(1),
     .net_target_bias_permille = ATOMIC_VAR_INIT(500),
+    .net_qos_enabled = ATOMIC_VAR_INIT(0),
     .net_clock_correction_limit_ppm = ATOMIC_VAR_INIT(100),
     .net_max_hold_ms = 1000,
     .param_lock = PTHREAD_MUTEX_INITIALIZER,
@@ -1186,6 +1189,17 @@ static void network_configure_tcp_buffer(int fd, int role) {
     }
 }
 
+/* Optional Wi-Fi QoS marking. The kernel maps DSCP EF (0xB8) to the 802.11e
+ * voice access category via the RFC8325 default mapping in
+ * cfg80211_classify8021d(), which shortens the contention/backoff window and
+ * reduces jitter. Applied best-effort: some kernels/drivers ignore IP_TOS. */
+#define NET_QOS_DSCP_EF 0xB8
+static void network_apply_qos(int fd) {
+    if(fd<0)return;
+    int tos=atomic_load(&g.net_qos_enabled)?NET_QOS_DSCP_EF:0;
+    setsockopt(fd,IPPROTO_IP,IP_TOS,&tos,sizeof(tos));
+}
+
 static void network_tcp_open_sender(void) {
     if(g.net_transport!=NET_TRANSPORT_TCP||atomic_load(&g.net_role)!=1||g.net_sock>=0)return;
     uint64_t now=now_ns();
@@ -1194,6 +1208,7 @@ static void network_tcp_open_sender(void) {
     g.net_sock=socket(AF_INET,SOCK_STREAM,0);
     if(g.net_sock<0){int error=errno;network_set_error(NET_ERROR_SOCKET,error,0);LOGI("Wi-Fi TCP sender socket failed errno=%d",error);g.net_tcp_next_connect_ns=now+1000000000ull;return;}
     network_configure_tcp_buffer(g.net_sock,1);
+    network_apply_qos(g.net_sock);
     fcntl(g.net_sock,F_SETFL,O_NONBLOCK);
     int rc=connect(g.net_sock,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr));
     if(rc==0) {
@@ -2007,7 +2022,7 @@ static void network_fill(void) {
     if(g.net_transport==NET_TRANSPORT_TCP) {
         if(g.net_sock<0 && g.net_listen_sock>=0) {
             int accepted=accept(g.net_listen_sock,NULL,NULL);
-            if(accepted>=0) { network_configure_tcp_buffer(accepted,2); fcntl(accepted,F_SETFL,O_NONBLOCK); g.net_sock=accepted; g.net_rx_used=0; network_set_error(NET_ERROR_TCP_WAITING_DATA,0,0); LOGI("Wi-Fi TCP client connected"); }
+            if(accepted>=0) { network_configure_tcp_buffer(accepted,2); network_apply_qos(accepted); fcntl(accepted,F_SETFL,O_NONBLOCK); g.net_sock=accepted; g.net_rx_used=0; network_set_error(NET_ERROR_TCP_WAITING_DATA,0,0); LOGI("Wi-Fi TCP client connected"); }
         }
         if(g.net_sock>=0) {
             for(;;) {
@@ -2737,11 +2752,12 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
     if(transport==NET_TRANSPORT_TCP) {
         if(role==2) {
             g.net_listen_sock=socket(AF_INET,SOCK_STREAM,0);
-            if(g.net_listen_sock>=0) { int yes=1; setsockopt(g.net_listen_sock,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes)); network_configure_tcp_buffer(g.net_listen_sock,2); fcntl(g.net_listen_sock,F_SETFL,O_NONBLOCK); }
+            if(g.net_listen_sock>=0) { int yes=1; setsockopt(g.net_listen_sock,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes)); network_configure_tcp_buffer(g.net_listen_sock,2); network_apply_qos(g.net_listen_sock); fcntl(g.net_listen_sock,F_SETFL,O_NONBLOCK); }
         } else {
             g.net_sock=socket(AF_INET,SOCK_STREAM,0);
             if(g.net_sock>=0) {
                 network_configure_tcp_buffer(g.net_sock,1);
+                network_apply_qos(g.net_sock);
                 atomic_fetch_add(&g.net_tcp_connect_attempts,1);
                 struct sockaddr_in target={0};target.sin_family=AF_INET;target.sin_port=htons((uint16_t)port);target.sin_addr=requested_addr;
                 fcntl(g.net_sock,F_SETFL,O_NONBLOCK);
@@ -2755,6 +2771,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
         g.net_sock=socket(AF_INET,SOCK_DGRAM,0);
         if(g.net_sock>=0) {
             network_configure_udp_buffer(g.net_sock,role);
+            network_apply_qos(g.net_sock);
             fcntl(g.net_sock,F_SETFL,O_NONBLOCK);
         }
     }
@@ -2889,6 +2906,15 @@ JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetwor
     atomic_store(&g.net_target_dynamic_enabled,dynamic?1:0);
     atomic_store(&g.net_target_bias_permille,bias);
     pthread_mutex_unlock(&g.net_rx_lock);
+}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetworkQos(JNIEnv*e,jobject o,jboolean enabled){
+    (void)e;(void)o;
+    pthread_mutex_lock(&g.net_rx_lock);
+    atomic_store(&g.net_qos_enabled,enabled?1:0);
+    network_apply_qos(g.net_sock);
+    network_apply_qos(g.net_listen_sock);
+    pthread_mutex_unlock(&g.net_rx_lock);
+    LOGI("Wi-Fi QoS marking %s",enabled?"enabled (DSCP EF)":"disabled");
 }
 JNIEXPORT jobjectArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_logs(JNIEnv*e,jobject o){
     (void)o;

@@ -45,6 +45,7 @@ class AudioEngine(private val context: Context) {
     @Volatile var wifiClockCorrectionEnabled = false
     @Volatile var wifiClockCorrectionPpm = 100
     @Volatile var wifiLowLatencyEnabled = false
+    @Volatile var wifiQosEnabled = false
     @Volatile var wifiDynamicBufferEnabled = true
     @Volatile var wifiManualBufferBias = 0.5f
     @Volatile var wifiOpusFrameMs = 20
@@ -211,6 +212,7 @@ class AudioEngine(private val context: Context) {
         NativeAudio.configureNetworkClockCorrection(configured && wifiClockCorrectionEnabled && role == 2)
         NativeAudio.configureNetworkClockCorrectionLimitPpm(wifiClockCorrectionPpm)
         NativeAudio.configureNetworkTargetBuffer(wifiDynamicBufferEnabled, (wifiManualBufferBias.coerceIn(0f, 1f) * 1000f).roundToInt())
+        NativeAudio.configureNetworkQos(configured && wifiQosEnabled)
         networkRole = if (configured) role else 0
         if (role != 1) { wifiReconnectCount = 0; wifiReconnectPending = false }
         if (!configured) showWifiError(nativeError.second ?: wifiConfigurationFailureNotice)
@@ -242,6 +244,10 @@ class AudioEngine(private val context: Context) {
     fun configureWifiLowLatency(enabled: Boolean) {
         wifiLowLatencyEnabled = enabled
         if (isRunning) applyWifiLowLatencyLock()
+    }
+    fun configureWifiQos(enabled: Boolean) {
+        wifiQosEnabled = enabled
+        if (NativeAudio.available) NativeAudio.configureNetworkQos(enabled && networkRole != 0)
     }
     private fun applyWifiLowLatencyLock() {
         if (!wifiLowLatencyEnabled || networkRole == 0 || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {

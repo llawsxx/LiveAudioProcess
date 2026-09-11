@@ -74,7 +74,9 @@ fun WifiAudioPanel(
     manualBufferBias: Float,
     onManualBufferBias: (Float) -> Unit,
     clockCorrectionPpm: Int = 100,
-    onClockCorrectionPpm: (Int) -> Unit = {}
+    onClockCorrectionPpm: (Int) -> Unit = {},
+    networkQosEnabled: Boolean = false,
+    onNetworkQosEnabled: (Boolean) -> Unit = {}
 ) {
     val requestedPacketMs = packetDuration.toIntOrNull()?.coerceIn(1, 100) ?: 20
     val opusPacketFrames = sampleRate * opusFrameMs / 1000
@@ -162,6 +164,17 @@ fun WifiAudioPanel(
                     Text("Android 10+ Wi-Fi performance lock", color = WifiMuted, fontSize = 10.sp)
                 }
                 Switch(checked = wlanLowLatencyEnabled, onCheckedChange = onWlanLowLatencyEnabled)
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("QoS / WMM PRIORITY", color = Color.White, fontSize = 11.sp)
+                    Text("DSCP EF marking for lower jitter", color = WifiMuted, fontSize = 10.sp)
+                }
+                Switch(checked = networkQosEnabled, onCheckedChange = onNetworkQosEnabled)
             }
             Text("Wi-Fi 实时音频", color = Color.White, fontWeight = FontWeight.Bold)
 
