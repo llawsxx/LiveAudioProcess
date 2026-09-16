@@ -76,7 +76,9 @@ fun WifiAudioPanel(
     clockCorrectionPpm: Int = 100,
     onClockCorrectionPpm: (Int) -> Unit = {},
     networkQosEnabled: Boolean = false,
-    onNetworkQosEnabled: (Boolean) -> Unit = {}
+    onNetworkQosEnabled: (Boolean) -> Unit = {},
+    retransmitEnabled: Boolean = true,
+    onRetransmitEnabled: (Boolean) -> Unit = {}
 ) {
     val requestedPacketMs = packetDuration.toIntOrNull()?.coerceIn(1, 100) ?: 20
     val opusPacketFrames = sampleRate * opusFrameMs / 1000
@@ -175,6 +177,21 @@ fun WifiAudioPanel(
                     Text("DSCP EF marking for lower jitter", color = WifiMuted, fontSize = 10.sp)
                 }
                 Switch(checked = networkQosEnabled, onCheckedChange = onNetworkQosEnabled)
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("WIFI RETRANSMIT", color = Color.White, fontSize = 11.sp)
+                    Text("UDP NACK and recent-packet retry", color = WifiMuted, fontSize = 10.sp)
+                }
+                Switch(
+                    checked = retransmitEnabled,
+                    onCheckedChange = onRetransmitEnabled,
+                    enabled = transport == 0
+                )
             }
             Text("Wi-Fi 实时音频", color = Color.White, fontWeight = FontWeight.Bold)
 

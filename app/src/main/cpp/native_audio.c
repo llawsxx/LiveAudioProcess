@@ -86,11 +86,23 @@ static void app_log_print(android_LogPriority priority, const char *fmt, ...) {
 #define NET_TCP_SEND_BUFFER_BYTES (512 * 1024)
 #define NET_UDP_RECEIVE_BUFFER_BYTES (1024 * 1024)
 #define NET_UDP_SEND_BUFFER_BYTES (512 * 1024)
+#define NET_CONTROL_MAGIC 0x50464354u
+#define NET_CONTROL_RETRANSMIT 1u
+#define NET_RETRANSMIT_CACHE_SLOTS 32
+#define NET_RETRANSMIT_MAX_REQUESTS 3
+#define NET_RETRANSMIT_WAIT_NS 30000000ull
 #define EQ_BANDS 4
 #define MAX_INPUT_CHANNELS 8
 
 typedef struct { float b0,b1,b2,a1,a2,z1,z2,freq,gain,q; } Biquad;
 typedef struct __attribute__((packed)) { uint32_t magic; uint16_t version; uint8_t codec; uint8_t channels; uint32_t rate; uint32_t frames; uint64_t timestamp_ns; uint32_t sequence; } NetHeader;
+typedef struct __attribute__((packed)) { uint32_t magic; uint16_t version; uint8_t type; uint8_t reserved; uint32_t sequence; } NetControl;
+typedef struct {
+    uint32_t sequence;
+    uint32_t size;
+    int valid;
+    uint8_t data[NET_UDP_MAX_PAYLOAD_BYTES];
+} NetRetransmitSlot;
 enum {
     NET_ERROR_NONE = 0,
     NET_ERROR_INVALID_ROLE = 1,
@@ -216,6 +228,7 @@ typedef struct {
     atomic_int net_target_dynamic_enabled;
     atomic_int net_target_bias_permille;
     atomic_int net_qos_enabled;
+    atomic_int net_retransmit_enabled;
     double net_play_phase;
     double net_playback_ratio;
     int net_tcp_connecting;
@@ -223,6 +236,7 @@ typedef struct {
     wifi_opus_t net_opus;
     pthread_mutex_t net_codec_lock;
     pthread_mutex_t net_rx_lock;
+    pthread_mutex_t net_retransmit_lock;
     atomic_int net_role, use_network_input, net_packet_seen;
     atomic_int net_error, net_error_detail0, net_error_detail1;
     atomic_int net_rx_disconnect_requested, net_rx_timeout_reported, net_tx_disconnect_requested;
@@ -236,6 +250,16 @@ typedef struct {
     uint64_t net_tx_packet_count, net_tx_byte_count;
     double net_tx_jitter_ewma_ms;
     double net_jitter_max_ms;
+    atomic_ullong net_retransmit_requests, net_retransmitted_packets;
+    NetRetransmitSlot net_retransmit_cache[NET_RETRANSMIT_CACHE_SLOTS];
+    struct sockaddr_in net_udp_peer;
+    int net_udp_peer_valid, net_retransmit_pending;
+    uint32_t net_retransmit_sequence;
+    uint64_t net_retransmit_first_ns, net_retransmit_last_ns, net_retransmit_delay_ns;
+    int net_retransmit_attempts;
+    int net_wire_sequence_initialized;
+    uint32_t net_wire_high_sequence;
+    uint64_t net_wire_high_arrival_ns;
     NetJitterSlot *net_jitter;
     NetCompressedJitterSlot *net_aac_jitter;
     NetCompressedJitterSlot *net_opus_jitter;
@@ -300,6 +324,7 @@ static Engine g = {
     .net_target_dynamic_enabled = ATOMIC_VAR_INIT(1),
     .net_target_bias_permille = ATOMIC_VAR_INIT(500),
     .net_qos_enabled = ATOMIC_VAR_INIT(0),
+    .net_retransmit_enabled = ATOMIC_VAR_INIT(1),
     .net_clock_correction_limit_ppm = ATOMIC_VAR_INIT(100),
     .net_max_hold_ms = 1000,
     .param_lock = PTHREAD_MUTEX_INITIALIZER,
@@ -309,6 +334,7 @@ static Engine g = {
     .record_cv = PTHREAD_COND_INITIALIZER,
     .net_codec_lock = PTHREAD_MUTEX_INITIALIZER,
     .net_rx_lock = PTHREAD_MUTEX_INITIALIZER,
+    .net_retransmit_lock = PTHREAD_MUTEX_INITIALIZER,
     .reverb_lock = PTHREAD_MUTEX_INITIALIZER,
     .waveform_lock = PTHREAD_MUTEX_INITIALIZER,
     .tone_noise_state = 0x13579BDFu
@@ -1293,6 +1319,38 @@ static void network_record_tx_packet(const uint8_t *packet, size_t size) {
     g.net_tx_prev_frames = header.frames;
 }
 
+static void network_cache_udp_packet(const uint8_t *packet, size_t size) {
+    if (!atomic_load(&g.net_retransmit_enabled) || !packet ||
+        size < sizeof(NetHeader) || size > NET_UDP_MAX_PAYLOAD_BYTES) return;
+    NetHeader header;
+    memcpy(&header, packet, sizeof(header));
+    NetRetransmitSlot *slot=&g.net_retransmit_cache[header.sequence%NET_RETRANSMIT_CACHE_SLOTS];
+    pthread_mutex_lock(&g.net_retransmit_lock);
+    slot->valid=0;
+    memcpy(slot->data,packet,size);
+    slot->sequence=header.sequence;
+    slot->size=(uint32_t)size;
+    slot->valid=1;
+    pthread_mutex_unlock(&g.net_retransmit_lock);
+}
+
+static void network_handle_retransmit_request(const NetControl *control,
+                                              const struct sockaddr_in *source) {
+    if (!atomic_load(&g.net_retransmit_enabled) || !control || !source ||
+        control->magic!=NET_CONTROL_MAGIC ||
+        control->version!=NET_PROTOCOL_VERSION || control->type!=NET_CONTROL_RETRANSMIT ||
+        source->sin_addr.s_addr!=g.net_addr.sin_addr.s_addr ||
+        source->sin_port!=g.net_addr.sin_port || g.net_sock<0) return;
+    NetRetransmitSlot *slot=&g.net_retransmit_cache[control->sequence%NET_RETRANSMIT_CACHE_SLOTS];
+    pthread_mutex_lock(&g.net_retransmit_lock);
+    if(slot->valid && slot->sequence==control->sequence && slot->size>0) {
+        ssize_t sent=sendto(g.net_sock,slot->data,slot->size,0,
+                            (const struct sockaddr*)source,sizeof(*source));
+        if(sent==(ssize_t)slot->size)atomic_fetch_add(&g.net_retransmitted_packets,1);
+    }
+    pthread_mutex_unlock(&g.net_retransmit_lock);
+}
+
 static void network_write_packet(const uint8_t *packet, size_t size) {
     if(!packet||size==0)return;
     if(g.net_transport==NET_TRANSPORT_TCP) {
@@ -1312,7 +1370,11 @@ static void network_write_packet(const uint8_t *packet, size_t size) {
         if(g.net_sock<0)return;
         ssize_t sent=sendto(g.net_sock,packet,size,0,(struct sockaddr*)&g.net_addr,sizeof(g.net_addr));
         if(sent<0)network_set_error(NET_ERROR_CONNECT,errno,g.net_port);
-        else { network_set_error(NET_ERROR_NONE,0,0); if ((size_t)sent == size) network_record_tx_packet(packet, size); }
+        else if ((size_t)sent == size) {
+            network_set_error(NET_ERROR_NONE,0,0);
+            network_cache_udp_packet(packet,size);
+            network_record_tx_packet(packet,size);
+        }
     }
 }
 static void network_send_pcm_packet(const float *data, int frames) {
@@ -1475,6 +1537,21 @@ static void network_clear_jitter_state_unlocked(void) {
     g.net_play_phase=0.0;
     g.net_playback_ratio=1.0;
     atomic_store(&g.net_buffer_ms,0);
+}
+
+static void network_reset_retransmit_receiver(void) {
+    g.net_udp_peer_valid=0;
+    g.net_retransmit_pending=0;
+    g.net_retransmit_attempts=0;
+    g.net_wire_sequence_initialized=0;
+    g.net_wire_high_sequence=0;
+    g.net_wire_high_arrival_ns=0;
+}
+
+static void network_clear_retransmit_cache(void) {
+    pthread_mutex_lock(&g.net_retransmit_lock);
+    for(int i=0;i<NET_RETRANSMIT_CACHE_SLOTS;i++)g.net_retransmit_cache[i].valid=0;
+    pthread_mutex_unlock(&g.net_retransmit_lock);
 }
 
 static void network_clear_jitter_state(void) {
@@ -1705,6 +1782,104 @@ static double network_playback_step(int target_frames) {
     return g.net_playback_ratio;
 }
 
+static int network_wire_packet_present(uint32_t sequence) {
+    if(g.net_codec==1&&g.net_aac_jitter) {
+        NetCompressedJitterSlot *slot=&g.net_aac_jitter[sequence%NET_AAC_JITTER_SLOTS];
+        return slot->valid&&slot->sequence==sequence;
+    }
+    if(g.net_codec==2&&g.net_opus_jitter) {
+        NetCompressedJitterSlot *slot=&g.net_opus_jitter[sequence%NET_OPUS_JITTER_SLOTS];
+        return slot->valid&&slot->sequence==sequence;
+    }
+    if(g.net_codec==0&&g.net_jitter) {
+        NetJitterSlot *slot=&g.net_jitter[sequence%NET_JITTER_SLOTS];
+        return slot->valid&&slot->sequence==sequence;
+    }
+    return 0;
+}
+
+static uint64_t network_wire_packet_duration_ns(void) {
+    return g.rate>0&&g.net_observed_packet_frames>0
+           ?(uint64_t)g.net_observed_packet_frames*1000000000ull/(uint32_t)g.rate
+           :10000000ull;
+}
+
+static void network_arm_expected_packet(uint32_t after_sequence, uint64_t now) {
+    uint64_t packet_ns=network_wire_packet_duration_ns();
+    uint32_t candidate=after_sequence+1u;
+    while((int32_t)(g.net_wire_high_sequence-candidate)>=0&&network_wire_packet_present(candidate))
+        candidate++;
+    uint64_t delay=packet_ns/2;
+    if(delay<3000000ull)delay=3000000ull;
+    if(delay>15000000ull)delay=15000000ull;
+    g.net_retransmit_pending=1;
+    g.net_retransmit_sequence=candidate;
+    g.net_retransmit_delay_ns=delay;
+    if((int32_t)(g.net_wire_high_sequence-candidate)>=0) {
+        uint32_t packets_behind=g.net_wire_high_sequence-candidate;
+        uint64_t offset=(uint64_t)packets_behind*packet_ns;
+        g.net_retransmit_first_ns=g.net_wire_high_arrival_ns>offset
+                ?g.net_wire_high_arrival_ns-offset:now;
+    } else {
+        g.net_retransmit_first_ns=g.net_wire_high_arrival_ns+packet_ns;
+    }
+    g.net_retransmit_last_ns=0;
+    g.net_retransmit_attempts=0;
+}
+
+static void network_track_expected_packet(const NetHeader *header, uint64_t arrival) {
+    if(!atomic_load(&g.net_retransmit_enabled)||!header)return;
+    if(g.net_wire_sequence_initialized &&
+       ((int32_t)(header->sequence-g.net_wire_high_sequence)<-NET_JITTER_SLOTS ||
+        (arrival>g.net_wire_high_arrival_ns&&arrival-g.net_wire_high_arrival_ns>500000000ull)))
+        g.net_wire_sequence_initialized=0;
+    if(!g.net_wire_sequence_initialized) {
+        g.net_wire_sequence_initialized=1;
+        g.net_wire_high_sequence=header->sequence;
+        g.net_wire_high_arrival_ns=arrival;
+        network_arm_expected_packet(header->sequence,arrival);
+        return;
+    }
+    if((int32_t)(header->sequence-g.net_wire_high_sequence)>0) {
+        g.net_wire_high_sequence=header->sequence;
+        g.net_wire_high_arrival_ns=arrival;
+    }
+    if(g.net_retransmit_pending&&header->sequence==g.net_retransmit_sequence)
+        network_arm_expected_packet(header->sequence,arrival);
+}
+
+static void network_abandon_expected_packet(uint32_t sequence) {
+    if(g.net_retransmit_pending&&g.net_retransmit_sequence==sequence)
+        network_arm_expected_packet(sequence,now_ns());
+}
+
+static void network_request_missing_packet(uint64_t now) {
+    if(!atomic_load(&g.net_retransmit_enabled)||g.net_transport!=NET_TRANSPORT_UDP||
+       !g.net_udp_peer_valid||g.net_sock<0||
+       !g.net_retransmit_pending)return;
+    uint64_t due=g.net_retransmit_attempts==0
+            ?g.net_retransmit_first_ns+g.net_retransmit_delay_ns
+            :g.net_retransmit_last_ns+g.net_retransmit_delay_ns;
+    if(now<due||g.net_retransmit_attempts>=NET_RETRANSMIT_MAX_REQUESTS)return;
+    NetControl control={NET_CONTROL_MAGIC,NET_PROTOCOL_VERSION,NET_CONTROL_RETRANSMIT,0,
+                        g.net_retransmit_sequence};
+    ssize_t sent=sendto(g.net_sock,&control,sizeof(control),0,
+                        (struct sockaddr*)&g.net_udp_peer,sizeof(g.net_udp_peer));
+    if(sent==(ssize_t)sizeof(control)) {
+        g.net_retransmit_last_ns=now;
+        g.net_retransmit_attempts++;
+        atomic_fetch_add(&g.net_retransmit_requests,1);
+    }
+}
+
+static int network_waiting_for_retransmit(uint32_t sequence) {
+    if(!atomic_load(&g.net_retransmit_enabled)||!g.net_retransmit_pending||
+       g.net_retransmit_sequence!=sequence)return 0;
+    uint64_t now=now_ns();
+    return now>=g.net_retransmit_first_ns&&
+           now-g.net_retransmit_first_ns<NET_RETRANSMIT_WAIT_NS;
+}
+
 static void network_store_packet(const NetHeader *h, const float *samples, uint64_t arrival_ns) {
     uint64_t previous_arrival=atomic_load(&g.net_last_packet_ns);
     if(!g.net_seq_initialized) {
@@ -1813,6 +1988,8 @@ static void network_decode_aac_packets(void) {
         NetCompressedJitterSlot *slot=&g.net_aac_jitter[packet_index%NET_AAC_JITTER_SLOTS];
         if(!slot->valid||slot->sequence!=g.net_aac_play_seq) {
             if((int32_t)(g.net_aac_high_seq-g.net_aac_play_seq)>0) {
+                if(network_waiting_for_retransmit(g.net_aac_play_seq))break;
+                network_abandon_expected_packet(g.net_aac_play_seq);
                 g.net_aac_play_seq++;
                 continue;
             }
@@ -1919,7 +2096,12 @@ static void network_decode_opus_packets(void) {
     while (g.net_opus_packet_count > 0) {
         NetCompressedJitterSlot *slot = &g.net_opus_jitter[g.net_opus_play_seq % NET_OPUS_JITTER_SLOTS];
         if (!slot->valid || slot->sequence != g.net_opus_play_seq) {
-            if ((int32_t)(g.net_opus_high_seq - g.net_opus_play_seq) > 0) { g.net_opus_play_seq++; continue; }
+            if ((int32_t)(g.net_opus_high_seq - g.net_opus_play_seq) > 0) {
+                if(network_waiting_for_retransmit(g.net_opus_play_seq))break;
+                network_abandon_expected_packet(g.net_opus_play_seq);
+                g.net_opus_play_seq++;
+                continue;
+            }
             break;
         }
         uint32_t sequence = slot->sequence;
@@ -2000,6 +2182,7 @@ static void network_process_packet(const uint8_t *packet, size_t n) {
      * sender. The UI packet-duration field is only a sender hint and may be
      * stale or different on the two devices. */
     g.net_observed_packet_frames=h.frames;
+    network_track_expected_packet(&h,arrival);
     network_update_jitter_estimate(&h,arrival);
     atomic_store(&g.net_last_packet_ns,arrival);
     if(!atomic_exchange(&g.net_packet_seen,1))
@@ -2011,7 +2194,29 @@ static void network_process_packet(const uint8_t *packet, size_t n) {
 
 static void network_fill(void) {
     pthread_mutex_lock(&g.net_rx_lock);
-    if (atomic_load(&g.net_role) != 2 || !g.net_jitter) {
+    int role=atomic_load(&g.net_role);
+    if(role==1 && g.net_transport==NET_TRANSPORT_UDP && g.net_sock>=0) {
+        uint8_t control_buffer[sizeof(NetControl)];
+        for(;;) {
+            struct sockaddr_in source={0};
+            socklen_t source_size=sizeof(source);
+            ssize_t n=recvfrom(g.net_sock,control_buffer,sizeof(control_buffer),MSG_DONTWAIT,
+                               (struct sockaddr*)&source,&source_size);
+            if(n<0){
+                if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)
+                    network_set_error(NET_ERROR_TCP_RECEIVE,errno,0);
+                break;
+            }
+            if(n==(ssize_t)sizeof(NetControl)) {
+                NetControl control;
+                memcpy(&control,control_buffer,sizeof(control));
+                network_handle_retransmit_request(&control,&source);
+            }
+        }
+        pthread_mutex_unlock(&g.net_rx_lock);
+        return;
+    }
+    if (role != 2 || !g.net_jitter) {
         pthread_mutex_unlock(&g.net_rx_lock);
         return;
     }
@@ -2054,11 +2259,17 @@ static void network_fill(void) {
     if (g.net_sock < 0) { pthread_mutex_unlock(&g.net_rx_lock); return; }
     uint8_t packet[sizeof(NetHeader)+NET_PCM_MAX_PACKET_FRAMES*2*sizeof(float)];
     for (;;) {
-        ssize_t n=recvfrom(g.net_sock,packet,sizeof(packet),MSG_DONTWAIT,NULL,NULL);
+        struct sockaddr_in source={0};
+        socklen_t source_size=sizeof(source);
+        ssize_t n=recvfrom(g.net_sock,packet,sizeof(packet),MSG_DONTWAIT,
+                           (struct sockaddr*)&source,&source_size);
         if(n<0){if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)network_set_error(NET_ERROR_TCP_RECEIVE,errno,0);break;}
         if(n<(ssize_t)sizeof(NetHeader)){network_set_error(NET_ERROR_PACKET_TOO_SHORT,(int)n,(int)sizeof(NetHeader));break;}
+        g.net_udp_peer=source;
+        g.net_udp_peer_valid=1;
         network_process_packet(packet,(size_t)n);
     }
+    network_request_missing_packet(now_ns());
     if(g.net_codec==1)network_decode_aac_packets();
     else if(g.net_codec==2)network_decode_opus_packets();
     pthread_mutex_unlock(&g.net_rx_lock);
@@ -2070,13 +2281,26 @@ static void network_fill(void) {
 static void network_wait_for_receive(void) {
     struct pollfd pfd;
     int fd = -1;
+    int timeout_ms=100;
     memset(&pfd, 0, sizeof(pfd));
     pthread_mutex_lock(&g.net_rx_lock);
-    if (atomic_load(&g.net_role) == 2) {
+    int role=atomic_load(&g.net_role);
+    if (role == 2) {
         if (g.net_transport == NET_TRANSPORT_TCP)
             fd = g.net_sock >= 0 ? g.net_sock : g.net_listen_sock;
         else
             fd = g.net_sock;
+    } else if(role==1 && g.net_transport==NET_TRANSPORT_UDP) {
+        fd=g.net_sock;
+    }
+    if(role==2&&g.net_transport==NET_TRANSPORT_UDP&&g.net_retransmit_pending&&
+       g.net_retransmit_attempts<NET_RETRANSMIT_MAX_REQUESTS) {
+        uint64_t due=g.net_retransmit_attempts==0
+                ?g.net_retransmit_first_ns+g.net_retransmit_delay_ns
+                :g.net_retransmit_last_ns+g.net_retransmit_delay_ns;
+        uint64_t now=now_ns();
+        timeout_ms=due<=now?0:(int)((due-now+999999ull)/1000000ull);
+        if(timeout_ms>100)timeout_ms=100;
     }
     pthread_mutex_unlock(&g.net_rx_lock);
     if (fd < 0) {
@@ -2088,20 +2312,7 @@ static void network_wait_for_receive(void) {
     }
     pfd.fd = fd;
     pfd.events = POLLIN | POLLERR | POLLHUP;
-    while (atomic_load(&g.net_rx_worker_running)) {
-        int result = poll(&pfd, 1, 100);
-        if (result != 0 || !atomic_load(&g.net_rx_worker_running)) return;
-        /* Recheck the socket every 100 ms so shutdown/reconfiguration cannot
-         * leave the worker asleep indefinitely. */
-        pthread_mutex_lock(&g.net_rx_lock);
-        int current_fd = atomic_load(&g.net_role) == 2
-                ? (g.net_transport == NET_TRANSPORT_TCP
-                   ? (g.net_sock >= 0 ? g.net_sock : g.net_listen_sock)
-                   : g.net_sock)
-                : -1;
-        pthread_mutex_unlock(&g.net_rx_lock);
-        if (current_fd != fd) return;
-    }
+    poll(&pfd,1,timeout_ms);
 }
 
 static void *network_receive_thread(void *unused) {
@@ -2485,6 +2696,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
     g.net_aac_jitter=calloc(NET_AAC_JITTER_SLOTS,sizeof(*g.net_aac_jitter));
     g.net_opus_jitter=calloc(NET_OPUS_JITTER_SLOTS,sizeof(*g.net_opus_jitter));
     network_clear_jitter_state();
+    network_reset_retransmit_receiver();
     g.look_pos=0;g.look_size=(int)(rate*.006f)*2+4;g.lookahead=calloc((size_t)g.look_size,sizeof(float));
     g.limiter_next_pos=malloc((size_t)g.look_size*sizeof(*g.limiter_next_pos));
     g.limiter_next_delta=calloc((size_t)g.look_size,sizeof(*g.limiter_next_delta));
@@ -2784,7 +2996,10 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
     atomic_store(&g.net_last_packet_ns,now_ns());atomic_store(&g.net_packet_seen,0);
     g.net_min_ms=normalized_min;g.net_max_ms=normalized_max;
     g.net_max_hold_ms=normalized_max_hold;
-    g.net_send_count=0;g.net_aac_send_used=0;g.net_aac_send_frames=0;g.net_seq=0;g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);g.net_missing_packets=g.net_late_packets=g.net_duplicate_packets=0;network_clear_jitter_state_unlocked();
+    g.net_send_count=0;g.net_aac_send_used=0;g.net_aac_send_frames=0;g.net_seq=0;g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);g.net_missing_packets=g.net_late_packets=g.net_duplicate_packets=0;network_clear_jitter_state_unlocked();network_reset_retransmit_receiver();
+    network_clear_retransmit_cache();
+    atomic_store(&g.net_retransmit_requests,0);
+    atomic_store(&g.net_retransmitted_packets,0);
     atomic_store(&g.net_min_buffer_events,0);
     atomic_store(&g.net_max_buffer_events,0);
     if(role==2) {
@@ -2809,8 +3024,11 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNe
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearNetwork(JNIEnv*e,jobject o){
     (void)e;(void)o;
     pthread_mutex_lock(&g.net_rx_lock);
-    atomic_store(&g.net_role,0);network_close_socket(&g.net_sock);network_close_socket(&g.net_listen_sock);g.net_tcp_connecting=0;g.net_tcp_next_connect_ns=0;g.net_rx_used=g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);g.net_send_count=0;g.net_aac_send_used=0;g.net_aac_send_frames=0;network_clear_jitter_state_unlocked();atomic_store(&g.net_min_buffer_events,0);atomic_store(&g.net_max_buffer_events,0);network_set_error(NET_ERROR_NONE,0,0);
+    atomic_store(&g.net_role,0);network_close_socket(&g.net_sock);network_close_socket(&g.net_listen_sock);g.net_tcp_connecting=0;g.net_tcp_next_connect_ns=0;g.net_rx_used=g.net_tx_used=g.net_tx_offset=0;g.net_tx_blocked_since_ns=0;atomic_store(&g.net_rx_disconnect_requested,0);atomic_store(&g.net_rx_timeout_reported,0);atomic_store(&g.net_tx_disconnect_requested,0);g.net_send_count=0;g.net_aac_send_used=0;g.net_aac_send_frames=0;network_clear_jitter_state_unlocked();network_reset_retransmit_receiver();atomic_store(&g.net_min_buffer_events,0);atomic_store(&g.net_max_buffer_events,0);network_set_error(NET_ERROR_NONE,0,0);
     pthread_mutex_lock(&g.net_codec_lock);wifi_aac_destroy(g.net_aac);g.net_aac=NULL;wifi_opus_destroy(g.net_opus);g.net_opus=NULL;pthread_mutex_unlock(&g.net_codec_lock);
+    network_clear_retransmit_cache();
+    atomic_store(&g.net_retransmit_requests,0);
+    atomic_store(&g.net_retransmitted_packets,0);
     pthread_mutex_unlock(&g.net_rx_lock);
 }
 JNIEXPORT jintArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkErrorInfo(JNIEnv*e,jobject o){
@@ -2826,7 +3044,7 @@ JNIEXPORT jintArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkErr
 JNIEXPORT jlongArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkReceiveStats(JNIEnv*e,jobject o){
     (void)o;
     pthread_mutex_lock(&g.net_rx_lock);
-    jlong values[9]={
+    jlong values[10]={
         (jlong)atomic_load(&g.net_buffer_ms),
         (jlong)atomic_load(&g.net_min_buffer_events),
         (jlong)atomic_load(&g.net_max_buffer_events),
@@ -2837,11 +3055,12 @@ JNIEXPORT jlongArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkRe
         (jlong)llround(g.net_jitter_max_ms * 10.0),
         atomic_load(&g.net_clock_correction_enabled)
                 ? (jlong)llround((g.net_playback_ratio - 1.0) * 1000000.0)
-                : 0
+                : 0,
+        (jlong)atomic_load(&g.net_retransmit_requests)
     };
     pthread_mutex_unlock(&g.net_rx_lock);
-    jlongArray result=(*e)->NewLongArray(e,9);
-    if(result)(*e)->SetLongArrayRegion(e,result,0,9,values);
+    jlongArray result=(*e)->NewLongArray(e,10);
+    if(result)(*e)->SetLongArrayRegion(e,result,0,10,values);
     return result;
 }
 JNIEXPORT jlongArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkTransmitStats(JNIEnv*e,jobject o){
@@ -2849,17 +3068,18 @@ JNIEXPORT jlongArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkTr
     pthread_mutex_lock(&g.net_rx_lock);
     uint64_t now=now_ns();
     uint64_t elapsed=now>g.net_tx_stats_start_ns?now-g.net_tx_stats_start_ns:0;
-    jlong values[6]={
+    jlong values[7]={
         (jlong)g.net_transport,
         (jlong)g.net_codec,
         (jlong)g.net_bitrate,
         elapsed>0?(jlong)((g.net_tx_byte_count*1000000000ull)/elapsed):0,
         elapsed>0?(jlong)((g.net_tx_packet_count*1000000000ull)/elapsed):0,
-        (jlong)llround(g.net_tx_jitter_ewma_ms*10.0)
+        (jlong)llround(g.net_tx_jitter_ewma_ms*10.0),
+        (jlong)atomic_load(&g.net_retransmitted_packets)
     };
     pthread_mutex_unlock(&g.net_rx_lock);
-    jlongArray result=(*e)->NewLongArray(e,6);
-    if(result)(*e)->SetLongArrayRegion(e,result,0,6,values);
+    jlongArray result=(*e)->NewLongArray(e,7);
+    if(result)(*e)->SetLongArrayRegion(e,result,0,7,values);
     return result;
 }
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearNetworkReceiveStats(JNIEnv*e,jobject o){
@@ -2870,6 +3090,7 @@ JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_clearNetworkRec
     g.net_min_boundary_latched=0;
     g.net_max_boundary_latched=0;
     g.net_jitter_max_ms=0.0;
+    atomic_store(&g.net_retransmit_requests,0);
     pthread_mutex_unlock(&g.net_rx_lock);
 }
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetworkClockCorrection(JNIEnv*e,jobject o,jboolean enabled){
@@ -2915,6 +3136,18 @@ JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetwor
     network_apply_qos(g.net_listen_sock);
     pthread_mutex_unlock(&g.net_rx_lock);
     LOGI("Wi-Fi QoS marking %s",enabled?"enabled (DSCP EF)":"disabled");
+}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetworkRetransmit(JNIEnv*e,jobject o,jboolean enabled){
+    (void)e;(void)o;
+    pthread_mutex_lock(&g.net_rx_lock);
+    atomic_store(&g.net_retransmit_enabled,enabled?1:0);
+    if(!enabled) {
+        network_reset_retransmit_receiver();
+        atomic_store(&g.net_retransmit_requests,0);
+        atomic_store(&g.net_retransmitted_packets,0);
+    }
+    pthread_mutex_unlock(&g.net_rx_lock);
+    LOGI("Wi-Fi retransmission %s",enabled?"enabled":"disabled");
 }
 JNIEXPORT jobjectArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_logs(JNIEnv*e,jobject o){
     (void)o;

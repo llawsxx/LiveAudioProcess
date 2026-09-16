@@ -248,6 +248,7 @@ private fun LiveAudioProcessApp() {
     var wifiClockCorrectionPpm by remember { mutableIntStateOf(prefs.getInt("wifiClockCorrectionPpm", 100).coerceIn(1, 200)) }
     var wifiLowLatencyEnabled by remember { mutableStateOf(prefs.getBoolean("wifiLowLatencyEnabled", false)) }
     var wifiQosEnabled by remember { mutableStateOf(prefs.getBoolean("wifiQosEnabled", false)) }
+    var wifiRetransmitEnabled by remember { mutableStateOf(prefs.getBoolean("wifiRetransmitEnabled", true)) }
     var wifiDynamicBufferEnabled by remember { mutableStateOf(prefs.getBoolean("wifiDynamicBufferEnabled", true)) }
     var wifiManualBufferBias by remember { mutableFloatStateOf((prefs.getInt("wifiManualBufferBiasPermille", 500).coerceIn(0, 1000)) / 1000f) }
     var wifiTransport by remember { mutableIntStateOf(prefs.getInt("wifiTransport", 0).coerceIn(0, 1)) }
@@ -274,8 +275,8 @@ private fun LiveAudioProcessApp() {
     var usbStats by remember { mutableStateOf(LongArray(18)) }
     var inputInfo by remember { mutableStateOf(LongArray(14)) }
     var outputInfo by remember { mutableStateOf(LongArray(16)) }
-    var wifiReceiveStats by remember { mutableStateOf(LongArray(8)) }
-    var wifiTransmitStats by remember { mutableStateOf(LongArray(6)) }
+    var wifiReceiveStats by remember { mutableStateOf(LongArray(10)) }
+    var wifiTransmitStats by remember { mutableStateOf(LongArray(7)) }
     var nativeLogs by remember { mutableStateOf(emptyList<String>()) }
     var deviceInfo by remember { mutableStateOf(DeviceInfoSnapshot()) }
     var systemInputBufferMaxMs by remember { mutableStateOf(prefs.getInt("systemInputBufferMaxMs", 20).coerceIn(5, 200).toString()) }
@@ -385,8 +386,8 @@ private fun LiveAudioProcessApp() {
         if (!running) {
             inputInfo = LongArray(14)
             outputInfo = LongArray(16)
-            wifiReceiveStats = LongArray(8)
-            wifiTransmitStats = LongArray(6)
+            wifiReceiveStats = LongArray(10)
+            wifiTransmitStats = LongArray(7)
         }
         if (!running || currentPage != 0) return@LaunchedEffect
         while (running && NativeAudio.available) {
@@ -398,8 +399,8 @@ private fun LiveAudioProcessApp() {
                     NetworkStatsSnapshot(
                         NativeAudio.inputInfo(),
                         NativeAudio.outputInfo(),
-                        if (input == InputSource.WIFI) NativeAudio.networkReceiveStats() else LongArray(8),
-                        if (wifiOutputEnabled && input != InputSource.WIFI) NativeAudio.networkTransmitStats() else LongArray(6)
+                        if (input == InputSource.WIFI) NativeAudio.networkReceiveStats() else LongArray(10),
+                        if (wifiOutputEnabled && input != InputSource.WIFI) NativeAudio.networkTransmitStats() else LongArray(7)
                     )
                 }
             if (!inputInfo.contentEquals(latestNetworkStats.input)) inputInfo = latestNetworkStats.input
@@ -431,7 +432,7 @@ private fun LiveAudioProcessApp() {
         wifiOutputEnabled -> engine.configureNetwork(1, wifiTransport, wifiCodec, wifiAacBitrate, wifiSendHost, wifiSendPort.toIntOrNull() ?: 40100, wifiPacketDuration.toIntOrNull()?.coerceIn(1, 100) ?: 20, 0, 50, 1000)
         else -> { engine.clearNetwork(); false }
     }
-    fun syncEngine() { val inputBufferMaxMs = (systemInputBufferMaxMs.toIntOrNull() ?: 20).coerceIn(5, 200); val outputBufferMaxMs = (systemOutputBufferMaxMs.toIntOrNull() ?: 40).coerceIn(5, 200); val usbInputMaxMs = (usbInputBufferMaxMs.toIntOrNull() ?: 20).coerceIn(5, 200); engine.configureAudioFormat(rate, outputRate, usbInputBitDepth, usbOutputBitDepth); engine.bufferFrames = buffer; engine.wifiClockCorrectionEnabled = wifiClockCorrectionEnabled; engine.wifiQosEnabled = wifiQosEnabled; engine.wifiDynamicBufferEnabled = wifiDynamicBufferEnabled; engine.wifiManualBufferBias = wifiManualBufferBias; engine.wifiOpusFrameMs = wifiOpusFrameMs; engine.wifiOpusProfile = wifiOpusProfile; engine.configureSystemOutputBuffer(outputBufferMaxMs); engine.configureSystemInputBuffer(inputBufferMaxMs); engine.configureUsbInputBuffer(usbInputMaxMs); engine.eqGain = effects.eqGain; engine.eqFrequency = effects.eqFrequency; engine.eqQ = effects.eqQ; engine.eq2Frequency = effects.eq2Frequency; engine.eq2Gain = effects.eq2Gain; engine.eq2Q = effects.eq2Q; engine.eq3Frequency = effects.eq3Frequency; engine.eq3Gain = effects.eq3Gain; engine.eq3Q = effects.eq3Q; engine.eq4Frequency = effects.eq4Frequency; engine.eq4Gain = effects.eq4Gain; engine.eq4Q = effects.eq4Q; engine.reverbRoom = effects.reverbRoom; engine.reverbDecay = effects.reverbDecay; engine.reverbDamping = effects.reverbDamping; engine.reverbMix = effects.reverbMix / 100f; engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease; engine.loudnessTarget = effects.loudnessTarget; engine.loudnessLra = effects.loudnessLra; engine.loudnessTruePeak = effects.loudnessTruePeak; engine.loudnessEnabled = effects.loudnessEnabled; engine.wifiInputTimeoutMs = ((wifiInputTimeout.toFloatOrNull() ?: 1f) * 1000f).toInt().coerceIn(100, 60_000); engine.updateRouting(input, output, channelPair); effects.save(prefs); prefs.edit().putInt("rate", rate).putInt("outputRate", outputRate).putInt("usbInputBitDepth", usbInputBitDepth).putInt("usbOutputBitDepth", usbOutputBitDepth).putInt("buffer", buffer).putInt("systemOutputBufferMaxMs", outputBufferMaxMs).putInt("systemInputBufferMaxMs", inputBufferMaxMs).putInt("usbInputBufferMaxMs", usbInputMaxMs).putInt("channelPair", channelPair).putString("input", input.name).putString("output", output.name).putBoolean("wifiOutputEnabled", wifiOutputEnabled).putBoolean("wifiClockCorrectionEnabled", wifiClockCorrectionEnabled).putBoolean("wifiDynamicBufferEnabled", wifiDynamicBufferEnabled).putInt("wifiManualBufferBiasPermille", (wifiManualBufferBias * 1000f).roundToInt()).putBoolean("wifiActive", wifiActive).apply() }
+    fun syncEngine() { val inputBufferMaxMs = (systemInputBufferMaxMs.toIntOrNull() ?: 20).coerceIn(5, 200); val outputBufferMaxMs = (systemOutputBufferMaxMs.toIntOrNull() ?: 40).coerceIn(5, 200); val usbInputMaxMs = (usbInputBufferMaxMs.toIntOrNull() ?: 20).coerceIn(5, 200); engine.configureAudioFormat(rate, outputRate, usbInputBitDepth, usbOutputBitDepth); engine.bufferFrames = buffer; engine.wifiClockCorrectionEnabled = wifiClockCorrectionEnabled; engine.wifiQosEnabled = wifiQosEnabled; engine.wifiRetransmitEnabled = wifiRetransmitEnabled; engine.wifiDynamicBufferEnabled = wifiDynamicBufferEnabled; engine.wifiManualBufferBias = wifiManualBufferBias; engine.wifiOpusFrameMs = wifiOpusFrameMs; engine.wifiOpusProfile = wifiOpusProfile; engine.configureSystemOutputBuffer(outputBufferMaxMs); engine.configureSystemInputBuffer(inputBufferMaxMs); engine.configureUsbInputBuffer(usbInputMaxMs); engine.eqGain = effects.eqGain; engine.eqFrequency = effects.eqFrequency; engine.eqQ = effects.eqQ; engine.eq2Frequency = effects.eq2Frequency; engine.eq2Gain = effects.eq2Gain; engine.eq2Q = effects.eq2Q; engine.eq3Frequency = effects.eq3Frequency; engine.eq3Gain = effects.eq3Gain; engine.eq3Q = effects.eq3Q; engine.eq4Frequency = effects.eq4Frequency; engine.eq4Gain = effects.eq4Gain; engine.eq4Q = effects.eq4Q; engine.reverbRoom = effects.reverbRoom; engine.reverbDecay = effects.reverbDecay; engine.reverbDamping = effects.reverbDamping; engine.reverbMix = effects.reverbMix / 100f; engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease; engine.loudnessTarget = effects.loudnessTarget; engine.loudnessLra = effects.loudnessLra; engine.loudnessTruePeak = effects.loudnessTruePeak; engine.loudnessEnabled = effects.loudnessEnabled; engine.wifiInputTimeoutMs = ((wifiInputTimeout.toFloatOrNull() ?: 1f) * 1000f).toInt().coerceIn(100, 60_000); engine.updateRouting(input, output, channelPair); effects.save(prefs); prefs.edit().putInt("rate", rate).putInt("outputRate", outputRate).putInt("usbInputBitDepth", usbInputBitDepth).putInt("usbOutputBitDepth", usbOutputBitDepth).putInt("buffer", buffer).putInt("systemOutputBufferMaxMs", outputBufferMaxMs).putInt("systemInputBufferMaxMs", inputBufferMaxMs).putInt("usbInputBufferMaxMs", usbInputMaxMs).putInt("channelPair", channelPair).putString("input", input.name).putString("output", output.name).putBoolean("wifiOutputEnabled", wifiOutputEnabled).putBoolean("wifiClockCorrectionEnabled", wifiClockCorrectionEnabled).putBoolean("wifiDynamicBufferEnabled", wifiDynamicBufferEnabled).putBoolean("wifiRetransmitEnabled", wifiRetransmitEnabled).putInt("wifiManualBufferBiasPermille", (wifiManualBufferBias * 1000f).roundToInt()).putBoolean("wifiActive", wifiActive).apply() }
     LaunchedEffect(input, channelPair, output, wifiOutputEnabled, wifiClockCorrectionEnabled, wifiCodec, wifiOpusFrameMs, wifiOpusProfile, rate, outputRate, usbInputBitDepth, usbOutputBitDepth, buffer, effects) { syncEngine(); engine.dspEnabled = effects.dspEnabled; engine.eqEnabled = effects.eqEnabled; engine.reverbEnabled = effects.reverbEnabled; engine.limiterEnabled = effects.limiterEnabled; engine.loudnessEnabled = effects.loudnessEnabled; if (input == InputSource.WIFI || wifiOutputEnabled) wifiActive = configureWifiForCurrentRoute() else { engine.clearNetwork(); wifiActive = false }; engine.refreshNativeParameters() }
     LaunchedEffect(wifiDynamicBufferEnabled, wifiManualBufferBias) {
         engine.configureWifiBufferTarget(wifiDynamicBufferEnabled, wifiManualBufferBias)
@@ -451,6 +452,10 @@ private fun LiveAudioProcessApp() {
     LaunchedEffect(wifiQosEnabled) {
         engine.configureWifiQos(wifiQosEnabled)
         prefs.edit().putBoolean("wifiQosEnabled", wifiQosEnabled).apply()
+    }
+    LaunchedEffect(wifiRetransmitEnabled) {
+        engine.configureWifiRetransmit(wifiRetransmitEnabled)
+        prefs.edit().putBoolean("wifiRetransmitEnabled", wifiRetransmitEnabled).apply()
     }
     LaunchedEffect(outputVolumePercent, output, running, usbOutputHostActive) {
         if (output == OutputSource.USB) {
@@ -659,7 +664,7 @@ private fun LiveAudioProcessApp() {
                 UsbAudioPanel(usbMaxBuffer, usbInputBufferMaxMs, usbInputBitDepth, usbOutputBitDepth, usbInputBurstPackets, usbOutputBurstPackets, input == InputSource.USB, output == OutputSource.USB, running, usbStats, { usbMaxBuffer = it }, { usbInputBufferMaxMs = it }, { usbInputBitDepth = it }, { usbOutputBitDepth = it }, { usbInputBurstPackets = it }, { usbOutputBurstPackets = it })
             }
             Float32Badge()
-            WifiAudioPanel(rate, wifiSendHost, wifiSendPort, wifiTransport, wifiCodec, wifiAacBitrate, wifiPacketDuration, wifiOpusFrameMs, wifiOpusProfile, wifiOutputEnabled && wifiActive, { wifiSendHost = it }, { wifiSendPort = it }, { wifiTransport = it; prefs.edit().putInt("wifiTransport", it).apply() }, { wifiCodec = it }, { wifiAacBitrate = it }, { wifiPacketDuration = it }, { wifiOpusFrameMs = it }, { wifiOpusProfile = it }, wifiReceiveHost, wifiReceivePort, wifiMinBuffer, wifiMaxBuffer, wifiMaxHold, wifiInputTimeout, input == InputSource.WIFI && wifiActive, { wifiReceiveHost = it }, { wifiReceivePort = it }, { wifiMinBuffer = it }, { wifiMaxBuffer = it }, { wifiMaxHold = it }, { wifiInputTimeout = it }, wifiClockCorrectionEnabled, { enabled -> wifiClockCorrectionEnabled = enabled }, wifiLowLatencyEnabled, { enabled -> wifiLowLatencyEnabled = enabled }, wifiDynamicBufferEnabled, { enabled -> wifiDynamicBufferEnabled = enabled }, wifiManualBufferBias, { bias -> wifiManualBufferBias = bias }, clockCorrectionPpm = wifiClockCorrectionPpm, onClockCorrectionPpm = { ppm -> wifiClockCorrectionPpm = ppm }, networkQosEnabled = wifiQosEnabled, onNetworkQosEnabled = { enabled -> wifiQosEnabled = enabled })
+            WifiAudioPanel(rate, wifiSendHost, wifiSendPort, wifiTransport, wifiCodec, wifiAacBitrate, wifiPacketDuration, wifiOpusFrameMs, wifiOpusProfile, wifiOutputEnabled && wifiActive, { wifiSendHost = it }, { wifiSendPort = it }, { wifiTransport = it; prefs.edit().putInt("wifiTransport", it).apply() }, { wifiCodec = it }, { wifiAacBitrate = it }, { wifiPacketDuration = it }, { wifiOpusFrameMs = it }, { wifiOpusProfile = it }, wifiReceiveHost, wifiReceivePort, wifiMinBuffer, wifiMaxBuffer, wifiMaxHold, wifiInputTimeout, input == InputSource.WIFI && wifiActive, { wifiReceiveHost = it }, { wifiReceivePort = it }, { wifiMinBuffer = it }, { wifiMaxBuffer = it }, { wifiMaxHold = it }, { wifiInputTimeout = it }, wifiClockCorrectionEnabled, { enabled -> wifiClockCorrectionEnabled = enabled }, wifiLowLatencyEnabled, { enabled -> wifiLowLatencyEnabled = enabled }, wifiDynamicBufferEnabled, { enabled -> wifiDynamicBufferEnabled = enabled }, wifiManualBufferBias, { bias -> wifiManualBufferBias = bias }, clockCorrectionPpm = wifiClockCorrectionPpm, onClockCorrectionPpm = { ppm -> wifiClockCorrectionPpm = ppm }, networkQosEnabled = wifiQosEnabled, onNetworkQosEnabled = { enabled -> wifiQosEnabled = enabled }, retransmitEnabled = wifiRetransmitEnabled, onRetransmitEnabled = { enabled -> wifiRetransmitEnabled = enabled })
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                 Button(onClick = {
                     if (!hasPermission) {
@@ -940,6 +945,7 @@ private fun LogPanel(lines: List<String>, onClear: () -> Unit) {
     val jitterTenthsMs = stats.getOrElse(6) { 0L }
     val maxJitterTenthsMs = stats.getOrElse(7) { 0L }
     val correctionPpm = stats.getOrElse(8) { 0L }
+    val retransmitRequests = stats.getOrElse(9) { 0L }
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Text("WI-FI AUDIO RX", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
         Text("RECEIVING", color = Teal, fontSize = 10.sp, fontWeight = FontWeight.Bold)
@@ -963,7 +969,13 @@ private fun LogPanel(lines: List<String>, onClear: () -> Unit) {
         Text("MAX JITTER %.1f ms".format(maxJitterTenthsMs / 10f), color = Color.White, fontSize = 11.sp)
     }
     Spacer(Modifier.height(4.dp))
-    Text("CLOCK CORRECTION ${if (correctionPpm >= 0) "+" else ""}${correctionPpm} ppm", color = Color.White, fontSize = 11.sp)
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text("CLOCK CORRECTION ${if (correctionPpm >= 0) "+" else ""}${correctionPpm} ppm", color = Color.White, fontSize = 11.sp)
+    }
+    Spacer(Modifier.height(4.dp))
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text("RETRANSMIT REQUESTS $retransmitRequests", color = Color.White, fontSize = 11.sp)
+    }
 }
 @Composable private fun WifiTransmitMonitor(stats: LongArray) {
     val transport = if (stats.getOrElse(0) { 0L }.toInt() == 1) "TCP" else "UDP"
@@ -972,6 +984,7 @@ private fun LogPanel(lines: List<String>, onClear: () -> Unit) {
     val bytesPerSecond = stats.getOrElse(3) { 0L }
     val packetsPerSecond = stats.getOrElse(4) { 0L }
     val jitterTenthsMs = stats.getOrElse(5) { 0L }
+    val retransmittedPackets = stats.getOrElse(6) { 0L }
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Text("WI-FI AUDIO TX", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
         Text("TRANSMITTING", color = Teal, fontSize = 10.sp, fontWeight = FontWeight.Bold)
@@ -987,6 +1000,8 @@ private fun LogPanel(lines: List<String>, onClear: () -> Unit) {
         Text("${packetsPerSecond} pkt/s", color = Color.White, fontSize = 11.sp)
         Text("JITTER %.1f ms".format(jitterTenthsMs / 10f), color = Color.White, fontSize = 11.sp)
     }
+    Spacer(Modifier.height(4.dp))
+    Text("RETRANSMITTED $retransmittedPackets", color = Color.White, fontSize = 11.sp)
 }
 
 @Composable private fun DeviceInfoPanel(info: DeviceInfoSnapshot) {

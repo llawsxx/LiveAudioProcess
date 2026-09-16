@@ -152,6 +152,7 @@ class AudioProcessingService : Service() {
             engine.wifiClockCorrectionEnabled = p.getBoolean("wifiClockCorrectionEnabled", false)
             engine.wifiLowLatencyEnabled = p.getBoolean("wifiLowLatencyEnabled", false)
             engine.wifiQosEnabled = p.getBoolean("wifiQosEnabled", false)
+            engine.wifiRetransmitEnabled = p.getBoolean("wifiRetransmitEnabled", true)
             engine.wifiOpusFrameMs = p.getInt("wifiOpusFrameMs", 20).let { if (it in listOf(5, 10, 20, 40, 60)) it else 20 }
             engine.wifiOpusProfile = p.getInt("wifiOpusProfile", 0).coerceIn(0, 2)
             engine.wifiDynamicBufferEnabled = p.getBoolean("wifiDynamicBufferEnabled", true)
