@@ -12,6 +12,9 @@ import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbManager
+import android.net.ConnectivityManager
+import android.net.wifi.WifiInfo
+import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Debug
 import android.os.Bundle
@@ -63,9 +66,38 @@ private data class DeviceInfoSnapshot(
     val currentMa: Int? = null,
     val powerMw: Int? = null,
     val temperatureC: Float? = null,
-    val ips: List<String> = emptyList()
+    val ips: List<String> = emptyList(),
+    val wifiRssiDbm: Int? = null,
+    val wifiSignalPercent: Int? = null,
+    val wifiTxLinkSpeedMbps: Int? = null,
+    val wifiRxLinkSpeedMbps: Int? = null,
+    val wifiBand: String? = null,
+    val wifiStandard: String? = null
 )
 
+private fun wifiBandLabel(frequencyMhz: Int?): String? {
+    val f = frequencyMhz ?: return null
+    if (f <= 0) return null
+    val band = when {
+        f in 2400..2500 -> "2.4 GHz"
+        f in 4900..5895 -> "5 GHz"
+        f in 5925..7125 -> "6 GHz"
+        else -> null
+    }
+    return if (band != null) "$band · $f MHz" else "$f MHz"
+}
+
+private fun wifiStandardLabel(standard: Int): String = when (standard) {
+    1 -> "Legacy"
+    4 -> "802.11n · Wi-Fi 4"
+    5 -> "802.11ac · Wi-Fi 5"
+    6 -> "802.11ax · Wi-Fi 6"
+    7 -> "802.11ad"
+    8 -> "802.11be · Wi-Fi 7"
+    else -> "未知"
+}
+
+@Suppress("DEPRECATION")
 private fun readDeviceInfo(context: Context): DeviceInfoSnapshot {
     val activity = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
     val memory = ActivityManager.MemoryInfo().also(activity::getMemoryInfo)
@@ -93,13 +125,51 @@ private fun readDeviceInfo(context: Context): DeviceInfoSnapshot {
                 .map { it.hostAddress }
         }.distinct().sorted()
     }.getOrDefault(emptyList())
+    var wifiRssiDbm: Int? = null
+    var wifiSignalPercent: Int? = null
+    var wifiTxLinkSpeedMbps: Int? = null
+    var wifiRxLinkSpeedMbps: Int? = null
+    var wifiBand: String? = null
+    var wifiStandard: String? = null
+    runCatching {
+        val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val wifiInfo: WifiInfo? = if (Build.VERSION.SDK_INT >= 29) {
+            val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val capabilities = connectivity.activeNetwork?.let { connectivity.getNetworkCapabilities(it) }
+            capabilities?.transportInfo as? WifiInfo
+        } else {
+            wifiManager.connectionInfo
+        }
+        val info = wifiInfo ?: return@runCatching
+        val rssi = info.rssi.takeIf { it != -127 && it != 0 }
+        wifiRssiDbm = rssi
+        if (rssi != null) {
+            wifiSignalPercent = if (Build.VERSION.SDK_INT >= 30) {
+                val maxLevel = wifiManager.maxSignalLevel.coerceAtLeast(1)
+                wifiManager.calculateSignalLevel(rssi) * 100 / maxLevel
+            } else {
+                WifiManager.calculateSignalLevel(rssi, 100)
+            }
+        }
+        val txSpeed = if (Build.VERSION.SDK_INT >= 29) info.txLinkSpeedMbps else info.linkSpeed
+        wifiTxLinkSpeedMbps = txSpeed.takeIf { it > 0 }
+        if (Build.VERSION.SDK_INT >= 29) wifiRxLinkSpeedMbps = info.rxLinkSpeedMbps.takeIf { it > 0 }
+        wifiBand = wifiBandLabel(info.frequency)
+        if (Build.VERSION.SDK_INT >= 30) wifiStandard = wifiStandardLabel(info.wifiStandard)
+    }
     return DeviceInfoSnapshot(
         processMemoryMb = (processMemory.totalPss / 1024f).roundToInt(),
         totalMemoryMb = ((memory.totalMem - memory.availMem) / (1024L * 1024L)).toInt(),
         currentMa = currentMa,
         powerMw = powerMw,
         temperatureC = temp,
-        ips = ips
+        ips = ips,
+        wifiRssiDbm = wifiRssiDbm,
+        wifiSignalPercent = wifiSignalPercent,
+        wifiTxLinkSpeedMbps = wifiTxLinkSpeedMbps,
+        wifiRxLinkSpeedMbps = wifiRxLinkSpeedMbps,
+        wifiBand = wifiBand,
+        wifiStandard = wifiStandard
     )
 }
 
@@ -1013,6 +1083,15 @@ private fun LogPanel(lines: List<String>, onClear: () -> Unit) {
             InfoRow("当前功率", info.powerMw?.let { "${it} mW" } ?: "不可用")
             InfoRow("温度", info.temperatureC?.let { "%.1f °C".format(it) } ?: "不可用")
             InfoRow("本机 IP", info.ips.ifEmpty { listOf("不可用") }.joinToString("  "))
+            InfoRow("Wi-Fi 信号", info.wifiRssiDbm?.let { "${it} dBm" + (info.wifiSignalPercent?.let { p -> "  ·  $p%" } ?: "") } ?: "未连接")
+            InfoRow("Wi-Fi 链路速率", when {
+                info.wifiTxLinkSpeedMbps != null && info.wifiRxLinkSpeedMbps != null -> "↓${info.wifiRxLinkSpeedMbps} / ↑${info.wifiTxLinkSpeedMbps} Mbps"
+                info.wifiTxLinkSpeedMbps != null -> "↑${info.wifiTxLinkSpeedMbps} Mbps"
+                info.wifiRxLinkSpeedMbps != null -> "↓${info.wifiRxLinkSpeedMbps} Mbps"
+                else -> "不可用"
+            })
+            InfoRow("Wi-Fi 频段", info.wifiBand ?: "不可用")
+            if (info.wifiStandard != null) InfoRow("Wi-Fi 协议", info.wifiStandard)
         }
     }
 }
