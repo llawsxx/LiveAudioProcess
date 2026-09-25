@@ -15,9 +15,11 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -30,6 +32,7 @@ fun UsbAudioPanel(
     inputMaxBuffer: String,
     inputBitDepth: Int,
     outputBitDepth: Int,
+    outputDitherEnabled: Boolean,
     inputBurstPackets: Int,
     outputBurstPackets: Int,
     inputEnabled: Boolean,
@@ -40,6 +43,7 @@ fun UsbAudioPanel(
     onInputMaxBuffer: (String) -> Unit,
     onInputBitDepth: (Int) -> Unit,
     onOutputBitDepth: (Int) -> Unit,
+    onOutputDitherEnabled: (Boolean) -> Unit,
     onInputBurstPackets: (Int) -> Unit,
     onOutputBurstPackets: (Int) -> Unit
 ) {
@@ -61,7 +65,7 @@ fun UsbAudioPanel(
     ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("USB Host", color = Color.White, fontWeight = FontWeight.Bold)
-            Text("USB PCM 位深", color = muted, fontSize = 12.sp)
+            Text("USB 输入 PCM 位深", color = muted, fontSize = 12.sp)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf(16, 24, 32).forEach { bits ->
                     FilterChip(
@@ -72,11 +76,26 @@ fun UsbAudioPanel(
                     )
                 }
             }
-            Text("输出缓冲", color = muted, fontSize = 12.sp)
+            Text("USB 输出 PCM 位深", color = muted, fontSize = 12.sp)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf(16, 24, 32).forEach { bits ->
                     FilterChip(selected = outputBitDepth == bits, onClick = { onOutputBitDepth(bits) }, enabled = outputEnabled, label = { Text("$bits-bit", fontSize = 12.sp) })
                 }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("输出 TPDF 抖动", color = Color.White, fontSize = 12.sp)
+                    Text("降低 16/24-bit 量化失真", color = muted, fontSize = 10.sp)
+                }
+                Switch(
+                    checked = outputDitherEnabled,
+                    onCheckedChange = onOutputDitherEnabled,
+                    enabled = outputEnabled && outputBitDepth != 32
+                )
             }
             OutlinedTextField(
                 value = maxBuffer,

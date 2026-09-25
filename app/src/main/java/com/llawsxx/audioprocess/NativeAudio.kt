@@ -19,6 +19,7 @@ object NativeAudio {
     external fun configureNetwork(role: Int, transport: Int, codec: Int, sampleRate: Int, bitrate: Int, host: String, port: Int, packetDurationMs: Int, minBufferMs: Int, maxBufferMs: Int, maxHoldMs: Int): Boolean
     external fun configureUsbOutputBuffer(maxBufferMs: Int)
     external fun configureUsbInputBuffer(maxBufferMs: Int)
+    external fun configureUsbOutputDither(enabled: Boolean)
     external fun setUsbVolume(percent: Int): Boolean
     external fun configureOutputBufferMaxMs(maxMs: Int)
     external fun configureInputBufferMaxMs(maxMs: Int)

@@ -335,6 +335,7 @@ private fun LiveAudioProcessApp() {
     var usbInputBufferMaxMs by remember { mutableStateOf(prefs.getInt("usbInputBufferMaxMs", 20).coerceIn(5, 200).toString()) }
     var usbInputBitDepth by remember { mutableIntStateOf(prefs.getInt("usbInputBitDepth", prefs.getInt("usbBitDepth", 16)).takeIf { it == 16 || it == 24 || it == 32 } ?: 16) }
     var usbOutputBitDepth by remember { mutableIntStateOf(prefs.getInt("usbOutputBitDepth", prefs.getInt("usbBitDepth", 16)).takeIf { it == 16 || it == 24 || it == 32 } ?: 16) }
+    var usbOutputDitherEnabled by remember { mutableStateOf(prefs.getBoolean("usbOutputDitherEnabled", true)) }
     val legacyUsbBurstPackets = prefs.getInt("usbBurstPackets", 8)
     var usbInputBurstPackets by remember {
         mutableIntStateOf(prefs.getInt("usbInputBurstPackets", legacyUsbBurstPackets).takeIf { it in UsbBurstPacketOptions } ?: 8)
@@ -581,6 +582,10 @@ private fun LiveAudioProcessApp() {
             .apply()
         engine.configureUsbBursts(usbInputBurstPackets, usbOutputBurstPackets)
     }
+    LaunchedEffect(usbOutputDitherEnabled) {
+        engine.configureUsbOutputDither(usbOutputDitherEnabled)
+        prefs.edit().putBoolean("usbOutputDitherEnabled", usbOutputDitherEnabled).apply()
+    }
     LaunchedEffect(systemOutputBufferMaxMs) {
         val entered = systemOutputBufferMaxMs.toIntOrNull() ?: return@LaunchedEffect
         delay(500)
@@ -731,7 +736,7 @@ private fun LiveAudioProcessApp() {
             SystemInputPanel(inputInfo, input != InputSource.USB && input != InputSource.WIFI, systemInputBufferMaxMs) { systemInputBufferMaxMs = it }
             SystemOutputPanel(outputInfo, output != OutputSource.USB && output != OutputSource.NONE, systemOutputBufferMaxMs) { systemOutputBufferMaxMs = it }
             if (input == InputSource.USB || output == OutputSource.USB) {
-                UsbAudioPanel(usbMaxBuffer, usbInputBufferMaxMs, usbInputBitDepth, usbOutputBitDepth, usbInputBurstPackets, usbOutputBurstPackets, input == InputSource.USB, output == OutputSource.USB, running, usbStats, { usbMaxBuffer = it }, { usbInputBufferMaxMs = it }, { usbInputBitDepth = it }, { usbOutputBitDepth = it }, { usbInputBurstPackets = it }, { usbOutputBurstPackets = it })
+                UsbAudioPanel(usbMaxBuffer, usbInputBufferMaxMs, usbInputBitDepth, usbOutputBitDepth, usbOutputDitherEnabled, usbInputBurstPackets, usbOutputBurstPackets, input == InputSource.USB, output == OutputSource.USB, running, usbStats, { usbMaxBuffer = it }, { usbInputBufferMaxMs = it }, { usbInputBitDepth = it }, { usbOutputBitDepth = it }, { usbOutputDitherEnabled = it }, { usbInputBurstPackets = it }, { usbOutputBurstPackets = it })
             }
             Float32Badge()
             WifiAudioPanel(rate, wifiSendHost, wifiSendPort, wifiTransport, wifiCodec, wifiAacBitrate, wifiPacketDuration, wifiOpusFrameMs, wifiOpusProfile, wifiOutputEnabled && wifiActive, { wifiSendHost = it }, { wifiSendPort = it }, { wifiTransport = it; prefs.edit().putInt("wifiTransport", it).apply() }, { wifiCodec = it }, { wifiAacBitrate = it }, { wifiPacketDuration = it }, { wifiOpusFrameMs = it }, { wifiOpusProfile = it }, wifiReceiveHost, wifiReceivePort, wifiMinBuffer, wifiMaxBuffer, wifiMaxHold, wifiInputTimeout, input == InputSource.WIFI && wifiActive, { wifiReceiveHost = it }, { wifiReceivePort = it }, { wifiMinBuffer = it }, { wifiMaxBuffer = it }, { wifiMaxHold = it }, { wifiInputTimeout = it }, wifiClockCorrectionEnabled, { enabled -> wifiClockCorrectionEnabled = enabled }, wifiLowLatencyEnabled, { enabled -> wifiLowLatencyEnabled = enabled }, wifiDynamicBufferEnabled, { enabled -> wifiDynamicBufferEnabled = enabled }, wifiManualBufferBias, { bias -> wifiManualBufferBias = bias }, clockCorrectionPpm = wifiClockCorrectionPpm, onClockCorrectionPpm = { ppm -> wifiClockCorrectionPpm = ppm }, networkQosEnabled = wifiQosEnabled, onNetworkQosEnabled = { enabled -> wifiQosEnabled = enabled }, retransmitEnabled = wifiRetransmitEnabled, onRetransmitEnabled = { enabled -> wifiRetransmitEnabled = enabled })

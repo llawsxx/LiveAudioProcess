@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -133,6 +134,11 @@ public:
         inputMaxBufferMs_.store(std::clamp(maxBufferMs, 5, 200), std::memory_order_relaxed);
     }
 
+    void configureOutputDither(bool enabled) {
+        outputDitherEnabled_.store(enabled, std::memory_order_relaxed);
+        USB_HOST_LOGI("USB output TPDF dither %s", enabled ? "enabled" : "disabled");
+    }
+
     bool setVolumePercent(int percent) {
         if (!outputRoute_) return false;
         if (!volumeRangeValid_) {
@@ -190,12 +196,39 @@ private:
         if (n==4) { int32_t v=(int32_t)(s[0]|(s[1]<<8)|(s[2]<<16)|(s[3]<<24)); return (float)v/2147483648.0f; }
         return 0.0f;
     }
-    static void encode(uint8_t *s, float x, int n) {
-        x=std::max(-1.0f,std::min(1.0f,x));
-        if(n==2){int32_t v=(int32_t)(x*32767.0f);s[0]=(uint8_t)v;s[1]=(uint8_t)(v>>8);}
-        else if(n==3){int32_t v=(int32_t)(x*8388607.0f);s[0]=(uint8_t)v;s[1]=(uint8_t)(v>>8);s[2]=(uint8_t)(v>>16);}
-        else if(n==4){int64_t v=(int64_t)(x*2147483647.0f);s[0]=(uint8_t)v;s[1]=(uint8_t)(v>>8);s[2]=(uint8_t)(v>>16);s[3]=(uint8_t)(v>>24);}
-        else std::memset(s,0,(size_t)n);
+    static uint32_t nextRandom(uint32_t &state) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return state;
+    }
+    static double tpdfDither(uint32_t &state, int bitResolution) {
+        const double first = (double)(nextRandom(state) >> 8) / 16777216.0;
+        const double second = (double)(nextRandom(state) >> 8) / 16777216.0;
+        return (first - second) / (double)(1u << (bitResolution - 1));
+    }
+    static void encode(uint8_t *s, float x, int n, int bitResolution,
+                       bool dither, uint32_t &randomState) {
+        if (!std::isfinite(x)) x = 0.0f;
+        double sample = std::clamp((double)x, -1.0, 1.0);
+        if (dither && (bitResolution == 16 || bitResolution == 24))
+            sample += tpdfDither(randomState, bitResolution);
+
+        if (n == 2) {
+            int64_t v = std::llround(sample * 32768.0);
+            v = std::clamp<int64_t>(v, -32768, 32767);
+            s[0]=(uint8_t)v;s[1]=(uint8_t)(v>>8);
+        } else if (n == 3) {
+            int64_t v = std::llround(sample * 8388608.0);
+            v = std::clamp<int64_t>(v, -8388608, 8388607);
+            s[0]=(uint8_t)v;s[1]=(uint8_t)(v>>8);s[2]=(uint8_t)(v>>16);
+        } else if (n == 4) {
+            int64_t v = std::llround(sample * 2147483648.0);
+            v = std::clamp<int64_t>(v, -2147483648LL, 2147483647LL);
+            s[0]=(uint8_t)v;s[1]=(uint8_t)(v>>8);s[2]=(uint8_t)(v>>16);s[3]=(uint8_t)(v>>24);
+        } else {
+            std::memset(s,0,(size_t)n);
+        }
     }
     void onInput(uint8_t *data,uint len,int bytes,int ch){
         uint64_t begin=now_us(); if(stopping_.load(std::memory_order_acquire))return; int stride=bytes*ch; if(stride<=0)return;
@@ -221,6 +254,8 @@ private:
             update_max(outputCallbackMaxUs_,now_us()-begin); return;
         }
         uint32_t offset=read&kRingMask;
+        const bool dither = outputDitherEnabled_.load(std::memory_order_relaxed);
+        const int bits = (int)outputBitResolution_;
         for(uint32_t i=0;i<count;++i){
             const double position = outputResamplePhase_ + (double)i * step;
             const uint32_t sourceOffset = (uint32_t)position;
@@ -229,7 +264,10 @@ private:
             const uint32_t p1=(offset+sourceOffset+1u)&kRingMask;
             const float left = outputRing_[2u*p0] + (outputRing_[2u*p1] - outputRing_[2u*p0]) * frac;
             const float right = outputRing_[2u*p0+1u] + (outputRing_[2u*p1+1u] - outputRing_[2u*p0+1u]) * frac;
-            uint8_t*f=data+(size_t)i*stride;encode(f,left,bytes);if(ch>1)encode(f+bytes,right,bytes);for(int c=2;c<ch;++c)encode(f+c*bytes,0.0f,bytes);
+            uint8_t*f=data+(size_t)i*stride;
+            encode(f,left,bytes,bits,dither,outputDitherState_[0]);
+            if(ch>1)encode(f+bytes,right,bytes,bits,dither,outputDitherState_[1]);
+            for(int c=2;c<ch;++c)std::memset(f+c*bytes,0,(size_t)bytes);
         }
         const uint32_t consumed = (uint32_t)endPosition;
         outputResamplePhase_=endPosition-(double)consumed;
@@ -316,7 +354,7 @@ private:
         return nullptr;
     }
     void updateOutputBufferFrames(){if(outputTransferFrames_<=0)return;int maxMs=std::clamp(outputMaxBufferMs_.load(),5,200);uint32_t maxFrames=std::max<uint32_t>({(uint32_t)outputTransferFrames_,(uint32_t)processingFrames_,(uint32_t)((processingRate_*maxMs+999)/1000)});maxFrames=std::min<uint32_t>(maxFrames,kRingFrames);uint32_t prefill=std::max<uint32_t>({maxFrames/2u,(uint32_t)outputTransferFrames_,(uint32_t)processingFrames_});if(prefill>maxFrames)prefill=maxFrames;outputPrerollFrames_.store(prefill);outputMaxPrerollFrames_.store(maxFrames);}
-    std::shared_ptr<uac::uac_context> context_;std::shared_ptr<uac::uac_device_handle> device_;std::shared_ptr<uac::uac_stream_handle> inputStream_,outputStream_;const uac::uac_audio_route *outputRoute_=nullptr;bool volumeRangeValid_=false,volumeRawValid_=false;int32_t volumeMin_=0,volumeMax_=0,volumeRes_=0,volumeRaw_=0;std::atomic<bool> stopping_{false};int processingRate_=48000,inputRate_=48000,inputBitDepth_=16,outputRate_=48000,outputBitDepth_=16,inputBurstPackets_=8,outputBurstPackets_=8,outputTransferFrames_=0,processingFrames_=256;double inputResamplePhase_=0.0,outputResamplePhase_=0.0;std::vector<float> inputRing_,outputRing_;std::atomic<uint32_t> inputRead_{0},inputWrite_{0},outputRead_{0},outputWrite_{0};std::atomic<int> inputMaxBufferMs_{20},outputMaxBufferMs_{50};std::atomic<uint32_t> outputPrerollFrames_{1},outputMaxPrerollFrames_{1};std::atomic<bool> outputPrimed_{false},outputHasData_{false};std::atomic<uint64_t> inputRingOverruns_{0},inputBufferClears_{0},outputRingOverruns_{0},outputUnderruns_{0},outputBufferClears_{0},inputCallbackMaxUs_{0},outputCallbackMaxUs_{0};uint32_t inputSampleRate_=0,outputSampleRate_=0;uint8_t inputBitResolution_=0,inputChannels_=0,outputBitResolution_=0,outputChannels_=0;
+    std::shared_ptr<uac::uac_context> context_;std::shared_ptr<uac::uac_device_handle> device_;std::shared_ptr<uac::uac_stream_handle> inputStream_,outputStream_;const uac::uac_audio_route *outputRoute_=nullptr;bool volumeRangeValid_=false,volumeRawValid_=false;int32_t volumeMin_=0,volumeMax_=0,volumeRes_=0,volumeRaw_=0;std::atomic<bool> stopping_{false};int processingRate_=48000,inputRate_=48000,inputBitDepth_=16,outputRate_=48000,outputBitDepth_=16,inputBurstPackets_=8,outputBurstPackets_=8,outputTransferFrames_=0,processingFrames_=256;double inputResamplePhase_=0.0,outputResamplePhase_=0.0;std::vector<float> inputRing_,outputRing_;std::atomic<uint32_t> inputRead_{0},inputWrite_{0},outputRead_{0},outputWrite_{0};std::atomic<int> inputMaxBufferMs_{20},outputMaxBufferMs_{50};std::atomic<uint32_t> outputPrerollFrames_{1},outputMaxPrerollFrames_{1};std::atomic<bool> outputPrimed_{false},outputHasData_{false},outputDitherEnabled_{true};uint32_t outputDitherState_[2]={0x13579BDFu,0x2468ACE1u};std::atomic<uint64_t> inputRingOverruns_{0},inputBufferClears_{0},outputRingOverruns_{0},outputUnderruns_{0},outputBufferClears_{0},inputCallbackMaxUs_{0},outputCallbackMaxUs_{0};uint32_t inputSampleRate_=0,outputSampleRate_=0;uint8_t inputBitResolution_=0,inputChannels_=0,outputBitResolution_=0,outputChannels_=0;
 };
 }
 extern "C" usb_host_audio_t usb_host_audio_start(int fd,int processingRate,int inputRate,int inputBitDepth,int outputRate,int outputBitDepth,int in,int out,int maxMs,int processingFrames,int inputBurst,int outputBurst){try{return new UsbHostAudio(fd,processingRate,inputRate,inputBitDepth,outputRate,outputBitDepth,in!=0,out!=0,maxMs,processingFrames,inputBurst,outputBurst);}catch(const std::exception&e){USB_HOST_LOGE("USB Host audio start failed: %s",e.what());return nullptr;}catch(...){USB_HOST_LOGE("USB Host audio start failed");return nullptr;}}
@@ -324,6 +362,7 @@ extern "C" int usb_host_audio_read(usb_host_audio_t a,float*d,int n){return a?st
 extern "C" int usb_host_audio_write(usb_host_audio_t a,const float*d,int n){return a?static_cast<UsbHostAudio*>(a)->write(d,n):0;}
 extern "C" void usb_host_audio_configure_output_buffer(usb_host_audio_t a,int maxMs){if(a)static_cast<UsbHostAudio*>(a)->configureOutputBuffer(maxMs);}
 extern "C" void usb_host_audio_configure_input_buffer(usb_host_audio_t a,int maxMs){if(a)static_cast<UsbHostAudio*>(a)->configureInputBuffer(maxMs);}
+extern "C" void usb_host_audio_configure_output_dither(usb_host_audio_t a,int enabled){if(a)static_cast<UsbHostAudio*>(a)->configureOutputDither(enabled!=0);}
 extern "C" int usb_host_audio_set_volume(usb_host_audio_t a,int percent){return a&&static_cast<UsbHostAudio*>(a)->setVolumePercent(percent)?1:0;}
 extern "C" int usb_host_audio_has_failed(usb_host_audio_t a){return a&&static_cast<UsbHostAudio*>(a)->hasFailed()?1:0;}
 extern "C" void usb_host_audio_get_stats(usb_host_audio_t a,usb_host_audio_stats_t*stats){if(!stats)return;*stats=a?static_cast<UsbHostAudio*>(a)->stats():usb_host_audio_stats_t{};}

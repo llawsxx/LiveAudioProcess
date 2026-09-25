@@ -115,6 +115,7 @@ class AudioEngine(private val context: Context) {
         private set
     @Volatile var usbOutputBitDepth = 16
         private set
+    @Volatile var usbOutputDitherEnabled = true
     @Volatile var usbInputBurstPackets = 8
         private set
     @Volatile var usbOutputBurstPackets = 8
@@ -297,6 +298,10 @@ class AudioEngine(private val context: Context) {
         val normalized = maxBufferMs.coerceIn(5, 200)
         usbInputBufferMaxMs = normalized
         if (NativeAudio.available) NativeAudio.configureUsbInputBuffer(normalized)
+    }
+    fun configureUsbOutputDither(enabled: Boolean) {
+        usbOutputDitherEnabled = enabled
+        if (NativeAudio.available) NativeAudio.configureUsbOutputDither(enabled)
     }
     fun configureAudioFormat(requestedSampleRate: Int, requestedOutputSampleRate: Int, requestedUsbInputBitDepth: Int, requestedUsbOutputBitDepth: Int) {
         val normalizedRate = requestedSampleRate.takeIf { it == 44_100 || it == 48_000 || it == 96_000 } ?: 48_000
