@@ -132,6 +132,11 @@ class AudioProcessingService : Service() {
         )
         engine.wifiInputTimeoutMs = (((p.getString("wifiInputTimeout", "1.0")?.toFloatOrNull() ?: 1f) * 1000f).toInt()).coerceIn(100, 60_000)
         engine.inputPair = p.getInt("channelPair", 0)
+        engine.configureDeviceSelection(
+            p.getString("systemInputDeviceKey", SYSTEM_DEVICE_BUILTIN_INPUT) ?: SYSTEM_DEVICE_BUILTIN_INPUT,
+            p.getString("systemOutputDeviceKey", SYSTEM_DEVICE_BUILTIN_OUTPUT) ?: SYSTEM_DEVICE_BUILTIN_OUTPUT,
+            p.getString("usbHostDeviceKey", USB_HOST_DEVICE_AUTO) ?: USB_HOST_DEVICE_AUTO
+        )
         engine.inputSource = runCatching { InputSource.valueOf(p.getString("input", InputSource.BUILT_IN.name)!!) }.getOrDefault(InputSource.BUILT_IN)
         engine.outputSource = runCatching { OutputSource.valueOf(p.getString("output", OutputSource.SPEAKER.name)!!) }.getOrDefault(OutputSource.SPEAKER)
         engine.outputVolumePercent = if (engine.outputSource == OutputSource.USB) {

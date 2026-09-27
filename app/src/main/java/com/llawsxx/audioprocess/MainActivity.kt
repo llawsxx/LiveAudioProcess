@@ -203,9 +203,9 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
-    fun requestUsbAudioPermission(onResult: (Boolean) -> Unit) {
+    fun requestUsbAudioPermission(deviceKey: String = USB_HOST_DEVICE_AUTO, onResult: (Boolean) -> Unit) {
         val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
-        val device = usbAudioDevice(usbManager)
+        val device = findUsbAudioDevice(usbManager, deviceKey)
         if (device == null) {
             // Keep the user's USB route selection even while no device is
             // connected; AudioEngine will fall back to the system route and
@@ -226,17 +226,10 @@ class MainActivity : ComponentActivity() {
         usbManager.requestPermission(device, permissionIntent)
     }
 
-    fun hasUsbAudioDevice(): Boolean {
+    fun hasUsbAudioDevice(deviceKey: String = USB_HOST_DEVICE_AUTO): Boolean {
         val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
-        return usbAudioDevice(usbManager) != null
+        return findUsbAudioDevice(usbManager, deviceKey) != null
     }
-
-    private fun usbAudioDevice(usbManager: UsbManager) =
-        usbManager.deviceList.values.firstOrNull { usbDevice ->
-            (0 until usbDevice.interfaceCount).any {
-                usbDevice.getInterface(it).interfaceClass == UsbConstants.USB_CLASS_AUDIO
-            }
-        }
 }
 
 private val Ink = Color(0xFF101417)
@@ -336,6 +329,10 @@ private fun LiveAudioProcessApp() {
     var usbInputBitDepth by remember { mutableIntStateOf(prefs.getInt("usbInputBitDepth", prefs.getInt("usbBitDepth", 16)).takeIf { it == 16 || it == 24 || it == 32 } ?: 16) }
     var usbOutputBitDepth by remember { mutableIntStateOf(prefs.getInt("usbOutputBitDepth", prefs.getInt("usbBitDepth", 16)).takeIf { it == 16 || it == 24 || it == 32 } ?: 16) }
     var usbOutputDitherEnabled by remember { mutableStateOf(prefs.getBoolean("usbOutputDitherEnabled", true)) }
+    var systemInputDeviceKey by remember { mutableStateOf(prefs.getString("systemInputDeviceKey", SYSTEM_DEVICE_BUILTIN_INPUT) ?: SYSTEM_DEVICE_BUILTIN_INPUT) }
+    var systemOutputDeviceKey by remember { mutableStateOf(prefs.getString("systemOutputDeviceKey", SYSTEM_DEVICE_BUILTIN_OUTPUT) ?: SYSTEM_DEVICE_BUILTIN_OUTPUT) }
+    var usbHostDeviceKey by remember { mutableStateOf(prefs.getString("usbHostDeviceKey", USB_HOST_DEVICE_AUTO) ?: USB_HOST_DEVICE_AUTO) }
+    var deviceChoicesEpoch by remember { mutableIntStateOf(0) }
     val legacyUsbBurstPackets = prefs.getInt("usbBurstPackets", 8)
     var usbInputBurstPackets by remember {
         mutableIntStateOf(prefs.getInt("usbInputBurstPackets", legacyUsbBurstPackets).takeIf { it in UsbBurstPacketOptions } ?: 8)
@@ -362,7 +359,10 @@ private fun LiveAudioProcessApp() {
     var elapsed by remember { mutableIntStateOf(0) }
     var hasPermission by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) }
     var pendingBluetoothOutput by remember { mutableStateOf<OutputSource?>(null) }
-    val channelPairs = remember(input) { if (input == InputSource.USB) engine.availableInputPairs() else listOf(ChannelPair(0, "Mono / Mic")) }
+    val systemInputDevices = remember(deviceChoicesEpoch) { engine.availableSystemInputDevices() }
+    val systemOutputDevices = remember(deviceChoicesEpoch) { engine.availableSystemOutputDevices() }
+    val usbHostDevices = remember(deviceChoicesEpoch) { engine.availableUsbHostDevices() }
+    val channelPairs = remember(input, usbHostDeviceKey, deviceChoicesEpoch) { if (input == InputSource.USB) engine.availableInputPairs() else listOf(ChannelPair(0, "Mono / Mic")) }
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { hasPermission = it }
     val bluetoothPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted -> if (granted) pendingBluetoothOutput?.let { output = it }; pendingBluetoothOutput = null }
     DisposableEffect(activity, screenAlwaysOn) {
@@ -376,9 +376,35 @@ private fun LiveAudioProcessApp() {
     }
     DisposableEffect(engine) { onDispose { } }
     LaunchedEffect(Unit) {
+        var lastInputChoices = emptyList<AudioDeviceChoice>()
+        var lastOutputChoices = emptyList<AudioDeviceChoice>()
+        var lastUsbChoices = emptyList<AudioDeviceChoice>()
         while (true) {
+            val currentInputChoices = engine.availableSystemInputDevices()
+            val currentOutputChoices = engine.availableSystemOutputDevices()
+            val currentUsbChoices = engine.availableUsbHostDevices()
+            if (currentInputChoices != lastInputChoices || currentOutputChoices != lastOutputChoices || currentUsbChoices != lastUsbChoices) {
+                lastInputChoices = currentInputChoices
+                lastOutputChoices = currentOutputChoices
+                lastUsbChoices = currentUsbChoices
+                deviceChoicesEpoch++
+            }
             running = engine.isRunning
             recording = engine.isRecording
+            if (running && !engine.deviceSwitchInProgress &&
+                engine.routeNotice?.startsWith("设备切换失败，已恢复") == true &&
+                (systemInputDeviceKey != engine.systemInputDeviceKey ||
+                    systemOutputDeviceKey != engine.systemOutputDeviceKey ||
+                    usbHostDeviceKey != engine.usbHostDeviceKey)) {
+                systemInputDeviceKey = engine.systemInputDeviceKey
+                systemOutputDeviceKey = engine.systemOutputDeviceKey
+                usbHostDeviceKey = engine.usbHostDeviceKey
+                prefs.edit()
+                    .putString("systemInputDeviceKey", systemInputDeviceKey)
+                    .putString("systemOutputDeviceKey", systemOutputDeviceKey)
+                    .putString("usbHostDeviceKey", usbHostDeviceKey)
+                    .apply()
+            }
             val actualUsbOutputHostActive = engine.usbOutputHostActive
             if (usbOutputHostActive && !actualUsbOutputHostActive && output == OutputSource.USB)
                 systemOutputVolumePercent = engine.systemVolumePercent()
@@ -503,7 +529,7 @@ private fun LiveAudioProcessApp() {
         wifiOutputEnabled -> engine.configureNetwork(1, wifiTransport, wifiCodec, wifiAacBitrate, wifiSendHost, wifiSendPort.toIntOrNull() ?: 40100, wifiPacketDuration.toIntOrNull()?.coerceIn(1, 100) ?: 20, 0, 50, 1000)
         else -> { engine.clearNetwork(); false }
     }
-    fun syncEngine() { val inputBufferMaxMs = (systemInputBufferMaxMs.toIntOrNull() ?: 20).coerceIn(5, 200); val outputBufferMaxMs = (systemOutputBufferMaxMs.toIntOrNull() ?: 40).coerceIn(5, 200); val usbInputMaxMs = (usbInputBufferMaxMs.toIntOrNull() ?: 20).coerceIn(5, 200); engine.configureAudioFormat(rate, outputRate, usbInputBitDepth, usbOutputBitDepth); engine.bufferFrames = buffer; engine.wifiClockCorrectionEnabled = wifiClockCorrectionEnabled; engine.wifiQosEnabled = wifiQosEnabled; engine.wifiRetransmitEnabled = wifiRetransmitEnabled; engine.wifiDynamicBufferEnabled = wifiDynamicBufferEnabled; engine.wifiManualBufferBias = wifiManualBufferBias; engine.wifiOpusFrameMs = wifiOpusFrameMs; engine.wifiOpusProfile = wifiOpusProfile; engine.configureSystemOutputBuffer(outputBufferMaxMs); engine.configureSystemInputBuffer(inputBufferMaxMs); engine.configureUsbInputBuffer(usbInputMaxMs); engine.eqGain = effects.eqGain; engine.eqFrequency = effects.eqFrequency; engine.eqQ = effects.eqQ; engine.eq2Frequency = effects.eq2Frequency; engine.eq2Gain = effects.eq2Gain; engine.eq2Q = effects.eq2Q; engine.eq3Frequency = effects.eq3Frequency; engine.eq3Gain = effects.eq3Gain; engine.eq3Q = effects.eq3Q; engine.eq4Frequency = effects.eq4Frequency; engine.eq4Gain = effects.eq4Gain; engine.eq4Q = effects.eq4Q; engine.reverbRoom = effects.reverbRoom; engine.reverbDecay = effects.reverbDecay; engine.reverbDamping = effects.reverbDamping; engine.reverbMix = effects.reverbMix / 100f; engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease; engine.loudnessTarget = effects.loudnessTarget; engine.loudnessLra = effects.loudnessLra; engine.loudnessTruePeak = effects.loudnessTruePeak; engine.loudnessEnabled = effects.loudnessEnabled; engine.wifiInputTimeoutMs = ((wifiInputTimeout.toFloatOrNull() ?: 1f) * 1000f).toInt().coerceIn(100, 60_000); engine.updateRouting(input, output, channelPair); effects.save(prefs); prefs.edit().putInt("rate", rate).putInt("outputRate", outputRate).putInt("usbInputBitDepth", usbInputBitDepth).putInt("usbOutputBitDepth", usbOutputBitDepth).putInt("buffer", buffer).putInt("systemOutputBufferMaxMs", outputBufferMaxMs).putInt("systemInputBufferMaxMs", inputBufferMaxMs).putInt("usbInputBufferMaxMs", usbInputMaxMs).putInt("channelPair", channelPair).putString("input", input.name).putString("output", output.name).putBoolean("wifiOutputEnabled", wifiOutputEnabled).putBoolean("wifiClockCorrectionEnabled", wifiClockCorrectionEnabled).putBoolean("wifiDynamicBufferEnabled", wifiDynamicBufferEnabled).putBoolean("wifiRetransmitEnabled", wifiRetransmitEnabled).putInt("wifiManualBufferBiasPermille", (wifiManualBufferBias * 1000f).roundToInt()).putBoolean("wifiActive", wifiActive).apply() }
+    fun syncEngine() { val inputBufferMaxMs = (systemInputBufferMaxMs.toIntOrNull() ?: 20).coerceIn(5, 200); val outputBufferMaxMs = (systemOutputBufferMaxMs.toIntOrNull() ?: 40).coerceIn(5, 200); val usbInputMaxMs = (usbInputBufferMaxMs.toIntOrNull() ?: 20).coerceIn(5, 200); engine.configureAudioFormat(rate, outputRate, usbInputBitDepth, usbOutputBitDepth); engine.configureDeviceSelection(systemInputDeviceKey, systemOutputDeviceKey, usbHostDeviceKey); engine.bufferFrames = buffer; engine.wifiClockCorrectionEnabled = wifiClockCorrectionEnabled; engine.wifiQosEnabled = wifiQosEnabled; engine.wifiRetransmitEnabled = wifiRetransmitEnabled; engine.wifiDynamicBufferEnabled = wifiDynamicBufferEnabled; engine.wifiManualBufferBias = wifiManualBufferBias; engine.wifiOpusFrameMs = wifiOpusFrameMs; engine.wifiOpusProfile = wifiOpusProfile; engine.configureSystemOutputBuffer(outputBufferMaxMs); engine.configureSystemInputBuffer(inputBufferMaxMs); engine.configureUsbInputBuffer(usbInputMaxMs); engine.eqGain = effects.eqGain; engine.eqFrequency = effects.eqFrequency; engine.eqQ = effects.eqQ; engine.eq2Frequency = effects.eq2Frequency; engine.eq2Gain = effects.eq2Gain; engine.eq2Q = effects.eq2Q; engine.eq3Frequency = effects.eq3Frequency; engine.eq3Gain = effects.eq3Gain; engine.eq3Q = effects.eq3Q; engine.eq4Frequency = effects.eq4Frequency; engine.eq4Gain = effects.eq4Gain; engine.eq4Q = effects.eq4Q; engine.reverbRoom = effects.reverbRoom; engine.reverbDecay = effects.reverbDecay; engine.reverbDamping = effects.reverbDamping; engine.reverbMix = effects.reverbMix / 100f; engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease; engine.loudnessTarget = effects.loudnessTarget; engine.loudnessLra = effects.loudnessLra; engine.loudnessTruePeak = effects.loudnessTruePeak; engine.loudnessEnabled = effects.loudnessEnabled; engine.wifiInputTimeoutMs = ((wifiInputTimeout.toFloatOrNull() ?: 1f) * 1000f).toInt().coerceIn(100, 60_000); engine.updateRouting(input, output, channelPair); effects.save(prefs); prefs.edit().putInt("rate", rate).putInt("outputRate", outputRate).putInt("usbInputBitDepth", usbInputBitDepth).putInt("usbOutputBitDepth", usbOutputBitDepth).putInt("buffer", buffer).putInt("systemOutputBufferMaxMs", outputBufferMaxMs).putInt("systemInputBufferMaxMs", inputBufferMaxMs).putInt("usbInputBufferMaxMs", usbInputMaxMs).putInt("channelPair", channelPair).putString("input", input.name).putString("output", output.name).putString("systemInputDeviceKey", systemInputDeviceKey).putString("systemOutputDeviceKey", systemOutputDeviceKey).putString("usbHostDeviceKey", usbHostDeviceKey).putBoolean("wifiOutputEnabled", wifiOutputEnabled).putBoolean("wifiClockCorrectionEnabled", wifiClockCorrectionEnabled).putBoolean("wifiDynamicBufferEnabled", wifiDynamicBufferEnabled).putBoolean("wifiRetransmitEnabled", wifiRetransmitEnabled).putInt("wifiManualBufferBiasPermille", (wifiManualBufferBias * 1000f).roundToInt()).putBoolean("wifiActive", wifiActive).apply() }
     LaunchedEffect(input, channelPair, output, wifiOutputEnabled, wifiClockCorrectionEnabled, wifiCodec, wifiOpusFrameMs, wifiOpusProfile, rate, outputRate, usbInputBitDepth, usbOutputBitDepth, buffer, effects) { syncEngine(); engine.dspEnabled = effects.dspEnabled; engine.eqEnabled = effects.eqEnabled; engine.reverbEnabled = effects.reverbEnabled; engine.limiterEnabled = effects.limiterEnabled; engine.loudnessEnabled = effects.loudnessEnabled; if (input == InputSource.WIFI || wifiOutputEnabled) wifiActive = configureWifiForCurrentRoute() else { engine.clearNetwork(); wifiActive = false }; engine.refreshNativeParameters() }
     LaunchedEffect(wifiDynamicBufferEnabled, wifiManualBufferBias) {
         engine.configureWifiBufferTarget(wifiDynamicBufferEnabled, wifiManualBufferBias)
@@ -631,9 +657,9 @@ private fun LiveAudioProcessApp() {
             routeNotice = "无法打开 USB 声卡授权窗口"
             return
         }
-        currentActivity.requestUsbAudioPermission { granted ->
+        currentActivity.requestUsbAudioPermission(usbHostDeviceKey) { granted ->
             if (granted) applyInputSelection(selected)
-            else routeNotice = if (currentActivity.hasUsbAudioDevice())
+            else routeNotice = if (currentActivity.hasUsbAudioDevice(usbHostDeviceKey))
                 "USB 声卡授权被拒绝，未切换输入"
             else "未检测到 USB 声卡，未切换输入"
         }
@@ -662,9 +688,9 @@ private fun LiveAudioProcessApp() {
             routeNotice = "无法打开 USB 声卡授权窗口"
             return
         }
-        currentActivity.requestUsbAudioPermission { granted ->
+        currentActivity.requestUsbAudioPermission(usbHostDeviceKey) { granted ->
             if (granted) applyOutputSelection(selected)
-            else routeNotice = if (currentActivity.hasUsbAudioDevice())
+            else routeNotice = if (currentActivity.hasUsbAudioDevice(usbHostDeviceKey))
                 "USB 声卡授权被拒绝，未切换输出"
             else "未检测到 USB 声卡，未切换输出"
         }
@@ -730,7 +756,7 @@ private fun LiveAudioProcessApp() {
                 }
             }
             LevelPanel(inputLevelL, inputLevelR, outputLevelL, outputLevelR, inputPeakL, inputPeakR, outputPeakL, outputPeakR, limiterGain, limiterReleaseMs, running, running && effects.dspEnabled && effects.limiterEnabled, running && input == InputSource.WIFI && wifiActive, wifiReceiveStats, running && input != InputSource.WIFI && wifiOutputEnabled && wifiActive, wifiTransmitStats, waveformData, showWaveforms, showLevelMeters, { showWaveforms = it; prefs.edit().putBoolean("showWaveforms", it).apply() }, { showLevelMeters = it; prefs.edit().putBoolean("showLevelMeters", it).apply() }, { NativeAudio.clearNetworkReceiveStats(); wifiReceiveStats = NativeAudio.networkReceiveStats() })
-            RoutingPanel2(input, { selectInput(it) }, output, { selectOutput(it) }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
+            RoutingPanel2(input, { selectInput(it) }, output, { selectOutput(it) }, systemInputDevices, systemInputDeviceKey, { systemInputDeviceKey = it; syncEngine() }, systemOutputDevices, systemOutputDeviceKey, { systemOutputDeviceKey = it; syncEngine() }, usbHostDevices, usbHostDeviceKey, { key -> val currentActivity = activity as? MainActivity; if (currentActivity == null) { usbHostDeviceKey = key; syncEngine() } else currentActivity.requestUsbAudioPermission(key) { granted -> if (granted) { usbHostDeviceKey = key; syncEngine() } else routeNotice = "USB 声卡授权被拒绝，未切换设备" } }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
             if (input == InputSource.TEST_TONE) TonePanel(toneWaveform, toneMusic, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevelDb, { selected -> toneWaveform = selected; when (selected) { 4 -> { toneFrequency = 20f; toneFrequency2 = 20_000f }; 6 -> { toneFrequency = 19_000f; toneFrequency2 = 20_000f }; else -> Unit } }, { toneMusic = it }, { toneChannels = it }, { toneFrequency = it }, { toneFrequency2 = it }, { toneDurationSeconds = it }, { toneClickIntervalMs = it }, { toneLevelDb = it })
             EnginePanelWithIoRates(rate, { rate = it; syncEngine() }, outputRate, { outputRate = it; syncEngine() }, buffer, { buffer = it; syncEngine() }, running)
             SystemInputPanel(inputInfo, input != InputSource.USB && input != InputSource.WIFI, systemInputBufferMaxMs) { systemInputBufferMaxMs = it }
@@ -751,7 +777,7 @@ private fun LiveAudioProcessApp() {
                         if (currentActivity == null) {
                             startMonitoring()
                         } else {
-                            currentActivity.requestUsbAudioPermission { granted ->
+                            currentActivity.requestUsbAudioPermission(usbHostDeviceKey) { granted ->
                                 if (granted) startMonitoring()
                                 else routeNotice = "USB AUDIO CODEC 权限被拒绝，未启动监听"
                             }
@@ -1113,19 +1139,49 @@ private fun limiterReleaseStatus(valueMs: Float): String = if (valueMs >= 1000f)
 @Composable private fun RoutingPanel(input: InputSource, onInput: (InputSource) -> Unit, output: OutputSource, onOutput: (OutputSource) -> Unit, channelPairs: List<ChannelPair>, selectedPair: Int, onPair: (Int) -> Unit) { Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) { SectionTitle("路由", "I/O ROUTING"); Text("输入源", color = Muted, fontSize = 12.sp); ChoiceRow(InputSource.values().toList(), input, onInput); if (input == InputSource.USB) { Text("输入通道对", color = Muted, fontSize = 12.sp); ChoiceRow(channelPairs, channelPairs.firstOrNull { it.index == selectedPair } ?: channelPairs.first(), { onPair(it.index) }); Text("USB 多通道会以所选立体声通道对进入 DSP，干声录音保留左右声道。", color = Muted, fontSize = 11.sp) }; Text("输出目标", color = Muted, fontSize = 12.sp); ChoiceRow(OutputSource.values().toList(), output, onOutput); if (output == OutputSource.BLUETOOTH) Text("蓝牙链路通常带来 150–200 ms 延迟，建议使用有线或 USB 输出。", color = Amber, fontSize = 11.sp) } } }
 @Composable private fun <T> ChoiceRow(items: List<T>, selected: T, onSelect: (T) -> Unit) { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) { items.forEach { item -> val label = when (item) { is InputSource -> item.label; is OutputSource -> item.label; is ChannelPair -> item.label; is Int -> if (item < 1000) "$item samples" else if (item % 1000 == 0) "${item / 1000} kHz" else "${item / 1000f} kHz"; else -> item.toString() }; FilterChip(selected = selected == item, onClick = { onSelect(item) }, label = { Text(label, fontSize = 12.sp) }, leadingIcon = { if (item is InputSource || item is OutputSource) Icon(if (item is InputSource && item == InputSource.BUILT_IN) Icons.Outlined.Mic else if (item is OutputSource && item == OutputSource.NONE) Icons.Outlined.VolumeOff else if (item is OutputSource && item == OutputSource.BLUETOOTH) Icons.Outlined.Bluetooth else if (item is OutputSource) Icons.Outlined.Headphones else Icons.Outlined.Usb, null, modifier = Modifier.size(16.dp)) }) } } }
 
-@Composable private fun RoutingPanel2(input: InputSource, onInput: (InputSource) -> Unit, output: OutputSource, onOutput: (OutputSource) -> Unit, wifiOutput: Boolean, onWifiOutput: (Boolean) -> Unit, channelPairs: List<ChannelPair>, selectedPair: Int, onPair: (Int) -> Unit, routeNotice: String?) {
+@Composable private fun RoutingPanel2(
+    input: InputSource,
+    onInput: (InputSource) -> Unit,
+    output: OutputSource,
+    onOutput: (OutputSource) -> Unit,
+    systemInputDevices: List<AudioDeviceChoice>,
+    selectedSystemInput: String,
+    onSystemInput: (String) -> Unit,
+    systemOutputDevices: List<AudioDeviceChoice>,
+    selectedSystemOutput: String,
+    onSystemOutput: (String) -> Unit,
+    usbHostDevices: List<AudioDeviceChoice>,
+    selectedUsbHostDevice: String,
+    onUsbHostDevice: (String) -> Unit,
+    wifiOutput: Boolean,
+    onWifiOutput: (Boolean) -> Unit,
+    channelPairs: List<ChannelPair>,
+    selectedPair: Int,
+    onPair: (Int) -> Unit,
+    routeNotice: String?
+) {
     Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             SectionTitle("路由", "I/O ROUTING")
             Text("输入源", color = Muted, fontSize = 12.sp)
             ChoiceRow(InputSource.values().toList(), input, onInput)
+            if (input == InputSource.BUILT_IN) {
+                DeviceChoiceRow("输入设备", systemInputDevices, selectedSystemInput, onSystemInput)
+            }
             if (input == InputSource.USB) {
+                DeviceChoiceRow("USB Host 设备", usbHostDevices, selectedUsbHostDevice, onUsbHostDevice)
                 Text("输入通道对", color = Muted, fontSize = 12.sp)
                 ChoiceRow(channelPairs, channelPairs.firstOrNull { it.index == selectedPair } ?: channelPairs.first()) { onPair(it.index) }
                 Text("USB 多通道以所选立体声通道对进入 DSP。", color = Muted, fontSize = 11.sp)
             }
             Text("本地输出", color = Muted, fontSize = 12.sp)
             ChoiceRow(OutputSource.values().filter { it != OutputSource.WIFI }, output, onOutput)
+            if (output == OutputSource.SPEAKER) {
+                DeviceChoiceRow("输出设备", systemOutputDevices, selectedSystemOutput, onSystemOutput)
+            }
+            if (output == OutputSource.USB && input != InputSource.USB) {
+                DeviceChoiceRow("USB Host 设备", usbHostDevices, selectedUsbHostDevice, onUsbHostDevice)
+            }
             if (output == OutputSource.BLUETOOTH) Text("蓝牙通常带来 150–200 ms 延迟，建议使用有线或 USB。", color = Amber, fontSize = 11.sp)
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                 Column(Modifier.weight(1f)) {
@@ -1135,6 +1191,26 @@ private fun limiterReleaseStatus(valueMs: Float): String = if (valueMs >= 1000f)
                 Switch(checked = wifiOutput, onCheckedChange = onWifiOutput, enabled = input != InputSource.WIFI)
             }
             if (!routeNotice.isNullOrBlank()) Text(routeNotice, color = Amber, fontSize = 11.sp)
+        }
+    }
+}
+
+@Composable private fun DeviceChoiceRow(
+    title: String,
+    devices: List<AudioDeviceChoice>,
+    selectedKey: String,
+    onSelect: (String) -> Unit
+) {
+    val visibleDevices = if (devices.any { it.key == selectedKey }) devices
+    else devices + AudioDeviceChoice(selectedKey, "已选择设备（当前未连接）")
+    Text(title, color = Muted, fontSize = 12.sp)
+    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        visibleDevices.forEach { device ->
+            FilterChip(
+                selected = device.key == selectedKey,
+                onClick = { onSelect(device.key) },
+                label = { Text(device.label, fontSize = 11.sp, maxLines = 1) }
+            )
         }
     }
 }

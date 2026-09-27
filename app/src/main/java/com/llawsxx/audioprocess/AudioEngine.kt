@@ -91,6 +91,14 @@ class AudioEngine(private val context: Context) {
     }
     @Volatile var inputSource = InputSource.BUILT_IN
         internal set
+    @Volatile var systemInputDeviceKey = SYSTEM_DEVICE_BUILTIN_INPUT
+    @Volatile var systemOutputDeviceKey = SYSTEM_DEVICE_BUILTIN_OUTPUT
+    @Volatile var usbHostDeviceKey = USB_HOST_DEVICE_AUTO
+    @Volatile var deviceSwitchInProgress = false
+        private set
+    private var lastWorkingSystemInputDeviceKey = SYSTEM_DEVICE_BUILTIN_INPUT
+    private var lastWorkingSystemOutputDeviceKey = SYSTEM_DEVICE_BUILTIN_OUTPUT
+    private var lastWorkingUsbHostDeviceKey = USB_HOST_DEVICE_AUTO
     @Volatile var toneWaveform = 0
     @Volatile var toneMusic = 0
     @Volatile var toneChannels = 0
@@ -303,6 +311,18 @@ class AudioEngine(private val context: Context) {
         usbOutputDitherEnabled = enabled
         if (NativeAudio.available) NativeAudio.configureUsbOutputDither(enabled)
     }
+    fun configureDeviceSelection(inputKey: String, outputKey: String, usbKey: String) {
+        val changed = systemInputDeviceKey != inputKey ||
+            systemOutputDeviceKey != outputKey || usbHostDeviceKey != usbKey
+        systemInputDeviceKey = inputKey
+        systemOutputDeviceKey = outputKey
+        usbHostDeviceKey = usbKey
+        if (changed && isRunning) {
+            routeNotice = "正在切换音频设备"
+            routeHandler.removeCallbacks(routeRestart)
+            routeHandler.post(routeRestart)
+        }
+    }
     fun configureAudioFormat(requestedSampleRate: Int, requestedOutputSampleRate: Int, requestedUsbInputBitDepth: Int, requestedUsbOutputBitDepth: Int) {
         val normalizedRate = requestedSampleRate.takeIf { it == 44_100 || it == 48_000 || it == 96_000 } ?: 48_000
         val normalizeRate = { value: Int -> value.takeIf { it == 44_100 || it == 48_000 || it == 96_000 } ?: 48_000 }
@@ -369,22 +389,55 @@ class AudioEngine(private val context: Context) {
         val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
         if (max <= 0) 0 else (audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) * 100f / max).roundToInt().coerceIn(0, 100)
     }.getOrDefault(0)
-    private fun usbInputDevice(): AudioDeviceInfo? {
-        return audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.type == AudioDeviceInfo.TYPE_USB_DEVICE || it.type == AudioDeviceInfo.TYPE_USB_HEADSET }
+    fun availableSystemInputDevices(): List<AudioDeviceChoice> {
+        val devices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).toList()
+        val choices = mutableListOf(
+            AudioDeviceChoice(SYSTEM_DEVICE_BUILTIN_INPUT, "内置麦克风"),
+            AudioDeviceChoice(SYSTEM_DEVICE_DEFAULT, "系统默认输入")
+        )
+        devices.filter { it.type != AudioDeviceInfo.TYPE_BUILTIN_MIC }
+            .forEach { choices += AudioDeviceChoice(systemAudioDeviceKey(it), systemAudioDeviceLabel(it)) }
+        return choices.distinctBy { it.key }
     }
-    private fun usbOutputDevice(): AudioDeviceInfo? {
-        return audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { it.type == AudioDeviceInfo.TYPE_USB_DEVICE || it.type == AudioDeviceInfo.TYPE_USB_HEADSET }
+    fun availableSystemOutputDevices(): List<AudioDeviceChoice> {
+        val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).toList()
+        val choices = mutableListOf(
+            AudioDeviceChoice(SYSTEM_DEVICE_BUILTIN_OUTPUT, "内置扬声器"),
+            AudioDeviceChoice(SYSTEM_DEVICE_DEFAULT, "系统默认输出")
+        )
+        devices.filter { it.type != AudioDeviceInfo.TYPE_BUILTIN_SPEAKER && !isBluetoothOutput(it) }
+            .forEach { choices += AudioDeviceChoice(systemAudioDeviceKey(it), systemAudioDeviceLabel(it)) }
+        return choices.distinctBy { it.key }
     }
-    private fun usbAudioDevice() = (context.getSystemService(Context.USB_SERVICE) as UsbManager)
-        .deviceList.values.firstOrNull { usbDevice ->
-            (0 until usbDevice.interfaceCount).any {
-                usbDevice.getInterface(it).interfaceClass == android.hardware.usb.UsbConstants.USB_CLASS_AUDIO
-            }
+    fun availableUsbHostDevices(): List<AudioDeviceChoice> {
+        val manager = context.getSystemService(Context.USB_SERVICE) as UsbManager
+        return listOf(AudioDeviceChoice(USB_HOST_DEVICE_AUTO, "自动选择 USB 声卡")) +
+            usbAudioDevices(manager).map { AudioDeviceChoice(usbHostDeviceKey(it), usbHostDeviceLabel(it)) }
+    }
+    private fun resolveSystemInputDevice(): AudioDeviceInfo? {
+        val devices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+        return when (systemInputDeviceKey) {
+            SYSTEM_DEVICE_DEFAULT -> null
+            SYSTEM_DEVICE_BUILTIN_INPUT -> devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
+            else -> devices.firstOrNull { systemAudioDeviceKey(it) == systemInputDeviceKey }
         }
+    }
+    private fun resolveSystemOutputDevice(): AudioDeviceInfo? {
+        val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        return when (systemOutputDeviceKey) {
+            SYSTEM_DEVICE_DEFAULT -> null
+            SYSTEM_DEVICE_BUILTIN_OUTPUT -> devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+            else -> devices.firstOrNull { systemAudioDeviceKey(it) == systemOutputDeviceKey }
+        }
+    }
+    private fun selectedUsbAudioDevice() = findUsbAudioDevice(
+        context.getSystemService(Context.USB_SERVICE) as UsbManager,
+        usbHostDeviceKey
+    )
     private fun requestUsbHostPermissionIfNeeded(): Boolean {
         if (!isRunning || (inputSource != InputSource.USB && outputSource != OutputSource.USB)) return false
         val manager = context.getSystemService(Context.USB_SERVICE) as UsbManager
-        val device = usbAudioDevice() ?: return false
+        val device = selectedUsbAudioDevice() ?: return false
         if (manager.hasPermission(device)) return false
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or
             if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
@@ -398,7 +451,7 @@ class AudioEngine(private val context: Context) {
         usbConnection?.close()
         usbConnection = null
         val manager = context.getSystemService(Context.USB_SERVICE) as UsbManager
-        val device = usbAudioDevice() ?: return -1
+        val device = selectedUsbAudioDevice() ?: return -1
         if (!manager.hasPermission(device)) return -1
         val connection = manager.openDevice(device) ?: return -1
         usbConnection = connection
@@ -454,15 +507,29 @@ class AudioEngine(private val context: Context) {
     }
     private val routeRefresh = Runnable {
         if (!isRunning) return@Runnable
-        val inputId = if (inputSource == InputSource.USB) usbInputDevice()?.id ?: -1 else -1
+        val inputId = when (inputSource) {
+            InputSource.BUILT_IN -> resolveSystemInputDevice()?.id ?: -1
+            InputSource.USB -> if (selectedUsbAudioDevice() != null) -3 else -1
+            else -> -1
+        }
         val outputId = when (outputSource) {
-            OutputSource.USB -> usbOutputDevice()?.id ?: -1
+            OutputSource.SPEAKER -> resolveSystemOutputDevice()?.id ?: -1
+            OutputSource.USB -> if (selectedUsbAudioDevice() != null) -4 else -1
             OutputSource.BLUETOOTH -> bluetoothOutputDevice()?.id ?: -1
             else -> -1
         }
         if (inputId != activeInputDeviceId || outputId != activeOutputDeviceId) restartStreamsForRouteChange()
     }
     private val routeRestart = Runnable { if (isRunning) restartStreamsForRouteChange() }
+    private val deviceRecovery = Runnable {
+        start()
+        deviceSwitchInProgress = false
+        routeNotice = if (isRunning) {
+            "设备切换失败，已恢复到之前可用的设备"
+        } else {
+            "设备切换失败，恢复原设备也失败：${lastError ?: "无法打开音频流"}"
+        }
+    }
     private val bluetoothRouteMonitor = object : Runnable {
         override fun run() {
             if (!isRunning || outputSource != OutputSource.BLUETOOTH) return
@@ -589,6 +656,8 @@ class AudioEngine(private val context: Context) {
     /** Restart only AAudio/DSP streams; keep the native recording files open. */
     private fun restartStreamsForRouteChange() {
         if (!isRunning) return
+        routeHandler.removeCallbacks(deviceRecovery)
+        deviceSwitchInProgress = true
         routeHandler.removeCallbacks(bluetoothRouteMonitor)
         NativeAudio.stopForRouteChange()
         clearBluetoothRoute()
@@ -596,13 +665,35 @@ class AudioEngine(private val context: Context) {
         activeOutputDeviceId = -1
         isRunning = false
         start()
+        if (isRunning) {
+            deviceSwitchInProgress = false
+            return
+        }
+
+        val failedInputKey = systemInputDeviceKey
+        val failedOutputKey = systemOutputDeviceKey
+        val failedUsbKey = usbHostDeviceKey
+        val selectionChanged = failedInputKey != lastWorkingSystemInputDeviceKey ||
+            failedOutputKey != lastWorkingSystemOutputDeviceKey ||
+            failedUsbKey != lastWorkingUsbHostDeviceKey
+        if (selectionChanged) {
+            systemInputDeviceKey = lastWorkingSystemInputDeviceKey
+            systemOutputDeviceKey = lastWorkingSystemOutputDeviceKey
+            usbHostDeviceKey = lastWorkingUsbHostDeviceKey
+            routeNotice = "设备切换失败，正在恢复之前的设备"
+            // Some Android audio HALs return AAUDIO_ERROR_INTERNAL when a
+            // device is reopened immediately after a failed route switch.
+            routeHandler.postDelayed(deviceRecovery, DEVICE_RECOVERY_DELAY_MS)
+        } else {
+            deviceSwitchInProgress = false
+            routeNotice = lastError ?: "音频设备重新连接失败"
+        }
     }
     fun availableInputPairs(): List<ChannelPair> {
         if (!NativeAudio.available) return listOf(ChannelPair(0, "AAudio unavailable"))
-        val usb = usbInputDevice()
-        // Some USB audio devices report only a mono capability through
-        // AudioManager even though their capture endpoint is stereo.
-        val count = maxOf(usb?.channelCounts?.maxOrNull()?.coerceIn(1, 8) ?: 2, 2)
+        // The current USB Host stream opens one stereo pair. Do not expose
+        // channel pairs that the native bridge cannot route yet.
+        val count = 2
         return if (count < 2) listOf(ChannelPair(0, "Mono")) else (0 until count / 2).map { ChannelPair(it, "CH ${it * 2 + 1}/${it * 2 + 2}") }
     }
     fun start() {
@@ -614,26 +705,23 @@ class AudioEngine(private val context: Context) {
             outputSource = OutputSource.SPEAKER
             lastError = "测试 Tone 需要本地输出，已切换到扬声器"
         }
-        val usbInput = if (inputSource == InputSource.USB) usbInputDevice() else null
         val pairs = availableInputPairs()
-        val channels = if (inputSource == InputSource.USB && usbInput != null) (pairs.size * 2).coerceIn(2, 8) else 1
+        val channels = if (inputSource == InputSource.USB) (pairs.size * 2).coerceIn(2, 8) else 1
         pushNativeParameters()
         val nativeInputChannels = if (inputSource == InputSource.WIFI) 2 else channels
-        val inputDeviceId = usbInput?.id ?: -1
+        val inputDeviceId = if (inputSource == InputSource.BUILT_IN) resolveSystemInputDevice()?.id ?: -1 else -1
         val outputDeviceId = when (outputSource) {
-            OutputSource.USB -> usbOutputDevice()?.id ?: -1
+            OutputSource.SPEAKER -> resolveSystemOutputDevice()?.id ?: -1
             OutputSource.BLUETOOTH -> prepareBluetoothRoute()
             else -> -1
         }
-        val usbPresent = usbAudioDevice() != null
-        if (inputSource == InputSource.USB && inputDeviceId < 0) {
-            lastError = if (usbPresent) "当前 USB 声卡不支持输入（可能是仅输出声卡），暂使用默认麦克风"
-            else "USB 输入已断开，暂使用默认麦克风"
-        }
-        if (outputSource == OutputSource.USB && outputDeviceId < 0) {
-            lastError = if (usbPresent) "当前 USB 声卡不支持输出（可能是仅输入声卡），暂使用默认扬声器"
-            else "USB 输出已断开，暂使用默认扬声器"
-        }
+        val usbPresent = selectedUsbAudioDevice() != null
+        if ((inputSource == InputSource.USB || outputSource == OutputSource.USB) && !usbPresent)
+            lastError = "所选 USB 声卡未连接，暂回退到系统音频；设备恢复后会自动切回"
+        if (inputSource == InputSource.BUILT_IN && systemInputDeviceKey != SYSTEM_DEVICE_DEFAULT && inputDeviceId < 0)
+            lastError = "所选系统输入设备未连接，暂使用系统默认输入"
+        if (outputSource == OutputSource.SPEAKER && systemOutputDeviceKey != SYSTEM_DEVICE_DEFAULT && outputDeviceId < 0)
+            lastError = "所选系统输出设备未连接，暂使用系统默认输出"
         if (outputSource == OutputSource.BLUETOOTH && outputDeviceId < 0) lastError = "未检测到蓝牙耳机，暂使用默认输出"
         val useNetworkInput = inputSource == InputSource.WIFI && networkRole == 2 && !wifiFallbackActive
         val requestedUsbInputHost = inputSource == InputSource.USB
@@ -660,8 +748,11 @@ class AudioEngine(private val context: Context) {
         }
         else { clearBluetoothRoute(); lastError = "AAudio stream open failed; check microphone and speaker settings" }
         if (isRunning) {
-            activeInputDeviceId = inputDeviceId
-            activeOutputDeviceId = outputDeviceId
+            lastWorkingSystemInputDeviceKey = systemInputDeviceKey
+            lastWorkingSystemOutputDeviceKey = systemOutputDeviceKey
+            lastWorkingUsbHostDeviceKey = usbHostDeviceKey
+            activeInputDeviceId = if (usbInputHost) -3 else inputDeviceId
+            activeOutputDeviceId = if (usbOutputHost) -4 else outputDeviceId
             usbOutputHostActive = NativeAudio.routeInfo().getOrElse(1) { -1 } == -4
             refreshRouteNotice()
             if (usbOutputHostActive) setOutputVolumePercent(outputVolumePercent)
@@ -677,22 +768,24 @@ class AudioEngine(private val context: Context) {
         val actualInput = actual.getOrElse(0) { -1 }
         val actualOutput = actual.getOrElse(1) { -1 }
         val actualInputChannels = actual.getOrElse(2) { -1 }
-        val usbInputId = if (inputSource == InputSource.USB) usbInputDevice()?.id ?: -1 else -1
-        val usbOutputId = if (outputSource == OutputSource.USB) usbOutputDevice()?.id ?: -1 else -1
-        val usbPresent = usbAudioDevice() != null
+        val selectedUsbPresent = selectedUsbAudioDevice() != null
+        val systemInputId = if (inputSource == InputSource.BUILT_IN) resolveSystemInputDevice()?.id ?: -1 else -1
+        val systemOutputId = if (outputSource == OutputSource.SPEAKER) resolveSystemOutputDevice()?.id ?: -1 else -1
         val bluetoothOutputId = if (outputSource == OutputSource.BLUETOOTH) bluetoothOutputDevice()?.id ?: -1 else -1
         val warnings = mutableListOf<String>()
         val wifiError = displayedWifiErrorNotice
         if (!wifiError.isNullOrBlank()) warnings += wifiError
         if (wifiError.isNullOrBlank() && inputSource == InputSource.WIFI && !wifiFallbackActive && (networkRole != 2 || actualInput != -2)) warnings += "Wi-Fi 输入未生效，当前使用默认麦克风"
         if (wifiError.isNullOrBlank() && inputSource == InputSource.WIFI && wifiFallbackActive) warnings += "Wi-Fi 输入暂无数据，当前使用默认麦克风并等待恢复"
-        if (inputSource == InputSource.USB && usbInputId < 0 && !usbPresent) warnings += "USB 输入已断开，当前使用系统默认输入；重新插入后将自动切回 USB"
-        else if (inputSource == InputSource.USB && usbInputId < 0 && usbPresent) warnings += "当前 USB 声卡不支持输入（可能是仅输出声卡），当前使用系统默认输入"
-        else if (inputSource == InputSource.USB && actualInput != -3 && actualInput != usbInputId) warnings += "USB 输入未生效，当前使用系统默认输入（实际设备 ID=$actualInput）"
+        if (inputSource == InputSource.BUILT_IN && systemInputDeviceKey != SYSTEM_DEVICE_DEFAULT && systemInputId < 0) warnings += "所选输入设备未连接，当前使用系统默认输入"
+        else if (inputSource == InputSource.BUILT_IN && systemInputId >= 0 && actualInput != systemInputId) warnings += "所选输入设备未生效（实际设备 ID=$actualInput）"
+        if (inputSource == InputSource.USB && !selectedUsbPresent) warnings += "所选 USB 声卡已断开，当前使用系统默认输入；重新插入后将自动切回"
+        else if (inputSource == InputSource.USB && actualInput != -3) warnings += "USB Host 输入未生效，当前使用系统默认输入"
         else if (inputSource == InputSource.USB && actualInputChannels < 2) warnings += "USB 输入已连接但当前仅为单声道（实际通道数=$actualInputChannels）"
-        if (outputSource == OutputSource.USB && usbOutputId < 0 && !usbPresent) warnings += "USB 输出已断开，当前使用系统默认输出；重新插入后将自动切回 USB"
-        else if (outputSource == OutputSource.USB && usbOutputId < 0 && usbPresent) warnings += "当前 USB 声卡不支持输出（可能是仅输入声卡），当前使用系统默认输出"
-        else if (outputSource == OutputSource.USB && actualOutput != -4 && actualOutput != usbOutputId) warnings += "USB 输出未生效，当前使用系统默认输出"
+        if (outputSource == OutputSource.SPEAKER && systemOutputDeviceKey != SYSTEM_DEVICE_DEFAULT && systemOutputId < 0) warnings += "所选输出设备未连接，当前使用系统默认输出"
+        else if (outputSource == OutputSource.SPEAKER && systemOutputId >= 0 && actualOutput != systemOutputId) warnings += "所选输出设备未生效（实际设备 ID=$actualOutput）"
+        if (outputSource == OutputSource.USB && !selectedUsbPresent) warnings += "所选 USB 声卡已断开，当前使用系统默认输出；重新插入后将自动切回"
+        else if (outputSource == OutputSource.USB && actualOutput != -4) warnings += "USB Host 输出未生效，当前使用系统默认输出"
         if (outputSource == OutputSource.BLUETOOTH && bluetoothOutputId < 0) warnings += "蓝牙输出已断开，当前使用系统默认输出；设备恢复后将自动重连"
         else if (outputSource == OutputSource.BLUETOOTH && actualOutput != bluetoothOutputId) warnings += "蓝牙输出未生效，正在自动重连"
         routeNotice = warnings.takeIf { it.isNotEmpty() }?.joinToString("；")
@@ -752,7 +845,7 @@ class AudioEngine(private val context: Context) {
         }
         recordingTarget = null
     }
-    fun stop() { if (isRecording) setRecording(false); routeHandler.removeCallbacks(routeRestart); routeHandler.removeCallbacks(routeRefresh); routeHandler.removeCallbacks(wifiHealthMonitor); routeHandler.removeCallbacks(bluetoothRouteMonitor); NativeAudio.stop(); releaseWifiLowLatencyLock(); usbConnection?.close(); usbConnection = null; clearBluetoothRoute(); activeInputDeviceId = -1; activeOutputDeviceId = -1; usbOutputHostActive = false; observedBluetoothDeviceId = Int.MIN_VALUE; bluetoothRetryCount = 0; nextBluetoothRetryAtMs = 0L; isRecording = false; isRunning = false }
+    fun stop() { if (isRecording) setRecording(false); routeHandler.removeCallbacks(routeRestart); routeHandler.removeCallbacks(routeRefresh); routeHandler.removeCallbacks(deviceRecovery); routeHandler.removeCallbacks(wifiHealthMonitor); routeHandler.removeCallbacks(bluetoothRouteMonitor); NativeAudio.stop(); releaseWifiLowLatencyLock(); usbConnection?.close(); usbConnection = null; clearBluetoothRoute(); activeInputDeviceId = -1; activeOutputDeviceId = -1; usbOutputHostActive = false; deviceSwitchInProgress = false; observedBluetoothDeviceId = Int.MIN_VALUE; bluetoothRetryCount = 0; nextBluetoothRetryAtMs = 0L; isRecording = false; isRunning = false }
     fun refreshNativeParameters() { pushNativeParameters() }
     fun configureTone(enabled: Boolean) {
         if (NativeAudio.available) NativeAudio.configureTone(enabled, toneWaveform, toneMusic, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevel)
@@ -781,6 +874,7 @@ class AudioEngine(private val context: Context) {
         private const val BLUETOOTH_ROUTE_RETRY_BASE_MS = 500L
         private const val BLUETOOTH_ROUTE_RETRY_MAX_MS = 8_000L
         private const val BLUETOOTH_ROUTE_RETRY_LIMIT = 6
+        private const val DEVICE_RECOVERY_DELAY_MS = 500L
     }
 }
 
