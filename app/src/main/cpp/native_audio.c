@@ -383,7 +383,7 @@ enum { DSP_ON=1, EQ_ON=2, REVERB_ON=4, LIMITER_ON=8, LOUDNESS_ON=16 };
 enum {
     P_EQ1_F,P_EQ1_G,P_EQ1_Q,P_EQ2_F,P_EQ2_G,P_EQ2_Q,P_EQ3_F,P_EQ3_G,P_EQ3_Q,P_EQ4_F,P_EQ4_G,P_EQ4_Q,
     P_ROOM,P_DECAY,P_DAMP,P_MIX,P_LIM_IN,P_LIMIT,P_RELEASE,P_CEILING,P_LOOKAHEAD,P_ADAPTIVE_RELEASE,
-    P_LOUDNESS_TARGET,P_LOUDNESS_LRA,P_LOUDNESS_TP
+    P_LOUDNESS_TARGET,P_LOUDNESS_LRA,P_LOUDNESS_TP,P_LOUDNESS_BOOST_ONLY
 };
 
 static float db_to_linear(float db) { return powf(10.f, db / 20.f); }
@@ -915,6 +915,8 @@ static void loudness_update_target(const float *p) {
     dynamic_correction = fmin(fmax(dynamic_correction, -6.0), 6.0);
     double gain_db = fmin(fmax(target - integrated + dynamic_correction,
                               -12.0), 18.0);
+    if (p[P_LOUDNESS_BOOST_ONLY] >= 0.5f)
+        gain_db = fmax(gain_db, 0.0);
     g.loudness_desired_gain = pow(10.0, gain_db / 20.0);
     double gain_tau = g.loudness_desired_gain < g.loudness_gain ? 0.080 :
                       fmin(1.500, 0.250 + 0.035 * target_lra);
@@ -960,6 +962,8 @@ static void loudness_process(float *l, float *r, const float *p) {
                                 g.loudness_peak_release_coeff;
     g.loudness_peak_gain = fmin(fmax(g.loudness_peak_gain, 0.0), 1.0);
     applied_gain = g.loudness_gain * g.loudness_peak_gain;
+    if (p[P_LOUDNESS_BOOST_ONLY] >= 0.5f)
+        applied_gain = fmax(applied_gain, 1.0);
     *l = (float)((double)*l * applied_gain);
     *r = (float)((double)*r * applied_gain);
 }

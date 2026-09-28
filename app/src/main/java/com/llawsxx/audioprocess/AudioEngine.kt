@@ -140,7 +140,7 @@ class AudioEngine(private val context: Context) {
     @Volatile var eq4Frequency = 10000f; @Volatile var eq4Gain = 0f; @Volatile var eq4Q = 1f
     @Volatile var reverbRoom = 42f; @Volatile var reverbDecay = 1.8f; @Volatile var reverbDamping = 35f; @Volatile var reverbMix = .18f
     @Volatile var limiterInputGain = 0f; @Volatile var limiterThreshold = -.5f; @Volatile var limiterRelease = 80f; @Volatile var limiterCeiling = -.5f; @Volatile var limiterLookAhead = 1f; @Volatile var limiterAdaptiveRelease = false
-    @Volatile var loudnessTarget = -16f; @Volatile var loudnessLra = 7f; @Volatile var loudnessTruePeak = -1f
+    @Volatile var loudnessTarget = -16f; @Volatile var loudnessLra = 7f; @Volatile var loudnessTruePeak = -1f; @Volatile var loudnessBoostOnly = false
     @Volatile var dspEnabled = false; @Volatile var eqEnabled = true; @Volatile var reverbEnabled = true; @Volatile var limiterEnabled = true; @Volatile var loudnessEnabled = true
     private var wifiLowLatencyLock: WifiManager.WifiLock? = null
     @Volatile var isRunning = false; private set
@@ -863,7 +863,8 @@ class AudioEngine(private val context: Context) {
             reverbRoom, reverbDecay, reverbDamping, reverbMix * 100f,
             limiterInputGain, limiterThreshold, limiterRelease, limiterCeiling,
             limiterLookAhead, if (limiterAdaptiveRelease) 1f else 0f,
-            loudnessTarget, loudnessLra, loudnessTruePeak
+            loudnessTarget, loudnessLra, loudnessTruePeak,
+            if (loudnessBoostOnly) 1f else 0f
         ))
         NativeAudio.configureTone(inputSource == InputSource.TEST_TONE, toneWaveform, toneMusic, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevel)
     }

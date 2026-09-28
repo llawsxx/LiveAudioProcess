@@ -48,6 +48,16 @@ fun UnifiedEffectsPanel(settings: EffectSettings, onChange: (EffectSettings) -> 
             ParameterSlider("Dry / Wet", settings.reverbMix, 0f..100f, { onChange(settings.copy(reverbMix = it)) }, "${settings.reverbMix.toInt()}%")
 
             GroupTitle("响度标准化 Loudness · Limiter 前级")
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("仅提升音量", color = Color.White, fontSize = 11.sp)
+                    Text("不衰减原始信号，真峰值仅限制新增增益", color = UnifiedMuted, fontSize = 10.sp)
+                }
+                Switch(
+                    checked = settings.loudnessBoostOnly,
+                    onCheckedChange = { onChange(settings.copy(loudnessBoostOnly = it)) }
+                )
+            }
             ParameterSlider("目标响度", settings.loudnessTarget, -30f..-5f, { onChange(settings.copy(loudnessTarget = it)) }, "${"%.1f".format(settings.loudnessTarget)} LUFS")
             ParameterSlider("响度范围 LRA", settings.loudnessLra, 1f..20f, { onChange(settings.copy(loudnessLra = it)) }, "${"%.1f".format(settings.loudnessLra)} LU")
             ParameterSlider("真峰值上限", settings.loudnessTruePeak, -9f..0f, { onChange(settings.copy(loudnessTruePeak = it)) }, "${"%.1f".format(settings.loudnessTruePeak)} dBTP")
