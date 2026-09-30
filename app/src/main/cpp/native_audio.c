@@ -169,6 +169,7 @@ typedef struct {
     _Atomic(float) peak_levels[4];
     uint64_t peak_hold_until_ns[4];
     float waveform_dry[512], waveform_wet[512];
+    float waveform_difference[512], waveform_wet_difference[512];
     int waveform_count, waveform_pos;
     pthread_mutex_t waveform_lock;
     int rate, output_rate, frames, in_channels, pair;
@@ -2569,6 +2570,8 @@ static void *audio_thread(void *unused) {
             int pos=g.waveform_pos;
             g.waveform_dry[pos]=(dry[i*2]+dry[i*2+1])*0.5f;
             g.waveform_wet[pos]=(output[i*2]+output[i*2+1])*0.5f;
+            g.waveform_difference[pos]=(dry[i*2]-dry[i*2+1])*0.5f;
+            g.waveform_wet_difference[pos]=(output[i*2]-output[i*2+1])*0.5f;
             g.waveform_pos=(pos+1)&511;
             if(g.waveform_count<512)g.waveform_count++;
         }
@@ -2684,6 +2687,8 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
     pthread_mutex_lock(&g.waveform_lock);
     memset(g.waveform_dry,0,sizeof(g.waveform_dry));
     memset(g.waveform_wet,0,sizeof(g.waveform_wet));
+    memset(g.waveform_difference,0,sizeof(g.waveform_difference));
+    memset(g.waveform_wet_difference,0,sizeof(g.waveform_wet_difference));
     g.waveform_count=g.waveform_pos=0;
     pthread_mutex_unlock(&g.waveform_lock);
     memset(g.eq,0,sizeof(g.eq));g.rate=rate;g.output_rate=outputRate>0?outputRate:rate;g.output_resample_phase=0.0;g.frames=frames;g.in_channels=channels;g.pair=pair;g.limiter_gain=1.0;g.limiter_delta=0.0;g.limiter_delay_frames=0;g.limiter_next_iter=g.limiter_next_len=0;loudness_init(rate);g.usb_audio=NULL;g.usb_input_host=usbInputHost?1:0;g.usb_output_host=usbOutputHost?1:0;if(usbFd<0){g.usb_input_host=0;g.usb_output_host=0;}atomic_store(&g.use_network_input,useNetworkInput?1:0);if(useNetworkInput)atomic_store(&g.net_last_packet_ns,now_ns());
@@ -2838,7 +2843,7 @@ JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureTone(J
 }
 JNIEXPORT jfloatArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_levels(JNIEnv*e,jobject o){(void)o;jfloat v[11];for(int i=0;i<6;i++)v[i]=atomic_load(&g.levels[i]);for(int i=0;i<4;i++)v[6+i]=atomic_load(&g.peak_levels[i]);v[10]=atomic_load(&g.loudness_applied_gain);jfloatArray a=(*e)->NewFloatArray(e,11);(*e)->SetFloatArrayRegion(e,a,0,11,v);return a;}
 JNIEXPORT jfloatArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_waveform(JNIEnv*e,jobject o){
-    (void)o; jfloat v[1024]={0};
+    (void)o; jfloat v[2048]={0};
     pthread_mutex_lock(&g.waveform_lock);
     int n=g.waveform_count<512?g.waveform_count:512;
     int start=(g.waveform_pos-n+512)&511;
@@ -2847,9 +2852,11 @@ JNIEXPORT jfloatArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_waveform
         int src=(start+i)&511;
         v[dst+i]=g.waveform_dry[src];
         v[512+dst+i]=g.waveform_wet[src];
+        v[1024+dst+i]=g.waveform_difference[src];
+        v[1536+dst+i]=g.waveform_wet_difference[src];
     }
     pthread_mutex_unlock(&g.waveform_lock);
-    jfloatArray a=(*e)->NewFloatArray(e,1024); (*e)->SetFloatArrayRegion(e,a,0,1024,v); return a;
+    jfloatArray a=(*e)->NewFloatArray(e,2048); (*e)->SetFloatArrayRegion(e,a,0,2048,v); return a;
 }
 JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureNetwork(JNIEnv*e,jobject o,jint role,jint transport,jint codec,jint sampleRate,jint bitrate,jstring host,jint port,jint packetMs,jint minMs,jint maxMs,jint maxHoldMs){
     (void)o;

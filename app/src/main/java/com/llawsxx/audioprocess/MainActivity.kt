@@ -278,7 +278,7 @@ private fun LiveAudioProcessApp() {
     val outputVolumePercent = if (usesUsbHostVolume) usbOutputVolumePercent else systemOutputVolumePercent
     var inputPeakL by remember { mutableFloatStateOf(0f) }; var inputPeakR by remember { mutableFloatStateOf(0f) }
     var outputPeakL by remember { mutableFloatStateOf(0f) }; var outputPeakR by remember { mutableFloatStateOf(0f) }
-    var waveformData by remember { mutableStateOf(FloatArray(1024)) }
+    var waveformData by remember { mutableStateOf(FloatArray(2048)) }
     var toneWaveform by remember { mutableIntStateOf(prefs.getInt("toneWaveform", 0).coerceIn(0, 7)) }
     var toneMusic by remember { mutableIntStateOf(prefs.getInt("toneMusic", 0).coerceIn(ToneMusicNames.indices)) }
     var showWaveforms by remember { mutableStateOf(prefs.getBoolean("showWaveforms", false)) }
@@ -1015,7 +1015,10 @@ private fun LogPanel(lines: List<String>, onClear: () -> Unit) {
             }
             if (showWaveforms) {
                 Spacer(Modifier.height(10.dp)); WaveformView("DRY", waveformData, 0, Teal)
+                Spacer(Modifier.height(6.dp)); WaveformView("INPUT L-R", waveformData, 1024, Color(0xFF89B4FA))
                 Spacer(Modifier.height(6.dp)); WaveformView("WET", waveformData, 512, Amber)
+                Spacer(Modifier.height(6.dp)); WaveformView("OUTPUT L-R", waveformData, 1536, Color(0xFFFFB86B))
+                Text("L-R 平线表示对应左右声道相同或静音", color = Muted, fontSize = 10.sp)
             }
             Spacer(Modifier.height(12.dp)); HorizontalDivider(color = Color(0xFF344248)); Spacer(Modifier.height(9.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
