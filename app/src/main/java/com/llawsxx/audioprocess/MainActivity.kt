@@ -298,6 +298,7 @@ private fun LiveAudioProcessApp() {
     val logScrollState = rememberScrollState()
     var limiterGain by remember { mutableFloatStateOf(1f) }
     var limiterReleaseMs by remember { mutableFloatStateOf(effects.limiterRelease) }
+    var loudnessGain by remember { mutableFloatStateOf(1f) }
     val legacyWifiHost = prefs.getString("wifiHost", "192.168.1.2") ?: "192.168.1.2"
     val legacyWifiPort = prefs.getString("wifiPort", "40100") ?: "40100"
     var wifiSendHost by remember { mutableStateOf(prefs.getString("wifiSendHost", legacyWifiHost) ?: legacyWifiHost) }
@@ -475,6 +476,7 @@ private fun LiveAudioProcessApp() {
                 outputPeakL = levels[8]
                 outputPeakR = levels[9]
             }
+            if (levels.size >= 11) loudnessGain = levels[10]
             if (latestWaveform != null) waveformData = latestWaveform
             delay(100)
         }
@@ -755,7 +757,7 @@ private fun LiveAudioProcessApp() {
                         engine.outputVolumePercent = actualSystemVolumePercent
                 }
             }
-            LevelPanel(inputLevelL, inputLevelR, outputLevelL, outputLevelR, inputPeakL, inputPeakR, outputPeakL, outputPeakR, limiterGain, limiterReleaseMs, running, running && effects.dspEnabled && effects.limiterEnabled, running && input == InputSource.WIFI && wifiActive, wifiReceiveStats, running && input != InputSource.WIFI && wifiOutputEnabled && wifiActive, wifiTransmitStats, waveformData, showWaveforms, showLevelMeters, { showWaveforms = it; prefs.edit().putBoolean("showWaveforms", it).apply() }, { showLevelMeters = it; prefs.edit().putBoolean("showLevelMeters", it).apply() }, { NativeAudio.clearNetworkReceiveStats(); wifiReceiveStats = NativeAudio.networkReceiveStats() })
+            LevelPanel(inputLevelL, inputLevelR, outputLevelL, outputLevelR, inputPeakL, inputPeakR, outputPeakL, outputPeakR, limiterGain, limiterReleaseMs, loudnessGain, running, running && effects.dspEnabled && effects.limiterEnabled, running && effects.dspEnabled && effects.loudnessEnabled, running && input == InputSource.WIFI && wifiActive, wifiReceiveStats, running && input != InputSource.WIFI && wifiOutputEnabled && wifiActive, wifiTransmitStats, waveformData, showWaveforms, showLevelMeters, { showWaveforms = it; prefs.edit().putBoolean("showWaveforms", it).apply() }, { showLevelMeters = it; prefs.edit().putBoolean("showLevelMeters", it).apply() }, { NativeAudio.clearNetworkReceiveStats(); wifiReceiveStats = NativeAudio.networkReceiveStats() })
             RoutingPanel2(input, { selectInput(it) }, output, { selectOutput(it) }, systemInputDevices, systemInputDeviceKey, { systemInputDeviceKey = it; syncEngine() }, systemOutputDevices, systemOutputDeviceKey, { systemOutputDeviceKey = it; syncEngine() }, usbHostDevices, usbHostDeviceKey, { key -> val currentActivity = activity as? MainActivity; if (currentActivity == null) { usbHostDeviceKey = key; syncEngine() } else currentActivity.requestUsbAudioPermission(key) { granted -> if (granted) { usbHostDeviceKey = key; syncEngine() } else routeNotice = "USB 声卡授权被拒绝，未切换设备" } }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
             if (input == InputSource.TEST_TONE) TonePanel(toneWaveform, toneMusic, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevelDb, { selected -> toneWaveform = selected; when (selected) { 4 -> { toneFrequency = 20f; toneFrequency2 = 20_000f }; 6 -> { toneFrequency = 19_000f; toneFrequency2 = 20_000f }; else -> Unit } }, { toneMusic = it }, { toneChannels = it }, { toneFrequency = it }, { toneFrequency2 = it }, { toneDurationSeconds = it }, { toneClickIntervalMs = it }, { toneLevelDb = it })
             EnginePanelWithIoRates(rate, { rate = it; syncEngine() }, outputRate, { outputRate = it; syncEngine() }, buffer, { buffer = it; syncEngine() }, running)
@@ -979,7 +981,8 @@ private fun LogPanel(lines: List<String>, onClear: () -> Unit) {
 @Composable private fun LevelPanel(
     inputL: Float, inputR: Float, outputL: Float, outputR: Float,
     inputPeakL: Float, inputPeakR: Float, outputPeakL: Float, outputPeakR: Float,
-    limiterGain: Float, limiterReleaseMs: Float, active: Boolean, limiterActive: Boolean,
+    limiterGain: Float, limiterReleaseMs: Float, loudnessGain: Float,
+    active: Boolean, limiterActive: Boolean, loudnessActive: Boolean,
     wifiReceiveActive: Boolean, wifiStats: LongArray,
     wifiTransmitActive: Boolean, wifiTransmitStats: LongArray,
     waveformData: FloatArray, showWaveforms: Boolean, showLevelMeters: Boolean,
@@ -1023,6 +1026,16 @@ private fun LogPanel(lines: List<String>, onClear: () -> Unit) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("GAIN", color = Muted, fontSize = 10.sp); Text("%.6f".format(limiterGain), color = Color.White, fontSize = 11.sp)
                 Text("RELEASE", color = Muted, fontSize = 10.sp); Text(limiterReleaseStatus(limiterReleaseMs), color = Color.White, fontSize = 11.sp)
+            }
+            Spacer(Modifier.height(10.dp)); HorizontalDivider(color = Color(0xFF344248)); Spacer(Modifier.height(9.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("LOUDNORM", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                Text(if (loudnessActive) "ACTIVE" else "BYPASS", color = if (loudnessActive) Teal else Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+            }
+            Spacer(Modifier.height(5.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("GAIN", color = Muted, fontSize = 10.sp)
+                Text("%.6f".format(loudnessGain), color = Color.White, fontSize = 11.sp)
             }
             if (wifiReceiveActive) {
                 Spacer(Modifier.height(10.dp)); HorizontalDivider(color = Color(0xFF344248)); Spacer(Modifier.height(9.dp))

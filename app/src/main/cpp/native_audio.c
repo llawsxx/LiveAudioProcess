@@ -165,6 +165,7 @@ typedef struct {
     atomic_int running, recording, flags;
     atomic_int net_rx_worker_running, net_rx_worker_started;
     _Atomic(float) levels[6];
+    _Atomic(float) loudness_applied_gain;
     _Atomic(float) peak_levels[4];
     uint64_t peak_hold_until_ns[4];
     float waveform_dry[512], waveform_wet[512];
@@ -798,6 +799,7 @@ static void loudness_reset(void) {
     g.loudness_lra_pos = g.loudness_lra_valid = g.loudness_lra_hop = 0;
     g.loudness_measured_lra = 0.0;
     g.loudness_gain = g.loudness_desired_gain = 1.0;
+    atomic_store(&g.loudness_applied_gain, 1.f);
     g.loudness_gain_coeff = 0.0;
     g.loudness_peak_gain = 1.0;
     g.loudness_tp_limit = 1.0;
@@ -964,6 +966,7 @@ static void loudness_process(float *l, float *r, const float *p) {
     applied_gain = g.loudness_gain * g.loudness_peak_gain;
     if (p[P_LOUDNESS_BOOST_ONLY] >= 0.5f)
         applied_gain = fmax(applied_gain, 1.0);
+    atomic_store(&g.loudness_applied_gain, (float)applied_gain);
     *l = (float)((double)*l * applied_gain);
     *r = (float)((double)*r * applied_gain);
 }
@@ -2833,7 +2836,7 @@ JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureTone(J
     pthread_mutex_unlock(&g.param_lock);
     atomic_store(&g.tone_enabled,enabled?1:0);
 }
-JNIEXPORT jfloatArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_levels(JNIEnv*e,jobject o){(void)o;jfloat v[10];for(int i=0;i<6;i++)v[i]=atomic_load(&g.levels[i]);for(int i=0;i<4;i++)v[6+i]=atomic_load(&g.peak_levels[i]);jfloatArray a=(*e)->NewFloatArray(e,10);(*e)->SetFloatArrayRegion(e,a,0,10,v);return a;}
+JNIEXPORT jfloatArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_levels(JNIEnv*e,jobject o){(void)o;jfloat v[11];for(int i=0;i<6;i++)v[i]=atomic_load(&g.levels[i]);for(int i=0;i<4;i++)v[6+i]=atomic_load(&g.peak_levels[i]);v[10]=atomic_load(&g.loudness_applied_gain);jfloatArray a=(*e)->NewFloatArray(e,11);(*e)->SetFloatArrayRegion(e,a,0,11,v);return a;}
 JNIEXPORT jfloatArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_waveform(JNIEnv*e,jobject o){
     (void)o; jfloat v[1024]={0};
     pthread_mutex_lock(&g.waveform_lock);
