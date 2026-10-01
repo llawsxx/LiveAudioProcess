@@ -15,6 +15,10 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -60,7 +64,13 @@ fun UnifiedEffectsPanel(settings: EffectSettings, onChange: (EffectSettings) -> 
             }
             ParameterSlider("目标响度", settings.loudnessTarget, -30f..-5f, { onChange(settings.copy(loudnessTarget = it)) }, "${"%.1f".format(settings.loudnessTarget)} LUFS")
             ParameterSlider("响度范围 LRA", settings.loudnessLra, 1f..20f, { onChange(settings.copy(loudnessLra = it)) }, "${"%.1f".format(settings.loudnessLra)} LU")
+            UpdateIntervalSlider(settings.loudnessUpdateIntervalMs) {
+                onChange(settings.copy(loudnessUpdateIntervalMs = it))
+            }
             ParameterSlider("真峰值上限", settings.loudnessTruePeak, -9f..0f, { onChange(settings.copy(loudnessTruePeak = it)) }, "${"%.1f".format(settings.loudnessTruePeak)} dBTP")
+            LookAheadSlider("前视时间", settings.loudnessLookAhead, 5f..50f) {
+                onChange(settings.copy(loudnessLookAhead = it))
+            }
 
             GroupTitle("限制器 Limiter")
             ParameterSlider("Input Gain", settings.limiterInputGain, -24f..24f, { onChange(settings.copy(limiterInputGain = it)) }, limiterDbLabel(settings.limiterInputGain))
@@ -77,7 +87,9 @@ fun UnifiedEffectsPanel(settings: EffectSettings, onChange: (EffectSettings) -> 
                 )
             }
             ParameterSlider("Ceiling", settings.limiterCeiling, -6f..0f, { onChange(settings.copy(limiterCeiling = it)) }, limiterDbLabel(settings.limiterCeiling))
-            ParameterSlider("Look-ahead", settings.limiterLookAhead, 0f..5f, { onChange(settings.copy(limiterLookAhead = it)) }, "${"%.1f".format(settings.limiterLookAhead)} ms")
+            LookAheadSlider("Look-ahead", settings.limiterLookAhead, 0f..50f) {
+                onChange(settings.copy(limiterLookAhead = it))
+            }
 
         }
     }
@@ -86,6 +98,41 @@ fun UnifiedEffectsPanel(settings: EffectSettings, onChange: (EffectSettings) -> 
 @Composable
 private fun GroupTitle(text: String) {
     Text(text, color = UnifiedTeal, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 5.dp))
+}
+
+@Composable
+private fun LookAheadSlider(label: String, value: Float, range: ClosedFloatingPointRange<Float>, onChange: (Float) -> Unit) {
+    var pending by remember(value) { mutableFloatStateOf(value) }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = Color.White, fontSize = 11.sp, modifier = Modifier.width(64.dp), maxLines = 1)
+        Slider(
+            value = pending,
+            onValueChange = { pending = it },
+            onValueChangeFinished = { onChange(pending) },
+            valueRange = range,
+            modifier = Modifier.weight(1f).height(30.dp)
+        )
+        Spacer(Modifier.width(8.dp))
+        Text("${"%.1f".format(pending)} ms", color = UnifiedMuted, fontSize = 10.sp, modifier = Modifier.width(64.dp))
+    }
+}
+
+@Composable
+private fun UpdateIntervalSlider(value: Float, onChange: (Float) -> Unit) {
+    var pending by remember(value) { mutableFloatStateOf(value) }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text("更新间隔", color = Color.White, fontSize = 11.sp, modifier = Modifier.width(64.dp))
+        Slider(
+            value = pending,
+            onValueChange = { pending = (((it / 100f) + 0.5f).toInt() * 100f).coerceIn(100f, 3000f) },
+            onValueChangeFinished = { onChange(pending) },
+            valueRange = 100f..3000f,
+            steps = 28,
+            modifier = Modifier.weight(1f).height(30.dp)
+        )
+        Spacer(Modifier.width(8.dp))
+        Text("${pending.toInt()} ms", color = UnifiedMuted, fontSize = 10.sp, modifier = Modifier.width(64.dp))
+    }
 }
 
 @Composable

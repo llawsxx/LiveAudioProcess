@@ -11,7 +11,8 @@ data class EffectSettings(
     val reverbRoom: Float = 42f, val reverbDecay: Float = 1.8f, val reverbDamping: Float = 35f, val reverbMix: Float = 18f,
     val limiterInputGain: Float = 0f, val limiterThreshold: Float = -.5f, val limiterRelease: Float = 80f, val limiterCeiling: Float = -.5f, val limiterLookAhead: Float = 1f, val limiterAdaptiveRelease: Boolean = false,
     val loudnessTarget: Float = -16f, val loudnessLra: Float = 7f, val loudnessTruePeak: Float = -1f,
-    val loudnessBoostOnly: Boolean = false
+    val loudnessBoostOnly: Boolean = false, val loudnessLookAhead: Float = 5f,
+    val loudnessUpdateIntervalMs: Float = 1000f
 ) {
     fun save(p: SharedPreferences) = p.edit()
         .putBoolean("dspEnabled", dspEnabled).putBoolean("eqEnabled", eqEnabled).putBoolean("reverbEnabled", reverbEnabled).putBoolean("limiterEnabled", limiterEnabled).putBoolean("loudnessEnabled", loudnessEnabled)
@@ -21,7 +22,7 @@ data class EffectSettings(
         .putFloat("eq4Frequency", eq4Frequency).putFloat("eq4Gain", eq4Gain).putFloat("eq4Q", eq4Q)
         .putFloat("reverbRoom", reverbRoom).putFloat("reverbDecay", reverbDecay).putFloat("reverbDamping", reverbDamping).putFloat("reverbMix", reverbMix)
         .putFloat("limiterInputGain", limiterInputGain).putFloat("limiterThreshold", limiterThreshold).putFloat("limiterRelease", limiterRelease).putFloat("limiterCeiling", limiterCeiling).putFloat("limiterLookAhead", limiterLookAhead).putBoolean("limiterAdaptiveRelease", limiterAdaptiveRelease)
-        .putFloat("loudnessTarget", loudnessTarget).putFloat("loudnessLra", loudnessLra).putFloat("loudnessTruePeak", loudnessTruePeak).putBoolean("loudnessBoostOnly", loudnessBoostOnly).apply()
+        .putFloat("loudnessTarget", loudnessTarget).putFloat("loudnessLra", loudnessLra).putFloat("loudnessTruePeak", loudnessTruePeak).putBoolean("loudnessBoostOnly", loudnessBoostOnly).putFloat("loudnessLookAhead", loudnessLookAhead).putFloat("loudnessUpdateIntervalMs", loudnessUpdateIntervalMs).apply()
 
     companion object {
         fun load(p: SharedPreferences) = EffectSettings(
@@ -31,8 +32,9 @@ data class EffectSettings(
             p.getFloat("eq3Frequency", 4000f), p.getFloat("eq3Gain", 0f), p.getFloat("eq3Q", 1f),
             p.getFloat("eq4Frequency", 10000f), p.getFloat("eq4Gain", 0f), p.getFloat("eq4Q", 1f),
             p.getFloat("reverbRoom", 42f), p.getFloat("reverbDecay", 1.8f), p.getFloat("reverbDamping", 35f), p.getFloat("reverbMix", 18f),
-            p.getFloat("limiterInputGain", 0f), p.getFloat("limiterThreshold", -.5f), p.getFloat("limiterRelease", 80f), p.getFloat("limiterCeiling", -.5f), p.getFloat("limiterLookAhead", 1f), p.getBoolean("limiterAdaptiveRelease", false),
-            p.getFloat("loudnessTarget", -16f), p.getFloat("loudnessLra", 7f), p.getFloat("loudnessTruePeak", -1f), p.getBoolean("loudnessBoostOnly", false)
+            p.getFloat("limiterInputGain", 0f), p.getFloat("limiterThreshold", -.5f), p.getFloat("limiterRelease", 80f), p.getFloat("limiterCeiling", -.5f), p.getFloat("limiterLookAhead", 1f).coerceIn(0f, 50f), p.getBoolean("limiterAdaptiveRelease", false),
+            p.getFloat("loudnessTarget", -16f), p.getFloat("loudnessLra", 7f), p.getFloat("loudnessTruePeak", -1f), p.getBoolean("loudnessBoostOnly", false), p.getFloat("loudnessLookAhead", 5f).coerceIn(5f, 50f),
+            p.getFloat("loudnessUpdateIntervalMs", 1000f).coerceIn(100f, 3000f)
         )
     }
 }

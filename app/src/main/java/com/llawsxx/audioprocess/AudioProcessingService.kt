@@ -97,7 +97,7 @@ class AudioProcessingService : Service() {
         engine.eq4Frequency = effects.eq4Frequency; engine.eq4Gain = effects.eq4Gain; engine.eq4Q = effects.eq4Q
         engine.reverbRoom = effects.reverbRoom; engine.reverbDecay = effects.reverbDecay; engine.reverbDamping = effects.reverbDamping; engine.reverbMix = effects.reverbMix / 100f
         engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease
-        engine.loudnessTarget = effects.loudnessTarget; engine.loudnessLra = effects.loudnessLra; engine.loudnessTruePeak = effects.loudnessTruePeak; engine.loudnessBoostOnly = effects.loudnessBoostOnly; engine.loudnessEnabled = effects.loudnessEnabled
+        engine.loudnessTarget = effects.loudnessTarget; engine.loudnessLra = effects.loudnessLra; engine.loudnessTruePeak = effects.loudnessTruePeak; engine.loudnessBoostOnly = effects.loudnessBoostOnly; engine.loudnessLookAhead = effects.loudnessLookAhead; engine.loudnessUpdateIntervalMs = effects.loudnessUpdateIntervalMs; engine.loudnessEnabled = effects.loudnessEnabled
         engine.toneWaveform = p.getInt("toneWaveform", 0).coerceIn(0, 7)
         engine.toneMusic = p.getInt("toneMusic", 0).coerceIn(0, 5)
         engine.toneChannels = p.getInt("toneChannels", 0).coerceIn(0, 2)
