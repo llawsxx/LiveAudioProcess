@@ -716,7 +716,41 @@ private fun LiveAudioProcessApp() {
             else "未检测到 USB 声卡，未切换输出"
         }
     }
-    Scaffold(containerColor = Ink, topBar = { TopAppBar(title = { Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.GraphicEq, null, tint = Teal, modifier = Modifier.size(25.dp)); Spacer(Modifier.width(9.dp)); Text("LiveAudioProcess", fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp) } }, actions = { StatusDot(running) }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Ink, titleContentColor = Color.White)) }) { pad ->
+    Scaffold(containerColor = Ink, topBar = {
+        EngineControlBar(
+            running = running,
+            recording = recording,
+            elapsed = elapsed,
+            hasPermission = hasPermission,
+            onStart = {
+                if (!hasPermission) {
+                    permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                } else if (input == InputSource.USB || output == OutputSource.USB) {
+                    val currentActivity = activity as? MainActivity
+                    if (currentActivity == null) {
+                        startMonitoring()
+                    } else {
+                        currentActivity.requestUsbAudioPermission(usbHostDeviceKey) { granted ->
+                            if (granted) startMonitoring()
+                            else routeNotice = "USB AUDIO CODEC 权限被拒绝，未启动监听"
+                        }
+                    }
+                } else {
+                    startMonitoring()
+                }
+            },
+            onStop = {
+                context.startService(Intent(context, AudioProcessingService::class.java).setAction(AudioProcessingService.ACTION_STOP))
+            },
+            onRecordingChange = {
+                if (running) {
+                    engine.setRecording(!recording)
+                    recording = engine.isRecording
+                    if (!recording) elapsed = 0
+                }
+            }
+        )
+    }) { pad ->
         Column(
             Modifier.fillMaxSize().padding(pad).padding(horizontal = 16.dp)
                 .verticalScroll(when (currentPage) { 0 -> consoleScrollState; 1 -> processingScrollState; else -> logScrollState }),
@@ -804,29 +838,6 @@ private fun LiveAudioProcessApp() {
             }
             Float32Badge()
             WifiAudioPanel(rate, wifiSendHost, wifiSendPort, wifiTransport, wifiCodec, wifiAacBitrate, wifiPacketDuration, wifiOpusFrameMs, wifiOpusProfile, wifiOutputEnabled && wifiActive, { wifiSendHost = it }, { wifiSendPort = it }, { wifiTransport = it; prefs.edit().putInt("wifiTransport", it).apply() }, { wifiCodec = it }, { wifiAacBitrate = it }, { wifiPacketDuration = it }, { wifiOpusFrameMs = it }, { wifiOpusProfile = it }, wifiReceiveHost, wifiReceivePort, wifiMinBuffer, wifiMaxBuffer, wifiMaxHold, wifiInputTimeout, input == InputSource.WIFI && wifiActive, { wifiReceiveHost = it }, { wifiReceivePort = it }, { wifiMinBuffer = it }, { wifiMaxBuffer = it }, { wifiMaxHold = it }, { wifiInputTimeout = it }, wifiClockCorrectionEnabled, { enabled -> wifiClockCorrectionEnabled = enabled }, wifiLowLatencyEnabled, { enabled -> wifiLowLatencyEnabled = enabled }, wifiDynamicBufferEnabled, { enabled -> wifiDynamicBufferEnabled = enabled }, wifiManualBufferBias, { bias -> wifiManualBufferBias = bias }, clockCorrectionPpm = wifiClockCorrectionPpm, onClockCorrectionPpm = { ppm -> wifiClockCorrectionPpm = ppm }, networkQosEnabled = wifiQosEnabled, onNetworkQosEnabled = { enabled -> wifiQosEnabled = enabled }, retransmitEnabled = wifiRetransmitEnabled, onRetransmitEnabled = { enabled -> wifiRetransmitEnabled = enabled })
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                Button(onClick = {
-                    if (!hasPermission) {
-                        permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                    } else if (running) {
-                        context.startService(Intent(context, AudioProcessingService::class.java).setAction(AudioProcessingService.ACTION_STOP))
-                    } else if (input == InputSource.USB || output == OutputSource.USB) {
-                        val currentActivity = activity as? MainActivity
-                        if (currentActivity == null) {
-                            startMonitoring()
-                        } else {
-                            currentActivity.requestUsbAudioPermission(usbHostDeviceKey) { granted ->
-                                if (granted) startMonitoring()
-                                else routeNotice = "USB AUDIO CODEC 权限被拒绝，未启动监听"
-                            }
-                        }
-                    } else {
-                        startMonitoring()
-                    }
-                }, modifier = Modifier.weight(1f).height(54.dp), colors = ButtonDefaults.buttonColors(containerColor = if (running) PanelRaised else Teal, contentColor = if (running) Color.White else Ink), shape = RoundedCornerShape(10.dp)) { Icon(if (running) Icons.Outlined.Stop else Icons.Outlined.PlayArrow, null); Spacer(Modifier.width(8.dp)); Text(if (!hasPermission) "授权麦克风" else if (running) "停止引擎" else "启动监听", fontWeight = FontWeight.Bold) }
-                IconButton(onClick = { if (running) { recording = !recording; engine.setRecording(recording); if (!recording) elapsed = 0 } }, modifier = Modifier.size(54.dp).background(if (recording) Red.copy(.18f) else Panel, RoundedCornerShape(10.dp))) { Icon(Icons.Outlined.FiberManualRecord, "录音", tint = if (recording) Red else Muted) }
-            }
-            RecordingBar(recording, elapsed)
             Spacer(Modifier.height(12.dp))
             } else if (currentPage == 1) {
                 SectionTitle("处理链", "DSP CHAIN")
@@ -871,7 +882,6 @@ private fun LogPanel(lines: List<String>, onClear: () -> Unit) {
     }
 }
 
-@Composable private fun StatusDot(active: Boolean) { Row(Modifier.padding(end = 16.dp), verticalAlignment = Alignment.CenterVertically) { Box(Modifier.size(8.dp).clip(RoundedCornerShape(50)).background(if (active) Teal else Muted)); Spacer(Modifier.width(6.dp)); Text(if (active) "LIVE" else "OFFLINE", color = if (active) Teal else Muted, fontSize = 11.sp, fontWeight = FontWeight.Bold) } }
 @Composable private fun VolumeControlPanel(value: Int, usb: Boolean, enabled: Boolean, onChange: (Int) -> Unit) {
     Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp)) {
@@ -1275,4 +1285,3 @@ private fun limiterReleaseStatus(valueMs: Float): String = if (valueMs >= 1000f)
 @Composable private fun EffectsPanel(settings: EffectSettings, onChange: (EffectSettings) -> Unit) { Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) { SectionTitle("处理链", "DSP CHAIN  ·  EQ → CONVOLUTION REVERB → LIMITER"); Text("参数均衡 EQ · 4-band ready", color = Teal, fontSize = 11.sp, fontWeight = FontWeight.Bold); EffectSlider("频点 1 · 频率", "20 Hz – 20 kHz", settings.eqFrequency, 20f..20000f, { onChange(settings.copy(eqFrequency = it)) }, "${settings.eqFrequency.toInt()} Hz"); EffectSlider("频点 1 · 增益", "Peaking  ·  Q 可调", settings.eqGain, -12f..12f, { onChange(settings.copy(eqGain = it)) }, "${if (settings.eqGain >= 0) "+" else ""}${settings.eqGain.toInt()} dB"); EffectSlider("频点 1 · Q 值", "带宽控制", settings.eqQ, .5f..10f, { onChange(settings.copy(eqQ = it)) }, "Q ${"%.2f".format(settings.eqQ)}"); Text("其余 EQ 频点可在同一处理器配置中扩展，当前 DSP 使用频点 1。", color = Muted, fontSize = 10.sp); Text("卷积混响 Convolution Reverb", color = Teal, fontSize = 11.sp, fontWeight = FontWeight.Bold); EffectSlider("Room size", "空间大小", settings.reverbRoom, 0f..100f, { onChange(settings.copy(reverbRoom = it)) }, "${settings.reverbRoom.toInt()}%"); EffectSlider("Decay", "衰减时间", settings.reverbDecay, .2f..6f, { onChange(settings.copy(reverbDecay = it)) }, "${"%.1f".format(settings.reverbDecay)} s"); EffectSlider("Damping", "高频阻尼", settings.reverbDamping, 0f..100f, { onChange(settings.copy(reverbDamping = it)) }, "${settings.reverbDamping.toInt()}%"); EffectSlider("Dry / Wet", "混合比例", settings.reverbMix, 0f..100f, { onChange(settings.copy(reverbMix = it)) }, "${settings.reverbMix.toInt()}%"); Text("限制器 Limiter", color = Teal, fontSize = 11.sp, fontWeight = FontWeight.Bold); EffectSlider("Threshold", "触发阈值", settings.limiterThreshold, -24f..0f, { onChange(settings.copy(limiterThreshold = it)) }, "${"%.2f".format(settings.limiterThreshold)} dB"); EffectSlider("Release", "释放时间", settings.limiterRelease, 10f..10000f, { onChange(settings.copy(limiterRelease = it)) }, "${"%.1f".format(settings.limiterRelease)} ms"); EffectSlider("Ceiling", "输出上限", settings.limiterCeiling, -6f..0f, { onChange(settings.copy(limiterCeiling = it)) }, "${"%.2f".format(settings.limiterCeiling)} dB"); EffectSlider("Look-ahead", "前视延迟", settings.limiterLookAhead, 0f..50f, { onChange(settings.copy(limiterLookAhead = it)) }, "${"%.1f".format(settings.limiterLookAhead)} ms") } } }
 @Composable private fun EffectSlider(title: String, hint: String, value: Float, range: ClosedFloatingPointRange<Float>, onChange: (Float) -> Unit, readout: String) { Column { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Column { Text(title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold); Text(hint, color = Muted, fontSize = 10.sp) }; Text(readout, color = Teal, fontSize = 12.sp, fontWeight = FontWeight.Bold) }; Slider(value = value, onValueChange = onChange, valueRange = range, modifier = Modifier.height(32.dp)) } }
 @Composable private fun SectionTitle(title: String, code: String) { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text(title, color = Color.White, fontWeight = FontWeight.Bold); Text(code, color = Muted, fontSize = 10.sp, letterSpacing = .8.sp) } }
-@Composable private fun RecordingBar(active: Boolean, elapsed: Int) { Row(Modifier.fillMaxWidth().border(1.dp, if (active) Red.copy(.5f) else Color(0xFF2A373C), RoundedCornerShape(10.dp)).padding(12.dp), verticalAlignment = Alignment.CenterVertically) { Box(Modifier.size(9.dp).clip(RoundedCornerShape(50)).background(if (active) Red else Muted)); Spacer(Modifier.width(9.dp)); Text(if (active) "正在录制 · 干声 + 湿声" else "双轨录音已就绪", color = Color.White, fontSize = 12.sp); Spacer(Modifier.weight(1f)); Text("%02d:%02d".format(elapsed / 60, elapsed % 60), color = if (active) Red else Muted, fontWeight = FontWeight.Bold, fontSize = 13.sp) } }
