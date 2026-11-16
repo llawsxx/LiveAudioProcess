@@ -93,6 +93,8 @@ class AudioEngine(private val context: Context) {
         internal set
     @Volatile var builtInMicSource = BuiltInMicSource.DEFAULT
         private set
+    @Volatile var inputClockCorrectionEnabled = true
+        private set
     @Volatile var systemInputDeviceKey = SYSTEM_DEVICE_BUILTIN_INPUT
     @Volatile var systemOutputDeviceKey = SYSTEM_DEVICE_BUILTIN_OUTPUT
     @Volatile var usbHostDeviceKey = USB_HOST_DEVICE_AUTO
@@ -312,6 +314,10 @@ class AudioEngine(private val context: Context) {
     fun configureUsbOutputDither(enabled: Boolean) {
         usbOutputDitherEnabled = enabled
         if (NativeAudio.available) NativeAudio.configureUsbOutputDither(enabled)
+    }
+    fun configureInputClockCorrection(enabled: Boolean) {
+        inputClockCorrectionEnabled = enabled
+        if (NativeAudio.available) NativeAudio.configureInputClockCorrection(enabled)
     }
     fun configureBuiltInMicSource(source: BuiltInMicSource) {
         val supportedSource = BuiltInMicSource.fromName(source.name, Build.VERSION.SDK_INT)

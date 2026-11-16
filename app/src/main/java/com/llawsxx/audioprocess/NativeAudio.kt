@@ -23,6 +23,8 @@ object NativeAudio {
     external fun setUsbVolume(percent: Int): Boolean
     external fun configureOutputBufferMaxMs(maxMs: Int)
     external fun configureInputBufferMaxMs(maxMs: Int)
+    external fun configureInputClockCorrection(enabled: Boolean)
+    external fun inputClockInfo(): LongArray
     external fun clearNetwork()
     external fun networkErrorInfo(): IntArray
     external fun networkReceiveStats(): LongArray

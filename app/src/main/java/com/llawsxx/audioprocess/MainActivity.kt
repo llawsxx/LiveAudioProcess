@@ -57,7 +57,8 @@ private data class NetworkStatsSnapshot(
     val input: LongArray,
     val output: LongArray,
     val receive: LongArray,
-    val transmit: LongArray
+    val transmit: LongArray,
+    val inputClock: LongArray
 )
 
 private data class DeviceInfoSnapshot(
@@ -260,6 +261,7 @@ private fun LiveAudioProcessApp() {
     var recording by remember { mutableStateOf(false) }
     var input by remember { mutableStateOf(runCatching { InputSource.valueOf(prefs.getString("input", InputSource.BUILT_IN.name)!!) }.getOrDefault(InputSource.BUILT_IN)) }
     var builtInMicSource by remember { mutableStateOf(BuiltInMicSource.fromName(prefs.getString("builtInMicSource", null), Build.VERSION.SDK_INT)) }
+    var inputClockCorrectionEnabled by remember { mutableStateOf(prefs.getBoolean("inputClockCorrectionEnabled", true)) }
     var channelPair by remember { mutableIntStateOf(prefs.getInt("channelPair", 0)) }
     var output by remember {
         val saved = runCatching { OutputSource.valueOf(prefs.getString("output", OutputSource.SPEAKER.name)!!) }
@@ -345,6 +347,7 @@ private fun LiveAudioProcessApp() {
     }
     var usbStats by remember { mutableStateOf(LongArray(18)) }
     var inputInfo by remember { mutableStateOf(LongArray(15)) }
+    var inputClockInfo by remember { mutableStateOf(LongArray(9)) }
     var outputInfo by remember { mutableStateOf(LongArray(16)) }
     var wifiReceiveStats by remember { mutableStateOf(LongArray(10)) }
     var wifiTransmitStats by remember { mutableStateOf(LongArray(7)) }
@@ -489,6 +492,7 @@ private fun LiveAudioProcessApp() {
     LaunchedEffect(running, input, currentPage) {
         if (!running) {
             inputInfo = LongArray(15)
+            inputClockInfo = LongArray(9)
             outputInfo = LongArray(16)
             wifiReceiveStats = LongArray(10)
             wifiTransmitStats = LongArray(7)
@@ -504,11 +508,13 @@ private fun LiveAudioProcessApp() {
                         NativeAudio.inputInfo(),
                         NativeAudio.outputInfo(),
                         if (input == InputSource.WIFI) NativeAudio.networkReceiveStats() else LongArray(10),
-                        if (wifiOutputEnabled && input != InputSource.WIFI) NativeAudio.networkTransmitStats() else LongArray(7)
+                        if (wifiOutputEnabled && input != InputSource.WIFI) NativeAudio.networkTransmitStats() else LongArray(7),
+                        NativeAudio.inputClockInfo()
                     )
                 }
             if (!inputInfo.contentEquals(latestNetworkStats.input)) inputInfo = latestNetworkStats.input
             if (!outputInfo.contentEquals(latestNetworkStats.output)) outputInfo = latestNetworkStats.output
+            if (!inputClockInfo.contentEquals(latestNetworkStats.inputClock)) inputClockInfo = latestNetworkStats.inputClock
             if (!wifiReceiveStats.contentEquals(latestNetworkStats.receive))
                 wifiReceiveStats = latestNetworkStats.receive
             if (!wifiTransmitStats.contentEquals(latestNetworkStats.transmit))
@@ -625,6 +631,10 @@ private fun LiveAudioProcessApp() {
         val applied = entered.coerceIn(5, 200)
         prefs.edit().putInt("systemOutputBufferMaxMs", applied).apply()
         engine.configureSystemOutputBuffer(applied)
+    }
+    LaunchedEffect(inputClockCorrectionEnabled) {
+        prefs.edit().putBoolean("inputClockCorrectionEnabled", inputClockCorrectionEnabled).apply()
+        engine.configureInputClockCorrection(inputClockCorrectionEnabled)
     }
     LaunchedEffect(builtInMicSource) {
         prefs.edit().putString("builtInMicSource", builtInMicSource.name).apply()
@@ -770,6 +780,15 @@ private fun LiveAudioProcessApp() {
             RoutingPanel2(input, { selectInput(it) }, output, { selectOutput(it) }, systemInputDevices, systemInputDeviceKey, { systemInputDeviceKey = it; syncEngine() }, systemOutputDevices, systemOutputDeviceKey, { systemOutputDeviceKey = it; syncEngine() }, usbHostDevices, usbHostDeviceKey, { key -> val currentActivity = activity as? MainActivity; if (currentActivity == null) { usbHostDeviceKey = key; syncEngine() } else currentActivity.requestUsbAudioPermission(key) { granted -> if (granted) { usbHostDeviceKey = key; syncEngine() } else routeNotice = "USB 声卡授权被拒绝，未切换设备" } }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
             if (input == InputSource.TEST_TONE) TonePanel(toneWaveform, toneMusic, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevelDb, { selected -> toneWaveform = selected; when (selected) { 4 -> { toneFrequency = 20f; toneFrequency2 = 20_000f }; 6 -> { toneFrequency = 19_000f; toneFrequency2 = 20_000f }; else -> Unit } }, { toneMusic = it }, { toneChannels = it }, { toneFrequency = it }, { toneFrequency2 = it }, { toneDurationSeconds = it }, { toneClickIntervalMs = it }, { toneLevelDb = it })
             EnginePanelWithIoRates(rate, { rate = it; syncEngine() }, outputRate, { outputRate = it; syncEngine() }, buffer, { buffer = it; syncEngine() }, running)
+            if (input == InputSource.BUILT_IN || input == InputSource.USB) {
+                InputClockPanel(
+                    info = inputClockInfo,
+                    enabled = inputClockCorrectionEnabled,
+                    onEnabledChange = { inputClockCorrectionEnabled = it },
+                    running = running,
+                    hasOutput = output != OutputSource.NONE && output != OutputSource.WIFI
+                )
+            }
             SystemInputPanel(
                 info = inputInfo,
                 visible = input != InputSource.USB && input != InputSource.WIFI,

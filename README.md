@@ -10,6 +10,7 @@ Android 低延迟实时音频处理与路由工具，支持本机 DSP、USB Audi
 
 - 基于 Android AAudio 的低延迟音频输入与输出
 - 内置麦克风音频来源选择：默认、MIC、CAMCORDER、VOICE_RECOGNITION、VOICE_COMMUNICATION、UNPROCESSED、VOICE_PERFORMANCE；自动保存，运行中切换会重开音频流
+- 输入设备时钟校正：以本地输出设备为基准统计输入采样率，显示估算 Hz、漂移和补偿 ppm，通过平滑重采样补偿系统输入及 USB Host 输入；无本地输出时自动忽略补偿
 - Wi-Fi 音频发送与接收
   - UDP / TCP 传输
   - PCM Float32、AAC-LC、Opus 编解码
@@ -61,6 +62,16 @@ Windows:
 4. 如两台手机的音频时钟存在偏差，在接收端开启 `CLOCK DRIFT CORRECTION`。
 5. 根据 BUFFER 稳定性调整校正幅度，范围为 `1-200 ppm`。
 
+“输入设备时钟校正”默认开启，可在控制台单独关闭并自动保存。初次统计至少需要 5 秒；页面显示相对于输出设备时钟的输入采样率，不是以外部精密时钟测得的绝对频率。优先使用 AAudio 时间戳，不可用时使用回调帧计数；USB Host 使用传输帧计数，包含调度抖动，估算值会随统计窗口逐步稳定。补偿在输入端、DSP 之前进行，包含少量缓冲深度反馈，总补偿限幅 ±5000 ppm。没有本地音频输出、时钟失效或切换设备时，不使用过期估算；测试音源和 Wi-Fi 接收保留各自原有逻辑，Wi-Fi 接收的 BUFFER 时钟校正设置不变。
+
+原生时钟校正模拟测试（需 GCC）：
+
+```powershell
+New-Item -ItemType Directory -Force app/build/clock-tests
+gcc -std=c11 -O2 -Wall -Wextra -Werror -I app/src/main/cpp app/src/main/cpp/input_clock_correction.c app/src/test/cpp/input_clock_correction_test.c -lm -o app/build/clock-tests/input_clock_correction_test.exe
+./app/build/clock-tests/input_clock_correction_test.exe
+```
+
 ## GitHub Topics
 
 ```text
@@ -92,6 +103,7 @@ Android low-latency real-time audio processing and routing tool with built-in DS
 
 - Low-latency audio input and output based on Android AAudio
 - Built-in microphone source selection: default, MIC, CAMCORDER, VOICE_RECOGNITION, VOICE_COMMUNICATION, UNPROCESSED, and VOICE_PERFORMANCE; saved automatically, with stream reopening when changed during capture
+- Input device clock correction: estimates and displays the input sample rate relative to the local output clock, then smoothly resamples system and USB Host input before DSP; bypassed when there is no local output clock
 - Wi-Fi audio sender and receiver
   - UDP / TCP transport
   - PCM Float32, AAC-LC, and Opus codecs

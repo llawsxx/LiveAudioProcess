@@ -5,6 +5,11 @@ extern "C" {
 #endif
 typedef void *usb_host_audio_t;
 typedef struct {
+    uint64_t input_frames, input_time_ns;
+    uint64_t output_frames, output_time_ns;
+    uint32_t input_rate, output_rate, input_queued_frames;
+} usb_host_audio_clock_t;
+typedef struct {
     uint64_t input_packet_errors;
     uint64_t input_empty_packets;
     uint64_t input_transfer_errors;
@@ -35,6 +40,8 @@ int usb_host_audio_read(usb_host_audio_t audio, float *stereo, int frames);
 int usb_host_audio_write(usb_host_audio_t audio, const float *stereo, int frames);
 void usb_host_audio_configure_output_buffer(usb_host_audio_t audio, int max_buffer_ms);
 void usb_host_audio_configure_input_buffer(usb_host_audio_t audio, int max_buffer_ms);
+void usb_host_audio_set_input_clock_ratio(usb_host_audio_t audio, double ratio);
+void usb_host_audio_get_clock(usb_host_audio_t audio, usb_host_audio_clock_t *clock);
 void usb_host_audio_configure_output_dither(usb_host_audio_t audio, int enabled);
 int usb_host_audio_set_volume(usb_host_audio_t audio, int percent);
 int usb_host_audio_has_failed(usb_host_audio_t audio);

@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "convolution_reverb.h"
+#include "input_clock_correction.h"
 #include "loudness_peak.h"
 #include "test_music.h"
 #include "usb_host_bridge.h"
@@ -160,6 +161,11 @@ typedef struct {
     int16_t wet[MAX_FRAMES * 2];
 } RecordBlock;
 typedef struct {
+    atomic_uint sequence;
+    atomic_ullong frames, time_ns;
+} CallbackClock;
+
+typedef struct {
     AAudioStream *input, *output;
     pthread_t thread;
     pthread_t net_rx_thread;
@@ -176,7 +182,15 @@ typedef struct {
     int waveform_count, waveform_pos;
     pthread_mutex_t waveform_lock;
     int rate, output_rate, frames, in_channels, pair;
-    double output_resample_phase;
+    double output_resample_phase, input_resample_phase;
+    int input_rate;
+    CallbackClock input_callback_clock, output_callback_clock;
+    InputClockCorrection input_clock;
+    double input_clock_ratio;
+    uint64_t input_clock_next_poll_ns, input_clock_last_valid_ns;
+    int input_clock_input_source, input_clock_output_source;
+    atomic_int input_clock_enabled;
+    atomic_llong input_clock_stats[9];
     float values[28];
     pthread_mutex_t param_lock, file_lock, stream_lock;
     Biquad eq[2][EQ_BANDS];
@@ -329,6 +343,7 @@ static Engine g = {
     .usb_input_buffer_max_ms = ATOMIC_VAR_INIT(20),
     .usb_output_dither_enabled = ATOMIC_VAR_INIT(1),
     .input_buffer_max_ms = ATOMIC_VAR_INIT(20),
+    .input_clock_enabled = ATOMIC_VAR_INIT(1),
     .net_opus_frame_ms = 20,
     .net_opus_application = WIFI_OPUS_APPLICATION_AUDIO,
     .net_target_dynamic_enabled = ATOMIC_VAR_INIT(1),
@@ -404,6 +419,35 @@ static uint32_t next_power_of_two(uint32_t value) {
     return result;
 }
 
+static void callback_clock_add(CallbackClock *clock, uint32_t frames) {
+    atomic_fetch_add_explicit(&clock->sequence, 1, memory_order_acq_rel);
+    atomic_fetch_add_explicit(&clock->frames, frames, memory_order_relaxed);
+    atomic_store_explicit(&clock->time_ns, now_ns(), memory_order_relaxed);
+    atomic_fetch_add_explicit(&clock->sequence, 1, memory_order_release);
+}
+
+static int callback_clock_read(CallbackClock *clock, uint64_t *frames, uint64_t *time_ns) {
+    for (int attempt = 0; attempt < 4; attempt++) {
+        unsigned int sequence = atomic_load_explicit(&clock->sequence, memory_order_acquire);
+        if (sequence & 1u) continue;
+        uint64_t sampled_frames = atomic_load_explicit(&clock->frames, memory_order_relaxed);
+        uint64_t sampled_time = atomic_load_explicit(&clock->time_ns, memory_order_relaxed);
+        atomic_thread_fence(memory_order_acquire);
+        if (sequence == atomic_load_explicit(&clock->sequence, memory_order_acquire)) {
+            *frames = sampled_frames;
+            *time_ns = sampled_time;
+            return sampled_time != 0;
+        }
+    }
+    return 0;
+}
+
+static void callback_clock_reset(CallbackClock *clock) {
+    atomic_store(&clock->sequence, 0);
+    atomic_store(&clock->frames, 0);
+    atomic_store(&clock->time_ns, 0);
+}
+
 static uint32_t input_ring_queued_frames(void) {
     /* Monotonic uint32 cursors intentionally wrap; unsigned subtraction keeps
        the SPSC distance valid because the queue can never span 2^32 frames. */
@@ -418,7 +462,7 @@ static int input_ring_create(int frames_per_burst, int processing_frames) {
     uint32_t block = processing_frames > 0 ? (uint32_t)processing_frames : burst;
     uint32_t channels = g.in_channels > 0 && g.in_channels <= MAX_INPUT_CHANNELS
             ? (uint32_t)g.in_channels : 1u;
-    uint32_t configured_frames = (uint32_t)(((uint64_t)g.rate * 200u) / 1000u);
+    uint32_t configured_frames = (uint32_t)(((uint64_t)g.input_rate * 200u) / 1000u);
     uint32_t required = configured_frames + burst * 2u + block;
     if (required < 4096u) required = 4096u;
     g.input_ring_capacity = next_power_of_two(required);
@@ -428,6 +472,7 @@ static int input_ring_create(int frames_per_burst, int processing_frames) {
     atomic_store(&g.input_read_frame, 0);
     atomic_store(&g.input_callback_overruns, 0);
     atomic_store(&g.input_buffer_clears, 0);
+    g.input_resample_phase = 0.0;
     return g.input_ring != NULL;
 }
 
@@ -440,40 +485,65 @@ static void input_ring_destroy(void) {
 
 static int input_ring_read(float *data, uint32_t frames) {
     if (!g.input_ring || !data || frames == 0 || frames > g.input_ring_capacity) return 0;
-    uint32_t read;
+    double step = (double)g.input_rate / (double)g.rate * g.input_clock_ratio;
+    double end_position = 0.0;
+    uint32_t read, consumed = 0;
+    int interpolate = 0;
     while (atomic_load(&g.running) && atomic_load(&g.input_error) == AAUDIO_OK) {
+        interpolate = step != 1.0 || g.input_resample_phase != 0.0;
+        end_position = g.input_resample_phase + (double)frames * step;
+        consumed = (uint32_t)end_position;
+        uint32_t required = interpolate
+                ? (uint32_t)(g.input_resample_phase + (double)(frames - 1u) * step) + 2u : frames;
+        if (required < consumed) required = consumed;
+        if (required > g.input_ring_capacity) return 0;
         uint32_t write = atomic_load_explicit(&g.input_write_frame, memory_order_acquire);
         read = atomic_load_explicit(&g.input_read_frame, memory_order_relaxed);
         uint32_t available = write - read;
         int max_ms = atomic_load_explicit(&g.input_buffer_max_ms, memory_order_relaxed);
-        uint32_t max_frames = (uint32_t)(((uint64_t)g.rate * (uint32_t)max_ms) / 1000u);
-        if (max_frames < frames) max_frames = frames;
+        uint32_t max_frames = (uint32_t)(((uint64_t)g.input_rate * (uint32_t)max_ms) / 1000u);
+        if (max_frames < required) max_frames = required;
         if (available > max_frames) {
             atomic_store_explicit(&g.input_read_frame, write, memory_order_release);
+            g.input_resample_phase = 0.0;
             unsigned int count = atomic_fetch_add(&g.input_buffer_clears, 1) + 1;
             if (count == 1 || count % 100 == 0)
                 LOGI("AAudio input buffer cleared: queued=%u limit=%u count=%u",
                      available, max_frames, count);
             continue;
         }
-        if (available <= g.input_ring_capacity && available >= frames) break;
+        if (available <= g.input_ring_capacity && available >= required) break;
         ring_prepare_wait(&g.input_ring_wakeup);
         write = atomic_load_explicit(&g.input_write_frame, memory_order_acquire);
         read = atomic_load_explicit(&g.input_read_frame, memory_order_relaxed);
         available = write - read;
-        if (available <= g.input_ring_capacity && available >= frames) continue;
+        if (available <= g.input_ring_capacity && available >= required) continue;
         ring_wait(&g.input_ring_wakeup);
     }
     if (!atomic_load(&g.running) || atomic_load(&g.input_error) != AAUDIO_OK) return 0;
     uint32_t channels = (uint32_t)g.in_channels;
     uint32_t offset = read & (g.input_ring_capacity - 1u);
-    uint32_t first = frames < g.input_ring_capacity - offset ? frames : g.input_ring_capacity - offset;
-    memcpy(data, g.input_ring + (size_t)offset * channels,
-           (size_t)first * channels * sizeof(float));
-    if (first < frames)
-        memcpy(data + (size_t)first * channels, g.input_ring,
-               (size_t)(frames - first) * channels * sizeof(float));
-    atomic_store_explicit(&g.input_read_frame, read + frames, memory_order_release);
+    if (interpolate) {
+        for (uint32_t frame = 0; frame < frames; frame++) {
+            double position = g.input_resample_phase + (double)frame * step;
+            uint32_t source = (uint32_t)position;
+            float fraction = (float)(position - source);
+            uint32_t first = (offset + source) & (g.input_ring_capacity - 1u);
+            uint32_t second = (first + 1u) & (g.input_ring_capacity - 1u);
+            for (uint32_t channel = 0; channel < channels; channel++) {
+                float before = g.input_ring[(size_t)first * channels + channel];
+                float after = g.input_ring[(size_t)second * channels + channel];
+                data[(size_t)frame * channels + channel] = before + (after - before) * fraction;
+            }
+        }
+    } else {
+        uint32_t first = frames < g.input_ring_capacity - offset ? frames : g.input_ring_capacity - offset;
+        memcpy(data, g.input_ring + (size_t)offset * channels, (size_t)first * channels * sizeof(float));
+        if (first < frames)
+            memcpy(data + (size_t)first * channels, g.input_ring, (size_t)(frames - first) * channels * sizeof(float));
+    }
+    g.input_resample_phase = end_position - consumed;
+    atomic_store_explicit(&g.input_read_frame, read + consumed, memory_order_release);
     return (int)frames;
 }
 
@@ -485,6 +555,7 @@ static aaudio_data_callback_result_t input_data_callback(
     if (!source || num_frames <= 0 || !atomic_load(&g.running) || !g.input_ring)
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     uint32_t frames = (uint32_t)num_frames;
+    callback_clock_add(&g.input_callback_clock, frames);
     uint32_t channels = (uint32_t)g.in_channels;
     uint32_t write = atomic_load_explicit(&g.input_write_frame, memory_order_relaxed);
     uint32_t read = atomic_load_explicit(&g.input_read_frame, memory_order_acquire);
@@ -611,6 +682,7 @@ static aaudio_data_callback_result_t output_data_callback(
         memset(target, 0, (size_t)num_frames * 2u * sizeof(float));
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
+    callback_clock_add(&g.output_callback_clock, (uint32_t)num_frames);
     uint32_t write = atomic_load_explicit(&g.output_write_frame, memory_order_acquire);
     uint32_t read = atomic_load_explicit(&g.output_read_frame, memory_order_relaxed);
     uint32_t available = write - read;
@@ -2470,12 +2542,111 @@ static int network_receive(float *data, int frames) {
     return frames;
 }
 
+static void input_clock_publish(int status, int input_rate, int output_rate, int input_source, int output_source) {
+    int measured = g.input_clock.ready && status != INPUT_CLOCK_WAITING;
+    atomic_store(&g.input_clock_stats[1], input_rate);
+    atomic_store(&g.input_clock_stats[2], measured ? llround(g.input_clock.estimated_input_rate * 1000.0) : 0);
+    atomic_store(&g.input_clock_stats[3], output_rate);
+    atomic_store(&g.input_clock_stats[4], measured ? llround(g.input_clock.drift_ppm * 1000.0) : 0);
+    atomic_store(&g.input_clock_stats[5], llround((g.input_clock_ratio - 1.0) * 1e9));
+    atomic_store(&g.input_clock_stats[6], llround(g.input_clock.span_seconds * 1000.0));
+    atomic_store(&g.input_clock_stats[7], input_source);
+    atomic_store(&g.input_clock_stats[8], output_source);
+    atomic_store(&g.input_clock_stats[0], status);
+}
+
+static void input_clock_reset(void) {
+    input_clock_correction_reset(&g.input_clock);
+    g.input_rate = 0;
+    g.input_clock_ratio = 1.0;
+    g.input_clock_next_poll_ns = g.input_clock_last_valid_ns = 0;
+    g.input_clock_input_source = g.input_clock_output_source = 0;
+    callback_clock_reset(&g.input_callback_clock);
+    callback_clock_reset(&g.output_callback_clock);
+    input_clock_publish(INPUT_CLOCK_MEASURING, 0, 0, 0, 0);
+}
+
+static int aaudio_clock_read(AAudioStream *stream, CallbackClock *callback,
+        int previous_source, uint64_t *frames, uint64_t *time_ns) {
+    int64_t position = 0, timestamp = 0;
+    aaudio_result_t result = AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &position, &timestamp);
+    uint64_t now = now_ns();
+    if (result == AAUDIO_OK && position >= 0 && timestamp > 0 &&
+            now >= (uint64_t)timestamp && now - (uint64_t)timestamp <= 2000000000ull) {
+        *frames = (uint64_t)position;
+        *time_ns = (uint64_t)timestamp;
+        return 1;
+    }
+    return previous_source != 1 && callback_clock_read(callback, frames, time_ns) ? 2 : 0;
+}
+
+static void input_clock_update(void) {
+    uint64_t now = now_ns();
+    if (now < g.input_clock_next_poll_ns) return;
+    g.input_clock_next_poll_ns = now + 250000000ull;
+    int enabled = atomic_load(&g.input_clock_enabled);
+    usb_host_audio_clock_t usb_clock = {0};
+    if (g.usb_audio) usb_host_audio_get_clock(g.usb_audio, &usb_clock);
+    int input_rate = g.usb_input_host ? (int)usb_clock.input_rate : g.input_rate;
+    int output_rate = g.usb_output_host ? (int)usb_clock.output_rate : g.output_rate;
+    int usb_failed = g.usb_audio && usb_host_audio_has_failed(g.usb_audio);
+    int has_input = g.usb_input_host ? !usb_failed : g.input && atomic_load(&g.input_error) == AAUDIO_OK;
+    int has_output = g.usb_output_host ? !usb_failed : g.output && atomic_load(&g.output_error) == AAUDIO_OK;
+    if (!has_input || !has_output) {
+        input_clock_correction_reset(&g.input_clock);
+        g.input_clock_ratio = 1.0;
+        usb_host_audio_set_input_clock_ratio(g.usb_audio, 1.0);
+        input_clock_publish(!has_input ? INPUT_CLOCK_NO_INPUT : INPUT_CLOCK_NO_OUTPUT,
+                has_input ? input_rate : 0, has_output ? output_rate : 0, 0, 0);
+        return;
+    }
+    uint64_t input_frames = usb_clock.input_frames, input_time = usb_clock.input_time_ns;
+    uint64_t output_frames = usb_clock.output_frames, output_time = usb_clock.output_time_ns;
+    int input_source = g.usb_input_host ? (input_time ? 3 : 0)
+            : aaudio_clock_read(g.input, &g.input_callback_clock, g.input_clock_input_source, &input_frames, &input_time);
+    int output_source = g.usb_output_host ? (output_time ? 3 : 0)
+            : aaudio_clock_read(g.output, &g.output_callback_clock, g.input_clock_output_source, &output_frames, &output_time);
+    now = now_ns();
+    int fresh = input_source && output_source && now >= input_time && now >= output_time &&
+            now - input_time <= 2000000000ull && now - output_time <= 2000000000ull;
+    if (!fresh) {
+        g.input_clock_ratio = g.input_clock.ratio = 1.0;
+        if (!g.input_clock_last_valid_ns || now - g.input_clock_last_valid_ns > 2000000000ull) {
+            input_clock_correction_reset(&g.input_clock);
+            g.input_clock_ratio = 1.0;
+            g.input_clock_input_source = g.input_clock_output_source = 0;
+        }
+        input_clock_publish(INPUT_CLOCK_WAITING, input_rate, output_rate, input_source, output_source);
+        usb_host_audio_set_input_clock_ratio(g.usb_audio, g.input_clock_ratio);
+        return;
+    }
+    g.input_clock_last_valid_ns = now;
+    if (input_source != g.input_clock_input_source || output_source != g.input_clock_output_source) {
+        input_clock_correction_reset(&g.input_clock);
+        g.input_clock_ratio = 1.0;
+        g.input_clock_input_source = input_source;
+        g.input_clock_output_source = output_source;
+    }
+    double queued = g.usb_input_host ? usb_clock.input_queued_frames : input_ring_queued_frames();
+    int max_ms = atomic_load(g.usb_input_host ? &g.usb_input_buffer_max_ms : &g.input_buffer_max_ms);
+    double target = fmax((double)g.frames * input_rate / g.rate + 2.0,
+            input_rate * fmin(max_ms * 0.5, 10.0) / 1000.0);
+    int ready = input_clock_correction_update(&g.input_clock,
+            input_frames, input_time, output_frames, output_time,
+            input_rate, output_rate, queued, target, now, enabled);
+    g.input_clock_ratio = g.input_clock.ratio;
+    usb_host_audio_set_input_clock_ratio(g.usb_audio, g.input_clock_ratio);
+    input_clock_publish(!enabled ? INPUT_CLOCK_DISABLED : (ready ? INPUT_CLOCK_ACTIVE : INPUT_CLOCK_MEASURING),
+            input_rate, output_rate, input_source, output_source);
+}
+
 static void *audio_thread(void *unused) {
     (void)unused;
     if (setpriority(PRIO_PROCESS, 0, -16) != 0)
         LOGI("Audio DSP thread priority request failed: errno=%d", errno);
     float input[MAX_FRAMES*MAX_INPUT_CHANNELS], dry[MAX_FRAMES*2], output[MAX_FRAMES*2], p[28];
     while(atomic_load(&g.running)) {
+        input_clock_update();
         uint64_t block_begin_us = now_ns() / 1000ull;
         int want=g.frames<MAX_FRAMES?g.frames:MAX_FRAMES;
         aaudio_result_t got;
@@ -2686,6 +2857,7 @@ static int open_stream(AAudioStream **stream, aaudio_direction_t direction, int 
              g.output_ring_capacity, atomic_load(&g.output_prefill_frames),
              atomic_load(&g.output_queue_limit));
     } else {
+        g.input_rate = AAudioStream_getSampleRate(*stream);
         g.in_channels = AAudioStream_getChannelCount(*stream);
         if (g.in_channels < 1 || g.in_channels > MAX_INPUT_CHANNELS) {
             LOGE("AAudio input channel count unsupported: %d", g.in_channels);
@@ -2718,6 +2890,7 @@ static int open_stream(AAudioStream **stream, aaudio_direction_t direction, int 
 JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEnv*e,jobject o,jint rate,jint outputRate,jint frames,jint inDev,jint outDev,jboolean enableOutput,jint channels,jint pair,jboolean useNetworkInput,jint usbFd,jboolean usbInputHost,jboolean usbOutputHost,jint usbInputBitDepth,jint usbOutputBitDepth,jint usbInputBurstPackets,jint usbOutputBurstPackets,jint inputPreset){
     (void)e;(void)o;
     if(atomic_load(&g.running))return JNI_TRUE;
+    input_clock_reset();
     int input_started=0, output_started=0, audio_thread_started=0;
     input_ring_destroy();
     output_ring_destroy();
@@ -2833,6 +3006,9 @@ static void native_stop_internal(int finalize_recording, int preserve_network) {
     atomic_store(&g.net_rx_worker_running,0);
     if(g.input)AAudioStream_requestStop(g.input);
     pthread_join(g.thread,NULL);
+    input_clock_correction_reset(&g.input_clock);
+    g.input_clock_ratio = 1.0;
+    input_clock_publish(INPUT_CLOCK_DISABLED, 0, 0, 0, 0);
     if (atomic_exchange(&g.net_rx_worker_started,0)) pthread_join(g.net_rx_thread,NULL);
     atomic_store(&g.reverb_worker_running,0);
     if(atomic_exchange(&g.reverb_worker_started,0))pthread_join(g.reverb_thread,NULL);
@@ -3281,6 +3457,21 @@ JNIEXPORT jint JNICALL Java_com_llawsxx_audioprocess_NativeAudio_networkOutputCo
 }
 JNIEXPORT jintArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_routeInfo(JNIEnv*e,jobject o){(void)o;jint route[4];pthread_mutex_lock(&g.stream_lock);route[0]=g.usb_input_host?-3:(atomic_load(&g.use_network_input)&&atomic_load(&g.net_role)==2?-2:(g.input?AAudioStream_getDeviceId(g.input):-1));route[1]=g.usb_output_host?-4:(g.output?AAudioStream_getDeviceId(g.output):-1);route[2]=g.usb_input_host?2:(g.input?AAudioStream_getChannelCount(g.input):-1);route[3]=g.usb_output_host?2:(g.output?AAudioStream_getChannelCount(g.output):-1);pthread_mutex_unlock(&g.stream_lock);jintArray result=(*e)->NewIntArray(e,4);(*e)->SetIntArrayRegion(e,result,0,4,route);return result;}
 JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_usbHostFailed(JNIEnv*e,jobject o){(void)e;(void)o;return usb_host_audio_has_failed(g.usb_audio)?JNI_TRUE:JNI_FALSE;}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureInputClockCorrection(JNIEnv *env, jobject instance, jboolean enabled) {
+    (void)env;
+    (void)instance;
+    atomic_store(&g.input_clock_enabled, enabled ? 1 : 0);
+}
+
+JNIEXPORT jlongArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_inputClockInfo(JNIEnv *env, jobject instance) {
+    (void)instance;
+    jlong values[9];
+    for (int index = 0; index < 9; index++) values[index] = atomic_load(&g.input_clock_stats[index]);
+    jlongArray result = (*env)->NewLongArray(env, 9);
+    if (result) (*env)->SetLongArrayRegion(env, result, 0, 9, values);
+    return result;
+}
+
 JNIEXPORT jlongArray JNICALL Java_com_llawsxx_audioprocess_NativeAudio_inputInfo(JNIEnv*e,jobject o){
     (void)o;
     jlong values[15]={0};

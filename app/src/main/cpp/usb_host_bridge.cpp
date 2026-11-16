@@ -27,6 +27,33 @@ static void update_max(std::atomic<uint64_t> &target, uint64_t value) {
             std::memory_order_relaxed, std::memory_order_relaxed)) {}
 }
 
+class FrameClock {
+public:
+    void add(uint32_t frames, uint64_t timeNs) {
+        sequence_.fetch_add(1, std::memory_order_acq_rel);
+        frames_.fetch_add(frames, std::memory_order_relaxed);
+        timeNs_.store(timeNs, std::memory_order_relaxed);
+        sequence_.fetch_add(1, std::memory_order_release);
+    }
+    void read(uint64_t &frames, uint64_t &timeNs) const {
+        for (int attempt = 0; attempt < 4; attempt++) {
+            uint32_t sequence = sequence_.load(std::memory_order_acquire);
+            if (sequence & 1u) continue;
+            uint64_t sampledFrames = frames_.load(std::memory_order_relaxed);
+            uint64_t sampledTime = timeNs_.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (sequence == sequence_.load(std::memory_order_acquire)) {
+                frames = sampledFrames;
+                timeNs = sampledTime;
+                return;
+            }
+        }
+    }
+private:
+    std::atomic<uint32_t> sequence_{0};
+    std::atomic<uint64_t> frames_{0}, timeNs_{0};
+};
+
 class UsbHostAudio {
 public:
     UsbHostAudio(int fd, int processingRate, int inputRate, int inputBitDepth,
@@ -65,19 +92,22 @@ public:
         uint32_t available = write - read;
         if (available > kRingFrames) return 0;
         const int sourceRate = inputSampleRate_ > 0 ? (int)inputSampleRate_ : inputRate_;
+        const double step = (double)sourceRate / (double)std::max(1, processingRate_) * inputClockRatio_;
+        const uint32_t requiredFrames = (uint32_t)std::ceil(frames * step) + 1u;
         uint32_t maxFrames = (uint32_t)((uint64_t)std::max(1, sourceRate) * (uint32_t)inputMaxBufferMs_.load(std::memory_order_relaxed) / 1000u);
-        if (maxFrames < (uint32_t)frames) maxFrames = (uint32_t)frames;
+        if (maxFrames < requiredFrames) maxFrames = requiredFrames;
         if (available > maxFrames) {
             inputRead_.store(write, std::memory_order_release);
+            inputResamplePhase_ = 0.0;
             inputBufferClears_.fetch_add(1, std::memory_order_relaxed);
             return 0;
         }
-        const double step = (double)sourceRate / (double)std::max(1, processingRate_);
         int produced = 0;
         while (produced < frames) {
             const double position = inputResamplePhase_ + (double)produced * step;
             const uint32_t index = (uint32_t)position;
-            if (index + 1u >= available) break;
+            const uint32_t consumedAfter = (uint32_t)(inputResamplePhase_ + (double)(produced + 1) * step);
+            if (index + 1u >= available || consumedAfter > available) break;
             const float frac = (float)(position - (double)index);
             const uint32_t p0 = (read + index) & kRingMask;
             const uint32_t p1 = (read + index + 1u) & kRingMask;
@@ -132,6 +162,21 @@ public:
 
     void configureInputBuffer(int maxBufferMs) {
         inputMaxBufferMs_.store(std::clamp(maxBufferMs, 5, 200), std::memory_order_relaxed);
+    }
+
+    void setInputClockRatio(double ratio) {
+        inputClockRatio_ = std::clamp(ratio, 0.995, 1.005);
+    }
+
+    usb_host_audio_clock_t clock() const {
+        usb_host_audio_clock_t result{};
+        inputClock_.read(result.input_frames, result.input_time_ns);
+        outputClock_.read(result.output_frames, result.output_time_ns);
+        result.input_rate = inputSampleRate_;
+        result.output_rate = outputSampleRate_;
+        uint32_t queued = inputWrite_.load(std::memory_order_acquire) - inputRead_.load(std::memory_order_acquire);
+        result.input_queued_frames = queued <= kRingFrames ? queued : 0;
+        return result;
     }
 
     void configureOutputDither(bool enabled) {
@@ -189,6 +234,8 @@ public:
     }
 
 private:
+    FrameClock inputClock_, outputClock_;
+    double inputClockRatio_ = 1.0;
     static constexpr uint32_t kRingFrames=131072u, kRingMask=kRingFrames-1u;
     static float decode(const uint8_t *s, int n) {
         if (n==2) return (float)(int16_t)(s[0]|(s[1]<<8))/32768.0f;
@@ -233,6 +280,7 @@ private:
     void onInput(uint8_t *data,uint len,int bytes,int ch){
         uint64_t begin=now_us(); if(stopping_.load(std::memory_order_acquire))return; int stride=bytes*ch; if(stride<=0)return;
         uint32_t count=(uint32_t)(len/(uint)stride),write=inputWrite_.load(std::memory_order_relaxed),read=inputRead_.load(std::memory_order_acquire),queued=write-read;
+        inputClock_.add(count, begin * 1000ull);
         if(queued>kRingFrames||count>kRingFrames-queued){inputRingOverruns_.fetch_add(1);update_max(inputCallbackMaxUs_,now_us()-begin);return;}
         uint32_t offset=write&kRingMask;
         for(uint32_t i=0;i<count;++i){const uint8_t*f=data+(size_t)i*stride;uint32_t p=(offset+i)&kRingMask;inputRing_[2u*p]=decode(f,bytes);inputRing_[2u*p+1u]=ch>1?decode(f+bytes,bytes):inputRing_[2u*p];}
@@ -240,6 +288,7 @@ private:
     }
     void onOutput(uint8_t *data,uint len,int bytes,int ch){
         uint64_t begin=now_us(); if(stopping_.load(std::memory_order_acquire)){std::memset(data,0,len);return;} int stride=bytes*ch;if(stride<=0)return;uint32_t count=(uint32_t)(len/(uint)stride);
+        outputClock_.add(count, begin * 1000ull);
         uint32_t write=outputWrite_.load(std::memory_order_acquire),read=outputRead_.load(std::memory_order_relaxed),available=write-read;
         const double step = (double)std::max(1, processingRate_) /
                             (double)std::max(1u, outputSampleRate_ > 0 ? outputSampleRate_ : (uint32_t)outputRate_);
@@ -362,6 +411,8 @@ extern "C" int usb_host_audio_read(usb_host_audio_t a,float*d,int n){return a?st
 extern "C" int usb_host_audio_write(usb_host_audio_t a,const float*d,int n){return a?static_cast<UsbHostAudio*>(a)->write(d,n):0;}
 extern "C" void usb_host_audio_configure_output_buffer(usb_host_audio_t a,int maxMs){if(a)static_cast<UsbHostAudio*>(a)->configureOutputBuffer(maxMs);}
 extern "C" void usb_host_audio_configure_input_buffer(usb_host_audio_t a,int maxMs){if(a)static_cast<UsbHostAudio*>(a)->configureInputBuffer(maxMs);}
+extern "C" void usb_host_audio_set_input_clock_ratio(usb_host_audio_t audio, double ratio) { if (audio) static_cast<UsbHostAudio*>(audio)->setInputClockRatio(ratio); }
+extern "C" void usb_host_audio_get_clock(usb_host_audio_t audio, usb_host_audio_clock_t *clock) { if (clock) *clock = audio ? static_cast<UsbHostAudio*>(audio)->clock() : usb_host_audio_clock_t{}; }
 extern "C" void usb_host_audio_configure_output_dither(usb_host_audio_t a,int enabled){if(a)static_cast<UsbHostAudio*>(a)->configureOutputDither(enabled!=0);}
 extern "C" int usb_host_audio_set_volume(usb_host_audio_t a,int percent){return a&&static_cast<UsbHostAudio*>(a)->setVolumePercent(percent)?1:0;}
 extern "C" int usb_host_audio_has_failed(usb_host_audio_t a){return a&&static_cast<UsbHostAudio*>(a)->hasFailed()?1:0;}
