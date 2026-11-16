@@ -259,6 +259,7 @@ private fun LiveAudioProcessApp() {
     var running by remember { mutableStateOf(false) }
     var recording by remember { mutableStateOf(false) }
     var input by remember { mutableStateOf(runCatching { InputSource.valueOf(prefs.getString("input", InputSource.BUILT_IN.name)!!) }.getOrDefault(InputSource.BUILT_IN)) }
+    var builtInMicSource by remember { mutableStateOf(BuiltInMicSource.fromName(prefs.getString("builtInMicSource", null), Build.VERSION.SDK_INT)) }
     var channelPair by remember { mutableIntStateOf(prefs.getInt("channelPair", 0)) }
     var output by remember {
         val saved = runCatching { OutputSource.valueOf(prefs.getString("output", OutputSource.SPEAKER.name)!!) }
@@ -343,7 +344,7 @@ private fun LiveAudioProcessApp() {
         mutableIntStateOf(prefs.getInt("usbOutputBurstPackets", legacyUsbBurstPackets).takeIf { it in UsbBurstPacketOptions } ?: 8)
     }
     var usbStats by remember { mutableStateOf(LongArray(18)) }
-    var inputInfo by remember { mutableStateOf(LongArray(14)) }
+    var inputInfo by remember { mutableStateOf(LongArray(15)) }
     var outputInfo by remember { mutableStateOf(LongArray(16)) }
     var wifiReceiveStats by remember { mutableStateOf(LongArray(10)) }
     var wifiTransmitStats by remember { mutableStateOf(LongArray(7)) }
@@ -487,7 +488,7 @@ private fun LiveAudioProcessApp() {
     }
     LaunchedEffect(running, input, currentPage) {
         if (!running) {
-            inputInfo = LongArray(14)
+            inputInfo = LongArray(15)
             outputInfo = LongArray(16)
             wifiReceiveStats = LongArray(10)
             wifiTransmitStats = LongArray(7)
@@ -624,6 +625,10 @@ private fun LiveAudioProcessApp() {
         val applied = entered.coerceIn(5, 200)
         prefs.edit().putInt("systemOutputBufferMaxMs", applied).apply()
         engine.configureSystemOutputBuffer(applied)
+    }
+    LaunchedEffect(builtInMicSource) {
+        prefs.edit().putString("builtInMicSource", builtInMicSource.name).apply()
+        engine.configureBuiltInMicSource(builtInMicSource)
     }
     LaunchedEffect(systemInputBufferMaxMs) {
         val entered = systemInputBufferMaxMs.toIntOrNull() ?: return@LaunchedEffect
@@ -765,7 +770,15 @@ private fun LiveAudioProcessApp() {
             RoutingPanel2(input, { selectInput(it) }, output, { selectOutput(it) }, systemInputDevices, systemInputDeviceKey, { systemInputDeviceKey = it; syncEngine() }, systemOutputDevices, systemOutputDeviceKey, { systemOutputDeviceKey = it; syncEngine() }, usbHostDevices, usbHostDeviceKey, { key -> val currentActivity = activity as? MainActivity; if (currentActivity == null) { usbHostDeviceKey = key; syncEngine() } else currentActivity.requestUsbAudioPermission(key) { granted -> if (granted) { usbHostDeviceKey = key; syncEngine() } else routeNotice = "USB 声卡授权被拒绝，未切换设备" } }, wifiOutputEnabled, { enabled -> if (input != InputSource.WIFI) { wifiOutputEnabled = enabled; wifiActive = configureWifiForCurrentRoute(); syncEngine() } }, channelPairs, channelPair, { channelPair = it; syncEngine() }, routeNotice)
             if (input == InputSource.TEST_TONE) TonePanel(toneWaveform, toneMusic, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevelDb, { selected -> toneWaveform = selected; when (selected) { 4 -> { toneFrequency = 20f; toneFrequency2 = 20_000f }; 6 -> { toneFrequency = 19_000f; toneFrequency2 = 20_000f }; else -> Unit } }, { toneMusic = it }, { toneChannels = it }, { toneFrequency = it }, { toneFrequency2 = it }, { toneDurationSeconds = it }, { toneClickIntervalMs = it }, { toneLevelDb = it })
             EnginePanelWithIoRates(rate, { rate = it; syncEngine() }, outputRate, { outputRate = it; syncEngine() }, buffer, { buffer = it; syncEngine() }, running)
-            SystemInputPanel(inputInfo, input != InputSource.USB && input != InputSource.WIFI, systemInputBufferMaxMs) { systemInputBufferMaxMs = it }
+            SystemInputPanel(
+                info = inputInfo,
+                visible = input != InputSource.USB && input != InputSource.WIFI,
+                maxBufferMs = systemInputBufferMaxMs,
+                onMaxBufferMsChange = { systemInputBufferMaxMs = it },
+                showMicSource = input == InputSource.BUILT_IN,
+                micSource = builtInMicSource,
+                onMicSourceChange = { builtInMicSource = it }
+            )
             SystemOutputPanel(outputInfo, output != OutputSource.USB && output != OutputSource.NONE, systemOutputBufferMaxMs) { systemOutputBufferMaxMs = it }
             if (input == InputSource.USB || output == OutputSource.USB) {
                 UsbAudioPanel(usbMaxBuffer, usbInputBufferMaxMs, usbInputBitDepth, usbOutputBitDepth, usbOutputDitherEnabled, usbInputBurstPackets, usbOutputBurstPackets, input == InputSource.USB, output == OutputSource.USB, running, usbStats, { usbMaxBuffer = it }, { usbInputBufferMaxMs = it }, { usbInputBitDepth = it }, { usbOutputBitDepth = it }, { usbOutputDitherEnabled = it }, { usbInputBurstPackets = it }, { usbOutputBurstPackets = it })

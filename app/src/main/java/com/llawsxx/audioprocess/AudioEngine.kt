@@ -91,6 +91,8 @@ class AudioEngine(private val context: Context) {
     }
     @Volatile var inputSource = InputSource.BUILT_IN
         internal set
+    @Volatile var builtInMicSource = BuiltInMicSource.DEFAULT
+        private set
     @Volatile var systemInputDeviceKey = SYSTEM_DEVICE_BUILTIN_INPUT
     @Volatile var systemOutputDeviceKey = SYSTEM_DEVICE_BUILTIN_OUTPUT
     @Volatile var usbHostDeviceKey = USB_HOST_DEVICE_AUTO
@@ -311,6 +313,16 @@ class AudioEngine(private val context: Context) {
         usbOutputDitherEnabled = enabled
         if (NativeAudio.available) NativeAudio.configureUsbOutputDither(enabled)
     }
+    fun configureBuiltInMicSource(source: BuiltInMicSource) {
+        val supportedSource = BuiltInMicSource.fromName(source.name, Build.VERSION.SDK_INT)
+        if (builtInMicSource == supportedSource) return
+        builtInMicSource = supportedSource
+        if (isRunning && inputSource == InputSource.BUILT_IN) {
+            routeNotice = "正在切换内置麦克风音频来源"
+            routeHandler.removeCallbacks(routeRestart)
+            routeHandler.post(routeRestart)
+        }
+    }
     fun configureDeviceSelection(inputKey: String, outputKey: String, usbKey: String) {
         val changed = systemInputDeviceKey != inputKey ||
             systemOutputDeviceKey != outputKey || usbHostDeviceKey != usbKey
@@ -392,11 +404,10 @@ class AudioEngine(private val context: Context) {
     fun availableSystemInputDevices(): List<AudioDeviceChoice> {
         val devices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).toList()
         val choices = mutableListOf(
-            AudioDeviceChoice(SYSTEM_DEVICE_BUILTIN_INPUT, "内置麦克风"),
+            AudioDeviceChoice(SYSTEM_DEVICE_BUILTIN_INPUT, "内置麦克风（自动选择）"),
             AudioDeviceChoice(SYSTEM_DEVICE_DEFAULT, "系统默认输入")
         )
-        devices.filter { it.type != AudioDeviceInfo.TYPE_BUILTIN_MIC }
-            .forEach { choices += AudioDeviceChoice(systemAudioDeviceKey(it), systemAudioDeviceLabel(it)) }
+        devices.forEach { choices += AudioDeviceChoice(systemAudioDeviceKey(it), systemAudioDeviceLabel(it)) }
         return choices.distinctBy { it.key }
     }
     fun availableSystemOutputDevices(): List<AudioDeviceChoice> {
@@ -730,16 +741,17 @@ class AudioEngine(private val context: Context) {
         val usbInputHost = requestedUsbInputHost && usbFd >= 0
         val usbOutputHost = requestedUsbOutputHost && usbFd >= 0
         val enableOutput = outputSource != OutputSource.NONE
-        var started = NativeAudio.start(sampleRate, outputSampleRate, bufferFrames, inputDeviceId, outputDeviceId, enableOutput, nativeInputChannels, inputPair, useNetworkInput, usbFd, usbInputHost, usbOutputHost, usbInputBitDepth, usbOutputBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
+        val inputPreset = if (inputSource == InputSource.BUILT_IN) builtInMicSource.preset else 0
+        var started = NativeAudio.start(sampleRate, outputSampleRate, bufferFrames, inputDeviceId, outputDeviceId, enableOutput, nativeInputChannels, inputPair, useNetworkInput, usbFd, usbInputHost, usbOutputHost, usbInputBitDepth, usbOutputBitDepth, usbInputBurstPackets, usbOutputBurstPackets, inputPreset)
         if (!started && usbFd >= 0) {
             usbConnection?.close()
             usbConnection = null
             lastError = "USB Host 格式不可用，正在回退到系统 USB 音频"
-            started = NativeAudio.start(sampleRate, outputSampleRate, bufferFrames, inputDeviceId, outputDeviceId, enableOutput, nativeInputChannels, inputPair, useNetworkInput, -1, false, false, usbInputBitDepth, usbOutputBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
+            started = NativeAudio.start(sampleRate, outputSampleRate, bufferFrames, inputDeviceId, outputDeviceId, enableOutput, nativeInputChannels, inputPair, useNetworkInput, -1, false, false, usbInputBitDepth, usbOutputBitDepth, usbInputBurstPackets, usbOutputBurstPackets, inputPreset)
         }
         if (!started && inputSource == InputSource.USB && nativeInputChannels == 2) {
             // Keep USB usable on devices whose driver rejects a stereo AAudio request.
-            started = NativeAudio.start(sampleRate, outputSampleRate, bufferFrames, inputDeviceId, outputDeviceId, enableOutput, 1, inputPair, useNetworkInput, -1, false, false, usbInputBitDepth, usbOutputBitDepth, usbInputBurstPackets, usbOutputBurstPackets)
+            started = NativeAudio.start(sampleRate, outputSampleRate, bufferFrames, inputDeviceId, outputDeviceId, enableOutput, 1, inputPair, useNetworkInput, -1, false, false, usbInputBitDepth, usbOutputBitDepth, usbInputBurstPackets, usbOutputBurstPackets, inputPreset)
             if (started) lastError = "USB 输入驱动拒绝立体声，已回退为单声道"
         }
         if (started) {

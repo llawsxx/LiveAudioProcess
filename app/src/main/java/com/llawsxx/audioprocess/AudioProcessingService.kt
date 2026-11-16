@@ -122,6 +122,7 @@ class AudioProcessingService : Service() {
         }
         engine.configureSystemOutputBuffer(outputBufferMaxMs)
         engine.configureSystemInputBuffer(p.getInt("systemInputBufferMaxMs", 20))
+        engine.configureBuiltInMicSource(BuiltInMicSource.fromName(p.getString("builtInMicSource", null), Build.VERSION.SDK_INT))
         engine.configureUsbOutputBuffer(p.getInt("usbMaxBuffer", 50))
         engine.configureUsbInputBuffer(p.getInt("usbInputBufferMaxMs", 20))
         engine.configureUsbOutputDither(p.getBoolean("usbOutputDitherEnabled", true))

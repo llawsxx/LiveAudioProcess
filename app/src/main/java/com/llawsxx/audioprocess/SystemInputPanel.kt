@@ -1,6 +1,8 @@
 package com.llawsxx.audioprocess
 
+import android.os.Build
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -8,9 +10,16 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -25,7 +34,15 @@ private val InputTeal = Color(0xFF43D5C1)
 private val InputAmber = Color(0xFFFFC857)
 
 @Composable
-fun SystemInputPanel(info: LongArray, visible: Boolean, maxBufferMs: String, onMaxBufferMsChange: (String) -> Unit) {
+fun SystemInputPanel(
+    info: LongArray,
+    visible: Boolean,
+    maxBufferMs: String,
+    onMaxBufferMsChange: (String) -> Unit,
+    showMicSource: Boolean,
+    micSource: BuiltInMicSource,
+    onMicSourceChange: (BuiltInMicSource) -> Unit
+) {
     if (!visible) return
     val rate = info.getOrElse(0) { 0L }
     val active = rate > 0L
@@ -52,6 +69,43 @@ fun SystemInputPanel(info: LongArray, visible: Boolean, maxBufferMs: String, onM
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("系统输入", color = Color.White, fontWeight = FontWeight.Bold)
                 Text("AAUDIO CALLBACK", color = InputMuted, fontSize = 10.sp)
+            }
+            if (showMicSource) {
+                val sources = remember { BuiltInMicSource.supported(Build.VERSION.SDK_INT) }
+                var expanded by remember { mutableStateOf(false) }
+                Text("内置麦克风音频来源", color = InputMuted, fontSize = 12.sp)
+                Box(Modifier.fillMaxWidth()) {
+                    OutlinedButton(
+                        onClick = { expanded = true },
+                        enabled = sources.size > 1,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(micSource.label)
+                    }
+                    DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                        sources.forEach { source ->
+                            DropdownMenuItem(
+                                text = { Text(source.label) },
+                                onClick = {
+                                    expanded = false
+                                    onMicSourceChange(source)
+                                }
+                            )
+                        }
+                    }
+                }
+                Text(micSource.description, color = InputMuted, fontSize = 11.sp)
+                Text(
+                    if (sources.size > 1) "运行中修改会重新打开音频流；具体效果取决于设备支持"
+                    else "自定义采集来源需要 Android 9 或更新版本，当前保留默认配置",
+                    color = InputMuted,
+                    fontSize = 11.sp
+                )
+                val actualPreset = info.getOrElse(14) { -1L }.toInt()
+                if (active && actualPreset >= 0) {
+                    val actualLabel = BuiltInMicSource.fromPreset(actualPreset)?.label ?: actualPreset.toString()
+                    Text("实际采集来源：$actualLabel", color = InputTeal, fontSize = 11.sp)
+                }
             }
             Text("输入缓冲上限", color = InputMuted, fontSize = 12.sp)
             OutlinedTextField(

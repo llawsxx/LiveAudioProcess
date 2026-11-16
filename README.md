@@ -9,6 +9,7 @@ Android 低延迟实时音频处理与路由工具，支持本机 DSP、USB Audi
 ## 功能
 
 - 基于 Android AAudio 的低延迟音频输入与输出
+- 内置麦克风音频来源选择：默认、MIC、CAMCORDER、VOICE_RECOGNITION、VOICE_COMMUNICATION、UNPROCESSED、VOICE_PERFORMANCE；自动保存，运行中切换会重开音频流
 - Wi-Fi 音频发送与接收
   - UDP / TCP 传输
   - PCM Float32、AAC-LC、Opus 编解码
@@ -50,6 +51,8 @@ Windows:
 
 ## 使用说明
 
+选择“内置麦克风”后，可在“系统输入”面板设置音频来源，并在启动后查看 AAudio 返回的实际采集来源。默认选项保持原有采集行为；自定义来源需要 Android 9+，VOICE_PERFORMANCE 需要 Android 10+。设备可能对不同来源采用不同的麦克风和处理链，UNPROCESSED 的实际效果取决于硬件支持。
+
 两台手机进行 Wi-Fi 音频传输时：
 
 1. 发送端选择 Wi-Fi 输出并填写接收端 IP 和端口。
@@ -88,6 +91,7 @@ Android low-latency real-time audio processing and routing tool with built-in DS
 ### Features
 
 - Low-latency audio input and output based on Android AAudio
+- Built-in microphone source selection: default, MIC, CAMCORDER, VOICE_RECOGNITION, VOICE_COMMUNICATION, UNPROCESSED, and VOICE_PERFORMANCE; saved automatically, with stream reopening when changed during capture
 - Wi-Fi audio sender and receiver
   - UDP / TCP transport
   - PCM Float32, AAC-LC, and Opus codecs
