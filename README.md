@@ -50,6 +50,27 @@ Windows:
 .\gradlew.bat :app:assembleDebug
 ```
 
+### GitHub Actions 发布签名 APK
+
+工作流文件为 `.github/workflows/build-release.yml`，在 GitHub 的 `Actions` 页面手动运行 `Build and Release APK` 即可编译并创建 Release。发布工作流要求使用固定的 Android 签名密钥，签名密钥不能提交到仓库。
+
+首次配置签名密钥（PowerShell）：
+
+```powershell
+keytool -genkeypair -v -keystore LiveAudioProcess-release.jks -alias liveaudioprocess -keyalg RSA -keysize 2048 -validity 10000
+$base64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes(".\LiveAudioProcess-release.jks"))
+Set-Clipboard $base64
+```
+
+在仓库 `Settings → Secrets and variables → Actions` 中添加以下 Secrets：
+
+- `ANDROID_KEYSTORE_BASE64`：上一步复制的 Base64 内容
+- `ANDROID_KEYSTORE_PASSWORD`：生成密钥库时设置的密码
+- `ANDROID_KEY_ALIAS`：`liveaudioprocess`
+- `ANDROID_KEY_PASSWORD`：该别名对应的密码
+
+请妥善备份 `.jks` 文件和密码；以后发布更新必须继续使用同一签名密钥，否则 Android 会把它视为不同应用。`.jks` 文件不应提交到 Git。工作流缺少任一签名 Secret 时会直接失败，不会发布未签名 APK。
+
 ## 使用说明
 
 顶部固定显示引擎和录音控制。点击“开始引擎”启动；停止时需将左侧滑块向右拖到末端并松手，点击滑轨或未拖到位不会停止引擎。录音按钮在引擎启动后可用，录音时显示计时，再次点击停止录音。

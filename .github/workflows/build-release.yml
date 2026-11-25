@@ -1,0 +1,112 @@
+name: Build and Release APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag; leave empty to generate one automatically"
+        required: false
+        type: string
+      prerelease:
+        description: "Mark this Release as a prerelease"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          sdkmanager "platforms;android-37.1" "build-tools;37.0.0" "cmake;3.22.1"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Decode release keystore
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [[ -z "$ANDROID_KEYSTORE_BASE64" ]]; then
+            echo "ANDROID_KEYSTORE_BASE64 is not configured."
+            exit 1
+          fi
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+
+      - name: Build signed release APK
+        shell: bash
+        env:
+          ORG_GRADLE_PROJECT_releaseStoreFile: ${{ runner.temp }}/release.keystore
+          ORG_GRADLE_PROJECT_releaseStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ORG_GRADLE_PROJECT_releaseKeyAlias: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ORG_GRADLE_PROJECT_releaseKeyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -z "$ORG_GRADLE_PROJECT_releaseStorePassword" || -z "$ORG_GRADLE_PROJECT_releaseKeyAlias" || -z "$ORG_GRADLE_PROJECT_releaseKeyPassword" ]]; then
+            echo "Android signing secrets are incomplete."
+            exit 1
+          fi
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :app:assembleRelease
+
+      - name: Prepare APK
+        id: apk
+        shell: bash
+        run: |
+          version_name=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)
+          apk_path=$(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' | head -n 1)
+          if [[ -z "$apk_path" ]]; then
+            echo "Release APK was not generated."
+            exit 1
+          fi
+          apk_name="LiveAudioProcess-${version_name}-${GITHUB_SHA:0:7}.apk"
+          cp "$apk_path" "$apk_name"
+          echo "path=$apk_name" >> "$GITHUB_OUTPUT"
+          echo "version=$version_name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveAudioProcess-${{ steps.apk.outputs.version }}-${{ github.sha }}
+          path: ${{ steps.apk.outputs.path }}
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
+          PRERELEASE_INPUT: ${{ inputs.prerelease }}
+          APK_PATH: ${{ steps.apk.outputs.path }}
+          VERSION_NAME: ${{ steps.apk.outputs.version }}
+        run: |
+          if [[ -n "$RELEASE_TAG_INPUT" ]]; then
+            release_tag="$RELEASE_TAG_INPUT"
+          else
+            release_tag="v${VERSION_NAME}-build.${GITHUB_RUN_NUMBER}"
+          fi
+
+          release_args=("$release_tag" "$APK_PATH" --target "$GITHUB_SHA" --title "LiveAudioProcess $release_tag" --generate-notes)
+          if [[ "$PRERELEASE_INPUT" == "true" ]]; then
+            release_args+=(--prerelease)
+          fi
+          gh release create "${release_args[@]}"
