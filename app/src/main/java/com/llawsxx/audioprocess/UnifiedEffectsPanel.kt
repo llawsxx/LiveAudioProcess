@@ -40,11 +40,6 @@ fun UnifiedEffectsPanel(settings: EffectSettings, onChange: (EffectSettings) -> 
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
             Text("处理链参数", color = Color.White, fontWeight = FontWeight.Bold)
 
-            GroupTitle("参数均衡 EQ · 频点 1")
-            ParameterSlider("频率", settings.eqFrequency, 20f..20000f, { onChange(settings.copy(eqFrequency = it)) }, "${settings.eqFrequency.toInt()} Hz")
-            ParameterSlider("增益", settings.eqGain, -12f..12f, { onChange(settings.copy(eqGain = it)) }, "${settings.eqGain.toInt()} dB")
-            ParameterSlider("Q 值", settings.eqQ, .5f..10f, { onChange(settings.copy(eqQ = it)) }, "${"%.2f".format(settings.eqQ)}")
-
             GroupTitle("卷积混响 Convolution Reverb")
             ParameterSlider("Room size", settings.reverbRoom, 0f..100f, { onChange(settings.copy(reverbRoom = it)) }, "${settings.reverbRoom.toInt()}%")
             ParameterSlider("Decay", settings.reverbDecay, .2f..6f, { onChange(settings.copy(reverbDecay = it)) }, "${"%.1f".format(settings.reverbDecay)} s")

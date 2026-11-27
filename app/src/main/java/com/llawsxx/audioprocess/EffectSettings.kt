@@ -4,37 +4,76 @@ import android.content.SharedPreferences
 
 data class EffectSettings(
     val dspEnabled: Boolean = false, val eqEnabled: Boolean = true, val reverbEnabled: Boolean = true, val limiterEnabled: Boolean = true, val loudnessEnabled: Boolean = true,
-    val eqFrequency: Float = 1200f, val eqGain: Float = 2f, val eqQ: Float = .85f,
-    val eq2Frequency: Float = 250f, val eq2Gain: Float = 0f, val eq2Q: Float = 1f,
-    val eq3Frequency: Float = 4000f, val eq3Gain: Float = 0f, val eq3Q: Float = 1f,
-    val eq4Frequency: Float = 10000f, val eq4Gain: Float = 0f, val eq4Q: Float = 1f,
+    val eqBands: List<EqBandSettings> = defaultEqBands(),
     val reverbRoom: Float = 42f, val reverbDecay: Float = 1.8f, val reverbDamping: Float = 35f, val reverbMix: Float = 18f,
     val limiterInputGain: Float = 0f, val limiterThreshold: Float = -.5f, val limiterRelease: Float = 80f, val limiterCeiling: Float = -.5f, val limiterLookAhead: Float = 1f, val limiterAdaptiveRelease: Boolean = false,
     val loudnessTarget: Float = -16f, val loudnessLra: Float = 7f, val loudnessTruePeak: Float = -1f,
     val loudnessBoostOnly: Boolean = false, val loudnessLookAhead: Float = 5f,
     val loudnessUpdateIntervalMs: Float = 1000f
 ) {
-    fun save(p: SharedPreferences) = p.edit()
-        .putBoolean("dspEnabled", dspEnabled).putBoolean("eqEnabled", eqEnabled).putBoolean("reverbEnabled", reverbEnabled).putBoolean("limiterEnabled", limiterEnabled).putBoolean("loudnessEnabled", loudnessEnabled)
-        .putFloat("eqFrequency", eqFrequency).putFloat("eqGain", eqGain).putFloat("eqQ", eqQ)
-        .putFloat("eq2Frequency", eq2Frequency).putFloat("eq2Gain", eq2Gain).putFloat("eq2Q", eq2Q)
-        .putFloat("eq3Frequency", eq3Frequency).putFloat("eq3Gain", eq3Gain).putFloat("eq3Q", eq3Q)
-        .putFloat("eq4Frequency", eq4Frequency).putFloat("eq4Gain", eq4Gain).putFloat("eq4Q", eq4Q)
-        .putFloat("reverbRoom", reverbRoom).putFloat("reverbDecay", reverbDecay).putFloat("reverbDamping", reverbDamping).putFloat("reverbMix", reverbMix)
-        .putFloat("limiterInputGain", limiterInputGain).putFloat("limiterThreshold", limiterThreshold).putFloat("limiterRelease", limiterRelease).putFloat("limiterCeiling", limiterCeiling).putFloat("limiterLookAhead", limiterLookAhead).putBoolean("limiterAdaptiveRelease", limiterAdaptiveRelease)
-        .putFloat("loudnessTarget", loudnessTarget).putFloat("loudnessLra", loudnessLra).putFloat("loudnessTruePeak", loudnessTruePeak).putBoolean("loudnessBoostOnly", loudnessBoostOnly).putFloat("loudnessLookAhead", loudnessLookAhead).putFloat("loudnessUpdateIntervalMs", loudnessUpdateIntervalMs).apply()
+    fun withEqBand(index: Int, band: EqBandSettings): EffectSettings {
+        require(index in eqBands.indices)
+        return copy(eqBands = eqBands.mapIndexed { position, current -> if (position == index) band.normalized() else current })
+    }
+
+    fun addEqBand(band: EqBandSettings = EqBandSettings()): EffectSettings = copy(eqBands = eqBands + band.normalized())
+
+    fun removeEqBand(index: Int): EffectSettings {
+        require(index in eqBands.indices)
+        return copy(eqBands = eqBands.filterIndexed { position, _ -> position != index })
+    }
+
+    fun save(p: SharedPreferences) {
+        val previousBandCount = p.getInt("graphicEq.count", 0)
+        val editor = p.edit()
+            .putBoolean("dspEnabled", dspEnabled).putBoolean("eqEnabled", eqEnabled).putBoolean("reverbEnabled", reverbEnabled).putBoolean("limiterEnabled", limiterEnabled).putBoolean("loudnessEnabled", loudnessEnabled)
+            .putFloat("reverbRoom", reverbRoom).putFloat("reverbDecay", reverbDecay).putFloat("reverbDamping", reverbDamping).putFloat("reverbMix", reverbMix)
+            .putFloat("limiterInputGain", limiterInputGain).putFloat("limiterThreshold", limiterThreshold).putFloat("limiterRelease", limiterRelease).putFloat("limiterCeiling", limiterCeiling).putFloat("limiterLookAhead", limiterLookAhead).putBoolean("limiterAdaptiveRelease", limiterAdaptiveRelease)
+            .putFloat("loudnessTarget", loudnessTarget).putFloat("loudnessLra", loudnessLra).putFloat("loudnessTruePeak", loudnessTruePeak).putBoolean("loudnessBoostOnly", loudnessBoostOnly).putFloat("loudnessLookAhead", loudnessLookAhead).putFloat("loudnessUpdateIntervalMs", loudnessUpdateIntervalMs)
+        editor.putInt("graphicEq.count", eqBands.size)
+        for (index in eqBands.size until previousBandCount) {
+            listOf("frequency", "gain", "quality", "type", "enabled").forEach { key ->
+                editor.remove("graphicEq.$index.$key")
+            }
+        }
+        eqBands.forEachIndexed { index, value ->
+            val band = value.normalized()
+            val prefix = "graphicEq.$index."
+            editor.putFloat(prefix + "frequency", band.frequency)
+                .putFloat(prefix + "gain", band.gain)
+                .putFloat(prefix + "quality", band.quality)
+                .putInt(prefix + "type", band.type.id)
+                .putBoolean(prefix + "enabled", band.enabled)
+        }
+        editor.apply()
+    }
 
     companion object {
         fun load(p: SharedPreferences) = EffectSettings(
-            p.getBoolean("dspEnabled", false), p.getBoolean("eqEnabled", true), p.getBoolean("reverbEnabled", true), p.getBoolean("limiterEnabled", true), p.getBoolean("loudnessEnabled", true),
-            p.getFloat("eqFrequency", 1200f), p.getFloat("eqGain", 2f), p.getFloat("eqQ", .85f),
-            p.getFloat("eq2Frequency", 250f), p.getFloat("eq2Gain", 0f), p.getFloat("eq2Q", 1f),
-            p.getFloat("eq3Frequency", 4000f), p.getFloat("eq3Gain", 0f), p.getFloat("eq3Q", 1f),
-            p.getFloat("eq4Frequency", 10000f), p.getFloat("eq4Gain", 0f), p.getFloat("eq4Q", 1f),
-            p.getFloat("reverbRoom", 42f), p.getFloat("reverbDecay", 1.8f), p.getFloat("reverbDamping", 35f), p.getFloat("reverbMix", 18f),
-            p.getFloat("limiterInputGain", 0f), p.getFloat("limiterThreshold", -.5f), p.getFloat("limiterRelease", 80f), p.getFloat("limiterCeiling", -.5f), p.getFloat("limiterLookAhead", 1f).coerceIn(0f, 50f), p.getBoolean("limiterAdaptiveRelease", false),
-            p.getFloat("loudnessTarget", -16f), p.getFloat("loudnessLra", 7f), p.getFloat("loudnessTruePeak", -1f), p.getBoolean("loudnessBoostOnly", false), p.getFloat("loudnessLookAhead", 5f).coerceIn(5f, 50f),
-            p.getFloat("loudnessUpdateIntervalMs", 1000f).coerceIn(100f, 3000f)
+            dspEnabled = p.getBoolean("dspEnabled", false),
+            eqEnabled = p.getBoolean("eqEnabled", true),
+            reverbEnabled = p.getBoolean("reverbEnabled", true),
+            limiterEnabled = p.getBoolean("limiterEnabled", true),
+            loudnessEnabled = p.getBoolean("loudnessEnabled", true),
+            eqBands = List(p.getInt("graphicEq.count", 0).coerceAtLeast(0)) { index ->
+                val defaults = EqBandSettings()
+                val prefix = "graphicEq.$index."
+                EqBandSettings(
+                    frequency = p.getFloat(prefix + "frequency", defaults.frequency),
+                    gain = p.getFloat(prefix + "gain", defaults.gain),
+                    quality = p.getFloat(prefix + "quality", defaults.quality),
+                    type = EqFilterType.fromId(p.getInt(prefix + "type", defaults.type.id)),
+                    enabled = p.getBoolean(prefix + "enabled", defaults.enabled)
+                ).normalized()
+            },
+            reverbRoom = p.getFloat("reverbRoom", 42f), reverbDecay = p.getFloat("reverbDecay", 1.8f),
+            reverbDamping = p.getFloat("reverbDamping", 35f), reverbMix = p.getFloat("reverbMix", 18f),
+            limiterInputGain = p.getFloat("limiterInputGain", 0f), limiterThreshold = p.getFloat("limiterThreshold", -.5f),
+            limiterRelease = p.getFloat("limiterRelease", 80f), limiterCeiling = p.getFloat("limiterCeiling", -.5f),
+            limiterLookAhead = p.getFloat("limiterLookAhead", 1f).coerceIn(0f, 50f), limiterAdaptiveRelease = p.getBoolean("limiterAdaptiveRelease", false),
+            loudnessTarget = p.getFloat("loudnessTarget", -16f), loudnessLra = p.getFloat("loudnessLra", 7f), loudnessTruePeak = p.getFloat("loudnessTruePeak", -1f),
+            loudnessBoostOnly = p.getBoolean("loudnessBoostOnly", false), loudnessLookAhead = p.getFloat("loudnessLookAhead", 5f).coerceIn(5f, 50f),
+            loudnessUpdateIntervalMs = p.getFloat("loudnessUpdateIntervalMs", 1000f).coerceIn(100f, 3000f)
         )
     }
 }

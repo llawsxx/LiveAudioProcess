@@ -26,6 +26,7 @@
 
 #include "convolution_reverb.h"
 #include "input_clock_correction.h"
+#include "parametric_eq.h"
 #include "loudness_peak.h"
 #include "test_music.h"
 #include "usb_host_bridge.h"
@@ -93,10 +94,9 @@ static void app_log_print(android_LogPriority priority, const char *fmt, ...) {
 #define NET_RETRANSMIT_CACHE_SLOTS 32
 #define NET_RETRANSMIT_MAX_REQUESTS 3
 #define NET_RETRANSMIT_WAIT_NS 30000000ull
-#define EQ_BANDS 4
+#define DSP_VALUE_COUNT 16
 #define MAX_INPUT_CHANNELS 8
 
-typedef struct { float b0,b1,b2,a1,a2,z1,z2,freq,gain,q; } Biquad;
 typedef struct __attribute__((packed)) { uint32_t magic; uint16_t version; uint8_t codec; uint8_t channels; uint32_t rate; uint32_t frames; uint64_t timestamp_ns; uint32_t sequence; } NetHeader;
 typedef struct __attribute__((packed)) { uint32_t magic; uint16_t version; uint8_t type; uint8_t reserved; uint32_t sequence; } NetControl;
 typedef struct {
@@ -191,9 +191,9 @@ typedef struct {
     int input_clock_input_source, input_clock_output_source;
     atomic_int input_clock_enabled;
     atomic_llong input_clock_stats[9];
-    float values[28];
+    float values[DSP_VALUE_COUNT];
     pthread_mutex_t param_lock, file_lock, stream_lock;
-    Biquad eq[2][EQ_BANDS];
+    ParametricEqBank *eq, *eq_pending, *eq_retired;
     ConvolutionReverb *reverb;
     pthread_mutex_t reverb_lock;
     pthread_t reverb_thread;
@@ -404,11 +404,12 @@ static void ring_wake_all(void) {
 
 enum { DSP_ON=1, EQ_ON=2, REVERB_ON=4, LIMITER_ON=8, LOUDNESS_ON=16 };
 enum {
-    P_EQ1_F,P_EQ1_G,P_EQ1_Q,P_EQ2_F,P_EQ2_G,P_EQ2_Q,P_EQ3_F,P_EQ3_G,P_EQ3_Q,P_EQ4_F,P_EQ4_G,P_EQ4_Q,
     P_ROOM,P_DECAY,P_DAMP,P_MIX,P_LIM_IN,P_LIMIT,P_RELEASE,P_CEILING,P_LOOKAHEAD,P_ADAPTIVE_RELEASE,
     P_LOUDNESS_TARGET,P_LOUDNESS_LRA,P_LOUDNESS_TP,P_LOUDNESS_BOOST_ONLY,
-    P_LOUDNESS_LOOKAHEAD,P_LOUDNESS_UPDATE_MS
+    P_LOUDNESS_LOOKAHEAD,P_LOUDNESS_UPDATE_MS,P_VALUE_COUNT
 };
+
+_Static_assert(P_VALUE_COUNT == DSP_VALUE_COUNT, "DSP parameter count mismatch");
 
 static float db_to_linear(float db) { return powf(10.f, db / 20.f); }
 static float clampf(float x, float lo, float hi) { return x < lo ? lo : (x > hi ? hi : x); }
@@ -747,20 +748,6 @@ static void output_error_callback(AAudioStream *stream, void *user_data, aaudio_
     atomic_store(&g.output_error, error);
     ring_notify(&g.output_ring_wakeup);
     LOGE("AAudio output stream error: %d", error);
-}
-
-/* Coefficient form follows FFmpeg af_biquads equalizer and uses transposed DF-II. */
-static void biquad_config(Biquad *b, int rate, float freq, float gain, float q) {
-    freq = clampf(freq, 20.f, rate * .49f); q = clampf(q, .1f, 20.f);
-    if (b->freq == freq && b->gain == gain && b->q == q) return;
-    b->freq=freq; b->gain=gain; b->q=q;
-    float A=powf(10.f,gain/40.f), w=2.f*(float)M_PI*freq/rate;
-    float alpha=sinf(w)/(2.f*q), c=cosf(w), a0=1.f+alpha/A;
-    b->b0=(1.f+alpha*A)/a0; b->b1=(-2.f*c)/a0; b->b2=(1.f-alpha*A)/a0;
-    b->a1=(-2.f*c)/a0; b->a2=(1.f-alpha/A)/a0;
-}
-static float biquad_process(Biquad *b, float x) {
-    float y=b->b0*x+b->z1; b->z1=b->b1*x-b->a1*y+b->z2; b->z2=b->b2*x-b->a2*y; return y;
 }
 
 /* IR preparation is deliberately kept off the real-time AAudio processing thread. */
@@ -2644,7 +2631,7 @@ static void *audio_thread(void *unused) {
     (void)unused;
     if (setpriority(PRIO_PROCESS, 0, -16) != 0)
         LOGI("Audio DSP thread priority request failed: errno=%d", errno);
-    float input[MAX_FRAMES*MAX_INPUT_CHANNELS], dry[MAX_FRAMES*2], output[MAX_FRAMES*2], p[28];
+    float input[MAX_FRAMES*MAX_INPUT_CHANNELS], dry[MAX_FRAMES*2], output[MAX_FRAMES*2], p[DSP_VALUE_COUNT];
     while(atomic_load(&g.running)) {
         input_clock_update();
         uint64_t block_begin_us = now_ns() / 1000ull;
@@ -2662,6 +2649,14 @@ static void *audio_thread(void *unused) {
         float tone_frequency, tone_frequency2, tone_duration_seconds, tone_click_interval_ms, tone_level;
         pthread_mutex_lock(&g.param_lock);
         memcpy(p,g.values,sizeof(p));
+        if (g.eq_pending) {
+            parametric_eq_bank_inherit(g.eq_pending, g.eq);
+            g.eq_retired = g.eq;
+            g.eq = g.eq_pending;
+            g.eq_pending = NULL;
+        }
+        ParametricEqBank *eq = g.eq;
+        int flags = atomic_load(&g.flags);
         tone_waveform=g.tone_waveform;
         tone_music=g.tone_music;
         tone_channels=g.tone_channels;
@@ -2671,7 +2666,8 @@ static void *audio_thread(void *unused) {
         tone_click_interval_ms=g.tone_click_interval_ms;
         tone_level=g.tone_level;
         pthread_mutex_unlock(&g.param_lock);
-        int flags=atomic_load(&g.flags); float peaks[4]={0.f,0.f,0.f,0.f};
+        float peaks[4]={0.f,0.f,0.f,0.f};
+        parametric_eq_bank_prepare(eq, g.rate, (flags & DSP_ON) && (flags & EQ_ON));
         if (!(flags&DSP_ON) || !(flags&LIMITER_ON)) {
             g.limiter_delay_frames=0;
             atomic_store(&g.levels[4],1.f);
@@ -2749,7 +2745,9 @@ static void *audio_thread(void *unused) {
             dry[i*2]=l;dry[i*2+1]=r;
             peaks[0]=fmaxf(peaks[0],fabsf(l)); peaks[1]=fmaxf(peaks[1],fabsf(r));
             if(flags&DSP_ON) {
-                if(flags&EQ_ON)for(int b=0;b<EQ_BANDS;b++){biquad_config(&g.eq[0][b],g.rate,p[b*3],p[b*3+1],p[b*3+2]);biquad_config(&g.eq[1][b],g.rate,p[b*3],p[b*3+1],p[b*3+2]);l=biquad_process(&g.eq[0][b],l);r=biquad_process(&g.eq[1][b],r);}
+                if (flags & EQ_ON) {
+                    parametric_eq_bank_process(eq, &l, &r);
+                }
                 if((flags&REVERB_ON) && reverb){float wet_l=0.f,wet_r=0.f,mix=clampf(p[P_MIX]/100.f,0.f,1.f);convolution_reverb_process(reverb,l,r,&wet_l,&wet_r);l=l*(1.f-mix)+wet_l*mix;r=r*(1.f-mix)+wet_r*mix;}
                 if(flags&LOUDNESS_ON) loudness_process(&l,&r,p);
                 if(flags&LIMITER_ON)limiter_process(&l,&r,p);
@@ -2904,7 +2902,10 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
     memset(g.waveform_wet_difference,0,sizeof(g.waveform_wet_difference));
     g.waveform_count=g.waveform_pos=0;
     pthread_mutex_unlock(&g.waveform_lock);
-    memset(g.eq,0,sizeof(g.eq));g.rate=rate;g.output_rate=outputRate>0?outputRate:rate;g.output_resample_phase=0.0;g.frames=frames;g.in_channels=channels;g.pair=pair;g.limiter_gain=1.0;g.limiter_delta=0.0;g.limiter_delay_frames=0;g.limiter_next_iter=g.limiter_next_len=0;loudness_init(rate);g.usb_audio=NULL;g.usb_input_host=usbInputHost?1:0;g.usb_output_host=usbOutputHost?1:0;if(usbFd<0){g.usb_input_host=0;g.usb_output_host=0;}atomic_store(&g.use_network_input,useNetworkInput?1:0);if(useNetworkInput)atomic_store(&g.net_last_packet_ns,now_ns());
+    pthread_mutex_lock(&g.param_lock);
+    parametric_eq_bank_prepare(g.eq, rate, 0);
+    pthread_mutex_unlock(&g.param_lock);
+    g.rate=rate;g.output_rate=outputRate>0?outputRate:rate;g.output_resample_phase=0.0;g.frames=frames;g.in_channels=channels;g.pair=pair;g.limiter_gain=1.0;g.limiter_delta=0.0;g.limiter_delay_frames=0;g.limiter_next_iter=g.limiter_next_len=0;loudness_init(rate);g.usb_audio=NULL;g.usb_input_host=usbInputHost?1:0;g.usb_output_host=usbOutputHost?1:0;if(usbFd<0){g.usb_input_host=0;g.usb_output_host=0;}atomic_store(&g.use_network_input,useNetworkInput?1:0);if(useNetworkInput)atomic_store(&g.net_last_packet_ns,now_ns());
     atomic_store(&g.reverb_worker_started,0);
     if(usbFd >= 0 && (g.usb_input_host || g.usb_output_host)) {
         g.usb_audio = usb_host_audio_start(usbFd, rate, rate, usbInputBitDepth, g.output_rate, usbOutputBitDepth, g.usb_input_host, g.usb_output_host,
@@ -3036,7 +3037,46 @@ static void native_stop_internal(int finalize_recording, int preserve_network) {
 }
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stop(JNIEnv*e,jobject o){(void)e;(void)o;native_stop_internal(1,0);}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_stopForRouteChange(JNIEnv*e,jobject o){(void)e;(void)o;native_stop_internal(0,1);}
-JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_update(JNIEnv*e,jobject o,jint flags,jfloatArray values){(void)o;float incoming[28]={0};jsize n=(*e)->GetArrayLength(e,values);if(n>28)n=28;(*e)->GetFloatArrayRegion(e,values,0,n,incoming);pthread_mutex_lock(&g.param_lock);int reverb_changed=n>P_DAMP&&(g.values[P_ROOM]!=incoming[P_ROOM]||g.values[P_DECAY]!=incoming[P_DECAY]||g.values[P_DAMP]!=incoming[P_DAMP]);memcpy(g.values,incoming,(size_t)n*sizeof(float));pthread_mutex_unlock(&g.param_lock);if(reverb_changed)atomic_fetch_add(&g.reverb_generation,1);atomic_store(&g.flags,flags);}
+JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_update(
+        JNIEnv *env, jobject instance, jint flags, jfloatArray values) {
+    (void)instance;
+    jsize count = (*env)->GetArrayLength(env, values);
+    if (count < DSP_VALUE_COUNT || (count - DSP_VALUE_COUNT) % PARAMETRIC_EQ_BAND_VALUES != 0) {
+        jclass exception = (*env)->FindClass(env, "java/lang/IllegalArgumentException");
+        if (exception) (*env)->ThrowNew(env, exception, "Unexpected DSP parameter count");
+        return;
+    }
+    ParametricEqBank *incoming_eq = parametric_eq_bank_create(
+            (size_t)(count - DSP_VALUE_COUNT) / PARAMETRIC_EQ_BAND_VALUES);
+    if (!incoming_eq) {
+        jclass exception = (*env)->FindClass(env, "java/lang/OutOfMemoryError");
+        if (exception) (*env)->ThrowNew(env, exception, "Unable to allocate EQ bands");
+        return;
+    }
+    jfloat *incoming = (*env)->GetFloatArrayElements(env, values, NULL);
+    if (!incoming) {
+        free(incoming_eq);
+        return;
+    }
+    for (size_t index = 0; index < incoming_eq->count; index++)
+        memcpy(incoming_eq->bands[index].values,
+                incoming + DSP_VALUE_COUNT + index * PARAMETRIC_EQ_BAND_VALUES,
+                sizeof(incoming_eq->bands[index].values));
+    pthread_mutex_lock(&g.param_lock);
+    int reverb_changed =
+            (g.values[P_ROOM] != incoming[P_ROOM] || g.values[P_DECAY] != incoming[P_DECAY] ||
+             g.values[P_DAMP] != incoming[P_DAMP]);
+    memcpy(g.values, incoming, sizeof(g.values));
+    ParametricEqBank *pending = g.eq_pending, *retired = g.eq_retired;
+    g.eq_pending = incoming_eq;
+    g.eq_retired = NULL;
+    atomic_store(&g.flags, flags);
+    pthread_mutex_unlock(&g.param_lock);
+    (*env)->ReleaseFloatArrayElements(env, values, incoming, JNI_ABORT);
+    free(pending);
+    free(retired);
+    if (reverb_changed) atomic_fetch_add(&g.reverb_generation, 1);
+}
 JNIEXPORT void JNICALL Java_com_llawsxx_audioprocess_NativeAudio_configureTone(JNIEnv*e,jobject o,jboolean enabled,jint waveform,jint music,jint channels,jfloat frequency,jfloat frequency2,jfloat durationSeconds,jfloat clickIntervalMs,jfloat level){
     (void)e;(void)o;
     float max_frequency=g.rate>0?(float)g.rate*.45f:20000.f;

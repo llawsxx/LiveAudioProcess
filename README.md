@@ -19,7 +19,7 @@ Android 低延迟实时音频处理与路由工具，支持本机 DSP、USB Audi
   - 校正幅度可调：1-200 ppm
 - USB Audio / USB Host 音频设备支持
 - 实时 DSP 处理链
-  - 4 段参数均衡器
+  - 动态多段图形参数均衡器：自由添加 / 删除节点，可拖动频响曲线，支持峰值、高通、低通、陷波、带通、低搁架和高搁架
   - Convolution Reverb
   - Limiter
   - Loudness processing
@@ -72,6 +72,10 @@ Set-Clipboard $base64
 请妥善备份 `.jks` 文件和密码；以后发布更新必须继续使用同一签名密钥，否则 Android 会把它视为不同应用。`.jks` 文件不应提交到 Git。工作流缺少任一签名 Secret 时会直接失败，不会发布未签名 APK。
 
 ## 使用说明
+
+处理链中的图形参数均衡器不设固定频段数，按实际节点数量动态分配。初始为空，双击曲线空白处可在对应频率和增益位置添加节点，也可点击“添加节点”；支持删除选中节点、清空全部，节点及数量会自动保存。空 EQ 为平直直通，节点越多实时处理开销越大，实际可用数量取决于设备性能。点击编号或曲线节点选中频段，编号列表可横向滚动；左右拖动节点调频率，峰值和搁架类型还可上下拖动调增益。下方可选择滤波类型、调整 Q 值、单独旁路频段或复位本段。频率轴为对数刻度，增益范围为 ±24 dB，Q 范围为 0.1–20；高通和低通为二阶 12 dB/oct。上限频率随 DSP 采样率限制在奈奎斯特频率以下。
+
+彩色细线表示各频段响应，白线表示已开启频段的合成响应；这是滤波器频响，不是实时 FFT 频谱。整体 DSP 或 EQ 关闭时曲线仅用于配置预览。原生处理使用双精度 IIR，参数改变时进行约 5 ms 的系数平滑，不引入额外的前视缓冲；曲线只在参数或采样率变化时重新计算。新 EQ 默认平直，不迁移旧 EQ 参数，其他 DSP 设置不受影响。
 
 顶部固定显示引擎和录音控制。点击“开始引擎”启动；停止时需将左侧滑块向右拖到末端并松手，点击滑轨或未拖到位不会停止引擎。录音按钮在引擎启动后可用，录音时显示计时，再次点击停止录音。
 
@@ -135,7 +139,7 @@ Android low-latency real-time audio processing and routing tool with built-in DS
   - Adjustable correction limit from 1 to 200 ppm
 - USB Audio / USB Host device support
 - Real-time DSP chain
-  - 4-band parametric equalizer
+  - Dynamic multiband graphical parametric equalizer with freely added/removed nodes, draggable responses, bell, high/low-pass, notch, band-pass, and high/low-shelf filters
   - Convolution reverb
   - Limiter
   - Loudness processing

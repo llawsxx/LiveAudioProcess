@@ -138,10 +138,7 @@ class AudioEngine(private val context: Context) {
         private set
     @Volatile var systemInputBufferMaxMs = 20
         private set
-    @Volatile var eqGain = 2f; @Volatile var eqFrequency = 1200f; @Volatile var eqQ = .85f
-    @Volatile var eq2Frequency = 250f; @Volatile var eq2Gain = 0f; @Volatile var eq2Q = 1f
-    @Volatile var eq3Frequency = 4000f; @Volatile var eq3Gain = 0f; @Volatile var eq3Q = 1f
-    @Volatile var eq4Frequency = 10000f; @Volatile var eq4Gain = 0f; @Volatile var eq4Q = 1f
+    @Volatile var eqBands = defaultEqBands()
     @Volatile var reverbRoom = 42f; @Volatile var reverbDecay = 1.8f; @Volatile var reverbDamping = 35f; @Volatile var reverbMix = .18f
     @Volatile var limiterInputGain = 0f; @Volatile var limiterThreshold = -.5f; @Volatile var limiterRelease = 80f; @Volatile var limiterCeiling = -.5f; @Volatile var limiterLookAhead = 1f; @Volatile var limiterAdaptiveRelease = false
     @Volatile var loudnessTarget = -16f; @Volatile var loudnessLra = 7f; @Volatile var loudnessTruePeak = -1f; @Volatile var loudnessBoostOnly = false; @Volatile var loudnessLookAhead = 5f; @Volatile var loudnessUpdateIntervalMs = 1000f
@@ -864,6 +861,30 @@ class AudioEngine(private val context: Context) {
         recordingTarget = null
     }
     fun stop() { if (isRecording) setRecording(false); routeHandler.removeCallbacks(routeRestart); routeHandler.removeCallbacks(routeRefresh); routeHandler.removeCallbacks(deviceRecovery); routeHandler.removeCallbacks(wifiHealthMonitor); routeHandler.removeCallbacks(bluetoothRouteMonitor); NativeAudio.stop(); releaseWifiLowLatencyLock(); usbConnection?.close(); usbConnection = null; clearBluetoothRoute(); activeInputDeviceId = -1; activeOutputDeviceId = -1; usbOutputHostActive = false; deviceSwitchInProgress = false; observedBluetoothDeviceId = Int.MIN_VALUE; bluetoothRetryCount = 0; nextBluetoothRetryAtMs = 0L; isRecording = false; isRunning = false }
+    fun applyEffects(settings: EffectSettings) {
+        dspEnabled = settings.dspEnabled
+        eqEnabled = settings.eqEnabled
+        reverbEnabled = settings.reverbEnabled
+        limiterEnabled = settings.limiterEnabled
+        loudnessEnabled = settings.loudnessEnabled
+        eqBands = settings.eqBands
+        reverbRoom = settings.reverbRoom
+        reverbDecay = settings.reverbDecay
+        reverbDamping = settings.reverbDamping
+        reverbMix = settings.reverbMix / 100f
+        limiterInputGain = settings.limiterInputGain
+        limiterThreshold = settings.limiterThreshold
+        limiterRelease = settings.limiterRelease
+        limiterCeiling = settings.limiterCeiling
+        limiterLookAhead = settings.limiterLookAhead
+        limiterAdaptiveRelease = settings.limiterAdaptiveRelease
+        loudnessTarget = settings.loudnessTarget
+        loudnessLra = settings.loudnessLra
+        loudnessTruePeak = settings.loudnessTruePeak
+        loudnessBoostOnly = settings.loudnessBoostOnly
+        loudnessLookAhead = settings.loudnessLookAhead
+        loudnessUpdateIntervalMs = settings.loudnessUpdateIntervalMs
+    }
     fun refreshNativeParameters() { pushNativeParameters() }
     fun configureTone(enabled: Boolean) {
         if (NativeAudio.available) NativeAudio.configureTone(enabled, toneWaveform, toneMusic, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevel)
@@ -875,16 +896,15 @@ class AudioEngine(private val context: Context) {
             (if (reverbEnabled) 4 else 0) or
             (if (limiterEnabled) 8 else 0) or
             (if (loudnessEnabled) 16 else 0)
+        val bands = eqBands
         NativeAudio.update(flags, floatArrayOf(
-            eqFrequency, eqGain, eqQ, eq2Frequency, eq2Gain, eq2Q,
-            eq3Frequency, eq3Gain, eq3Q, eq4Frequency, eq4Gain, eq4Q,
             reverbRoom, reverbDecay, reverbDamping, reverbMix * 100f,
             limiterInputGain, limiterThreshold, limiterRelease, limiterCeiling,
             limiterLookAhead, if (limiterAdaptiveRelease) 1f else 0f,
             loudnessTarget, loudnessLra, loudnessTruePeak,
             if (loudnessBoostOnly) 1f else 0f, loudnessLookAhead,
             loudnessUpdateIntervalMs
-        ))
+        ) + eqNativeValues(bands))
         NativeAudio.configureTone(inputSource == InputSource.TEST_TONE, toneWaveform, toneMusic, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevel)
     }
 

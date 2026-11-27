@@ -90,14 +90,7 @@ class AudioProcessingService : Service() {
     private fun restoreSettings(engine: AudioEngine) {
         val p = getSharedPreferences("audioprocess_settings", MODE_PRIVATE)
         val effects = EffectSettings.load(p)
-        engine.dspEnabled = effects.dspEnabled; engine.eqEnabled = effects.eqEnabled; engine.reverbEnabled = effects.reverbEnabled; engine.limiterEnabled = effects.limiterEnabled
-        engine.eqFrequency = effects.eqFrequency; engine.eqGain = effects.eqGain; engine.eqQ = effects.eqQ
-        engine.eq2Frequency = effects.eq2Frequency; engine.eq2Gain = effects.eq2Gain; engine.eq2Q = effects.eq2Q
-        engine.eq3Frequency = effects.eq3Frequency; engine.eq3Gain = effects.eq3Gain; engine.eq3Q = effects.eq3Q
-        engine.eq4Frequency = effects.eq4Frequency; engine.eq4Gain = effects.eq4Gain; engine.eq4Q = effects.eq4Q
-        engine.reverbRoom = effects.reverbRoom; engine.reverbDecay = effects.reverbDecay; engine.reverbDamping = effects.reverbDamping; engine.reverbMix = effects.reverbMix / 100f
-        engine.limiterInputGain = effects.limiterInputGain; engine.limiterThreshold = effects.limiterThreshold; engine.limiterRelease = effects.limiterRelease; engine.limiterCeiling = effects.limiterCeiling; engine.limiterLookAhead = effects.limiterLookAhead; engine.limiterAdaptiveRelease = effects.limiterAdaptiveRelease
-        engine.loudnessTarget = effects.loudnessTarget; engine.loudnessLra = effects.loudnessLra; engine.loudnessTruePeak = effects.loudnessTruePeak; engine.loudnessBoostOnly = effects.loudnessBoostOnly; engine.loudnessLookAhead = effects.loudnessLookAhead; engine.loudnessUpdateIntervalMs = effects.loudnessUpdateIntervalMs; engine.loudnessEnabled = effects.loudnessEnabled
+        engine.applyEffects(effects)
         engine.toneWaveform = p.getInt("toneWaveform", 0).coerceIn(0, 7)
         engine.toneMusic = p.getInt("toneMusic", 0).coerceIn(0, 5)
         engine.toneChannels = p.getInt("toneChannels", 0).coerceIn(0, 2)
