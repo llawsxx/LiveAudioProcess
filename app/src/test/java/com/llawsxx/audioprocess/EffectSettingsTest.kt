@@ -75,6 +75,30 @@ class EffectSettingsTest {
         assertFalse(values.containsKey("graphicEq.0.frequency"))
     }
 
+    @Test
+    fun exciterSettingsRoundTripWithoutChangingEqOrOtherEffects() {
+        val preferences = memoryPreferences()
+        val settings = EffectSettings(
+            dspEnabled = true, exciterEnabled = true,
+            exciter = HarmonicExciterSettings(4500f, 18f, 25f, 15000f, 65f, -3f),
+            eqBands = listOf(EqBandSettings(1000f, 2f)), reverbDecay = 2.5f, loudnessTarget = -20f
+        )
+        settings.save(preferences)
+        assertEquals(settings, EffectSettings.load(preferences))
+    }
+
+    @Test
+    fun missingExciterPreferencesRemainDisabledAndInvalidValuesAreNormalized() {
+        assertFalse(EffectSettings.load(memoryPreferences()).exciterEnabled)
+        val preferences = memoryPreferences(mutableMapOf(
+            "exciter.frequency" to Float.NaN, "exciter.drive" to Float.POSITIVE_INFINITY,
+            "exciter.amount" to -1f, "exciter.even" to 200f
+        ))
+        val settings = EffectSettings.load(preferences)
+        assertFalse(settings.exciterEnabled)
+        assertEquals(HarmonicExciterSettings(amount = 0f, even = 100f), settings.exciter)
+    }
+
     private fun memoryPreferences(values: MutableMap<String, Any> = mutableMapOf()): SharedPreferences {
         val editor = Proxy.newProxyInstance(
             SharedPreferences.Editor::class.java.classLoader, arrayOf(SharedPreferences.Editor::class.java)

@@ -139,6 +139,8 @@ class AudioEngine(private val context: Context) {
     @Volatile var systemInputBufferMaxMs = 20
         private set
     @Volatile var eqBands = defaultEqBands()
+    @Volatile var exciterEnabled = false
+    @Volatile var exciterSettings = HarmonicExciterSettings()
     @Volatile var reverbRoom = 42f; @Volatile var reverbDecay = 1.8f; @Volatile var reverbDamping = 35f; @Volatile var reverbMix = .18f
     @Volatile var limiterInputGain = 0f; @Volatile var limiterThreshold = -.5f; @Volatile var limiterRelease = 80f; @Volatile var limiterCeiling = -.5f; @Volatile var limiterLookAhead = 1f; @Volatile var limiterAdaptiveRelease = false
     @Volatile var loudnessTarget = -16f; @Volatile var loudnessLra = 7f; @Volatile var loudnessTruePeak = -1f; @Volatile var loudnessBoostOnly = false; @Volatile var loudnessLookAhead = 5f; @Volatile var loudnessUpdateIntervalMs = 1000f
@@ -868,6 +870,8 @@ class AudioEngine(private val context: Context) {
         limiterEnabled = settings.limiterEnabled
         loudnessEnabled = settings.loudnessEnabled
         eqBands = settings.eqBands
+        exciterEnabled = settings.exciterEnabled
+        exciterSettings = settings.exciter.normalized()
         reverbRoom = settings.reverbRoom
         reverbDecay = settings.reverbDecay
         reverbDamping = settings.reverbDamping
@@ -895,7 +899,8 @@ class AudioEngine(private val context: Context) {
             (if (eqEnabled) 2 else 0) or
             (if (reverbEnabled) 4 else 0) or
             (if (limiterEnabled) 8 else 0) or
-            (if (loudnessEnabled) 16 else 0)
+            (if (loudnessEnabled) 16 else 0) or
+            (if (exciterEnabled) 32 else 0)
         val bands = eqBands
         NativeAudio.update(flags, floatArrayOf(
             reverbRoom, reverbDecay, reverbDamping, reverbMix * 100f,
@@ -904,7 +909,7 @@ class AudioEngine(private val context: Context) {
             loudnessTarget, loudnessLra, loudnessTruePeak,
             if (loudnessBoostOnly) 1f else 0f, loudnessLookAhead,
             loudnessUpdateIntervalMs
-        ) + eqNativeValues(bands))
+        ) + exciterSettings.nativeValues() + eqNativeValues(bands))
         NativeAudio.configureTone(inputSource == InputSource.TEST_TONE, toneWaveform, toneMusic, toneChannels, toneFrequency, toneFrequency2, toneDurationSeconds, toneClickIntervalMs, toneLevel)
     }
 

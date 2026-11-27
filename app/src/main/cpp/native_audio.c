@@ -27,6 +27,7 @@
 #include "convolution_reverb.h"
 #include "input_clock_correction.h"
 #include "parametric_eq.h"
+#include "harmonic_exciter.h"
 #include "loudness_peak.h"
 #include "test_music.h"
 #include "usb_host_bridge.h"
@@ -94,7 +95,7 @@ static void app_log_print(android_LogPriority priority, const char *fmt, ...) {
 #define NET_RETRANSMIT_CACHE_SLOTS 32
 #define NET_RETRANSMIT_MAX_REQUESTS 3
 #define NET_RETRANSMIT_WAIT_NS 30000000ull
-#define DSP_VALUE_COUNT 16
+#define DSP_VALUE_COUNT (16 + EXCITER_PARAMETER_COUNT)
 #define MAX_INPUT_CHANNELS 8
 
 typedef struct __attribute__((packed)) { uint32_t magic; uint16_t version; uint8_t codec; uint8_t channels; uint32_t rate; uint32_t frames; uint64_t timestamp_ns; uint32_t sequence; } NetHeader;
@@ -194,6 +195,7 @@ typedef struct {
     float values[DSP_VALUE_COUNT];
     pthread_mutex_t param_lock, file_lock, stream_lock;
     ParametricEqBank *eq, *eq_pending, *eq_retired;
+    HarmonicExciter exciter;
     ConvolutionReverb *reverb;
     pthread_mutex_t reverb_lock;
     pthread_t reverb_thread;
@@ -402,11 +404,13 @@ static void ring_wake_all(void) {
 
 #define NET_MAGIC 0x50464C58u
 
-enum { DSP_ON=1, EQ_ON=2, REVERB_ON=4, LIMITER_ON=8, LOUDNESS_ON=16 };
+enum { DSP_ON=1, EQ_ON=2, REVERB_ON=4, LIMITER_ON=8, LOUDNESS_ON=16, EXCITER_ON=32 };
 enum {
     P_ROOM,P_DECAY,P_DAMP,P_MIX,P_LIM_IN,P_LIMIT,P_RELEASE,P_CEILING,P_LOOKAHEAD,P_ADAPTIVE_RELEASE,
     P_LOUDNESS_TARGET,P_LOUDNESS_LRA,P_LOUDNESS_TP,P_LOUDNESS_BOOST_ONLY,
-    P_LOUDNESS_LOOKAHEAD,P_LOUDNESS_UPDATE_MS,P_VALUE_COUNT
+    P_LOUDNESS_LOOKAHEAD,P_LOUDNESS_UPDATE_MS,
+    P_EXCITER_FREQUENCY,P_EXCITER_DRIVE,P_EXCITER_AMOUNT,P_EXCITER_TONE,P_EXCITER_EVEN,P_EXCITER_OUTPUT,
+    P_VALUE_COUNT
 };
 
 _Static_assert(P_VALUE_COUNT == DSP_VALUE_COUNT, "DSP parameter count mismatch");
@@ -2668,6 +2672,8 @@ static void *audio_thread(void *unused) {
         pthread_mutex_unlock(&g.param_lock);
         float peaks[4]={0.f,0.f,0.f,0.f};
         parametric_eq_bank_prepare(eq, g.rate, (flags & DSP_ON) && (flags & EQ_ON));
+        harmonic_exciter_prepare(&g.exciter, g.rate, (flags & DSP_ON) && (flags & EXCITER_ON),
+                &p[P_EXCITER_FREQUENCY]);
         if (!(flags&DSP_ON) || !(flags&LIMITER_ON)) {
             g.limiter_delay_frames=0;
             atomic_store(&g.levels[4],1.f);
@@ -2744,10 +2750,9 @@ static void *audio_thread(void *unused) {
             } else { l=g.usb_input_host ? input[i*2] : input[i*g.in_channels+first]; r=g.usb_input_host ? input[i*2+1] : input[i*g.in_channels+second]; }
             dry[i*2]=l;dry[i*2+1]=r;
             peaks[0]=fmaxf(peaks[0],fabsf(l)); peaks[1]=fmaxf(peaks[1],fabsf(r));
+            if ((flags & DSP_ON) && (flags & EQ_ON)) parametric_eq_bank_process(eq, &l, &r);
+            harmonic_exciter_process(&g.exciter, &l, &r);
             if(flags&DSP_ON) {
-                if (flags & EQ_ON) {
-                    parametric_eq_bank_process(eq, &l, &r);
-                }
                 if((flags&REVERB_ON) && reverb){float wet_l=0.f,wet_r=0.f,mix=clampf(p[P_MIX]/100.f,0.f,1.f);convolution_reverb_process(reverb,l,r,&wet_l,&wet_r);l=l*(1.f-mix)+wet_l*mix;r=r*(1.f-mix)+wet_r*mix;}
                 if(flags&LOUDNESS_ON) loudness_process(&l,&r,p);
                 if(flags&LIMITER_ON)limiter_process(&l,&r,p);
@@ -2905,6 +2910,7 @@ JNIEXPORT jboolean JNICALL Java_com_llawsxx_audioprocess_NativeAudio_start(JNIEn
     pthread_mutex_lock(&g.param_lock);
     parametric_eq_bank_prepare(g.eq, rate, 0);
     pthread_mutex_unlock(&g.param_lock);
+    harmonic_exciter_init(&g.exciter, rate);
     g.rate=rate;g.output_rate=outputRate>0?outputRate:rate;g.output_resample_phase=0.0;g.frames=frames;g.in_channels=channels;g.pair=pair;g.limiter_gain=1.0;g.limiter_delta=0.0;g.limiter_delay_frames=0;g.limiter_next_iter=g.limiter_next_len=0;loudness_init(rate);g.usb_audio=NULL;g.usb_input_host=usbInputHost?1:0;g.usb_output_host=usbOutputHost?1:0;if(usbFd<0){g.usb_input_host=0;g.usb_output_host=0;}atomic_store(&g.use_network_input,useNetworkInput?1:0);if(useNetworkInput)atomic_store(&g.net_last_packet_ns,now_ns());
     atomic_store(&g.reverb_worker_started,0);
     if(usbFd >= 0 && (g.usb_input_host || g.usb_output_host)) {

@@ -851,9 +851,10 @@ private fun LiveAudioProcessApp() {
             Spacer(Modifier.height(12.dp))
             } else if (currentPage == 1) {
                 SectionTitle("处理链", "DSP CHAIN")
-                Text("在此页面启用或调整 EQ、混响、响度与限制器。修改会实时同步到音频引擎。", color = Muted, fontSize = 12.sp)
+                Text("在此页面启用或调整 EQ、谐波激励、混响、响度与限制器。修改会实时同步到音频引擎。", color = Muted, fontSize = 12.sp)
                 ProcessingControlPanel(effects) { effects = it }
                 EqBandsPanel(effects, rate) { effects = it }
+                HarmonicExciterPanel(effects, rate) { effects = it }
                 UnifiedEffectsPanel(effects) { effects = it }
                 Spacer(Modifier.height(12.dp))
             } else if (currentPage == 2) {

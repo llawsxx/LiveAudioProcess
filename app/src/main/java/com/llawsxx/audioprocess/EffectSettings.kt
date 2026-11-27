@@ -5,6 +5,8 @@ import android.content.SharedPreferences
 data class EffectSettings(
     val dspEnabled: Boolean = false, val eqEnabled: Boolean = true, val reverbEnabled: Boolean = true, val limiterEnabled: Boolean = true, val loudnessEnabled: Boolean = true,
     val eqBands: List<EqBandSettings> = defaultEqBands(),
+    val exciterEnabled: Boolean = false,
+    val exciter: HarmonicExciterSettings = HarmonicExciterSettings(),
     val reverbRoom: Float = 42f, val reverbDecay: Float = 1.8f, val reverbDamping: Float = 35f, val reverbMix: Float = 18f,
     val limiterInputGain: Float = 0f, val limiterThreshold: Float = -.5f, val limiterRelease: Float = 80f, val limiterCeiling: Float = -.5f, val limiterLookAhead: Float = 1f, val limiterAdaptiveRelease: Boolean = false,
     val loudnessTarget: Float = -16f, val loudnessLra: Float = 7f, val loudnessTruePeak: Float = -1f,
@@ -25,11 +27,16 @@ data class EffectSettings(
 
     fun save(p: SharedPreferences) {
         val previousBandCount = p.getInt("graphicEq.count", 0)
+        val harmonic = exciter.normalized()
         val editor = p.edit()
             .putBoolean("dspEnabled", dspEnabled).putBoolean("eqEnabled", eqEnabled).putBoolean("reverbEnabled", reverbEnabled).putBoolean("limiterEnabled", limiterEnabled).putBoolean("loudnessEnabled", loudnessEnabled)
             .putFloat("reverbRoom", reverbRoom).putFloat("reverbDecay", reverbDecay).putFloat("reverbDamping", reverbDamping).putFloat("reverbMix", reverbMix)
             .putFloat("limiterInputGain", limiterInputGain).putFloat("limiterThreshold", limiterThreshold).putFloat("limiterRelease", limiterRelease).putFloat("limiterCeiling", limiterCeiling).putFloat("limiterLookAhead", limiterLookAhead).putBoolean("limiterAdaptiveRelease", limiterAdaptiveRelease)
             .putFloat("loudnessTarget", loudnessTarget).putFloat("loudnessLra", loudnessLra).putFloat("loudnessTruePeak", loudnessTruePeak).putBoolean("loudnessBoostOnly", loudnessBoostOnly).putFloat("loudnessLookAhead", loudnessLookAhead).putFloat("loudnessUpdateIntervalMs", loudnessUpdateIntervalMs)
+            .putBoolean("exciterEnabled", exciterEnabled)
+            .putFloat("exciter.frequency", harmonic.frequency).putFloat("exciter.drive", harmonic.drive)
+            .putFloat("exciter.amount", harmonic.amount).putFloat("exciter.tone", harmonic.tone)
+            .putFloat("exciter.even", harmonic.even).putFloat("exciter.outputGain", harmonic.outputGain)
         editor.putInt("graphicEq.count", eqBands.size)
         for (index in eqBands.size until previousBandCount) {
             listOf("frequency", "gain", "quality", "type", "enabled").forEach { key ->
@@ -55,6 +62,12 @@ data class EffectSettings(
             reverbEnabled = p.getBoolean("reverbEnabled", true),
             limiterEnabled = p.getBoolean("limiterEnabled", true),
             loudnessEnabled = p.getBoolean("loudnessEnabled", true),
+            exciterEnabled = p.getBoolean("exciterEnabled", false),
+            exciter = HarmonicExciterSettings(
+                frequency = p.getFloat("exciter.frequency", 3000f), drive = p.getFloat("exciter.drive", 12f),
+                amount = p.getFloat("exciter.amount", 15f), tone = p.getFloat("exciter.tone", 16000f),
+                even = p.getFloat("exciter.even", 25f), outputGain = p.getFloat("exciter.outputGain", 0f)
+            ).normalized(),
             eqBands = List(p.getInt("graphicEq.count", 0).coerceAtLeast(0)) { index ->
                 val defaults = EqBandSettings()
                 val prefix = "graphicEq.$index."

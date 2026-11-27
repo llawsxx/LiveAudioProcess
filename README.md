@@ -20,6 +20,7 @@ Android 低延迟实时音频处理与路由工具，支持本机 DSP、USB Audi
 - USB Audio / USB Host 音频设备支持
 - 实时 DSP 处理链
   - 动态多段图形参数均衡器：自由添加 / 删除节点，可拖动频响曲线，支持峰值、高通、低通、陷波、带通、低搁架和高搁架
+  - 谐波激励器：独立非线性支路，支持处理起点、驱动、添加量、高频上限、奇偶混合和输出增益，4× 过采样抗混叠
   - Convolution Reverb
   - Limiter
   - Loudness processing
@@ -76,6 +77,10 @@ Set-Clipboard $base64
 处理链中的图形参数均衡器不设固定频段数，按实际节点数量动态分配。初始为空，双击曲线空白处可在对应频率和增益位置添加节点，也可点击“添加节点”；支持删除选中节点、清空全部，节点及数量会自动保存。空 EQ 为平直直通，节点越多实时处理开销越大，实际可用数量取决于设备性能。点击编号或曲线节点选中频段，编号列表可横向滚动；左右拖动节点调频率，峰值和搁架类型还可上下拖动调增益。下方可选择滤波类型、调整 Q 值、单独旁路频段或复位本段。频率轴为对数刻度，增益范围为 ±24 dB，Q 范围为 0.1–20；高通和低通为二阶 12 dB/oct。上限频率随 DSP 采样率限制在奈奎斯特频率以下。
 
 彩色细线表示各频段响应，白线表示已开启频段的合成响应；这是滤波器频响，不是实时 FFT 频谱。整体 DSP 或 EQ 关闭时曲线仅用于配置预览。原生处理使用双精度 IIR，参数改变时进行约 5 ms 的系数平滑，不引入额外的前视缓冲；曲线只在参数或采样率变化时重新计算。新 EQ 默认平直，不迁移旧 EQ 参数，其他 DSP 设置不受影响。
+
+谐波激励器默认关闭，处理顺序为 EQ → 谐波激励 → 卷积混响 → 响度标准化 → 限制器。启用整体 DSP 和激励器开关后，先选取处理起点以上的声音，在独立支路生成奇次 / 偶次谐波，经去直流、高低通及抗混叠滤波后叠加回干声；它不是普通高频 EQ，也不依赖 FFT。奇次支路使用软饱和残差，偶次支路使用软饱和信号的平方，比例滑块是支路混合权重，不是实际谐波能量百分比。高通起点不是硬切边界，输出还会随采样率和抗混叠滤波滚降限制高频。生成的谐波属于音色处理，不是恢复原本丢失的细节。
+
+激励器默认处理起点 3 kHz、驱动 12 dB、添加量 15%、高频上限 16 kHz、偶次混合 25%、输出增益 0 dB；可先用 5–15% 添加量对比试听，驱动越大不等于音质越好，注意齿音、底噪和输出余量。干声不增加整块缓冲，4× 过采样使用双精度、129 抽头 FIR 插值 / 抽取，谐波支路有约 32 个原采样帧的滤波延迟（48 kHz 下约 0.67 ms），再加上高低通的相位变化；混合本身会影响音色，不是相位透明处理。零添加量且输出增益为 0 dB 时直通；开关、驱动、添加量、混合和输出增益约 5 ms 平滑过渡，关闭后清空支路状态。配置自动保存，关闭整体 DSP 后激励支路也会短暂淡出。EQ 面板曲线只表示 EQ，本身不包含非线性激励器的谐波。开启激励器会增加实时 CPU 开销，需根据设备性能选择使用。
 
 顶部固定显示引擎和录音控制。点击“开始引擎”启动；停止时需将左侧滑块向右拖到末端并松手，点击滑轨或未拖到位不会停止引擎。录音按钮在引擎启动后可用，录音时显示计时，再次点击停止录音。
 
@@ -140,6 +145,7 @@ Android low-latency real-time audio processing and routing tool with built-in DS
 - USB Audio / USB Host device support
 - Real-time DSP chain
   - Dynamic multiband graphical parametric equalizer with freely added/removed nodes, draggable responses, bell, high/low-pass, notch, band-pass, and high/low-shelf filters
+  - Harmonic exciter with selectable high-frequency processing, drive, additive amount, tone, even/odd blend and output gain; 4× oversampling and anti-alias filtering
   - Convolution reverb
   - Limiter
   - Loudness processing
